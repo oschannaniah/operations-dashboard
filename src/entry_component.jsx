@@ -38,7 +38,40 @@ const DEFAULT_ROLE_OPTIONS = [
   "Production Coordinator", "Worship Director", "Reception", "Info Center", "Hospitality", "Cafe",
 ];
 
-const TODAY_STR = "2026-07-10";
+// The four team lanes a phase-4 (fully staffed) campus org chart is organized into, each with
+// its own role/title list — sourced directly from the reference org chart. "Add Team Role"
+// builds a person straight into one of these, as a second, more structured way to build the
+// roster alongside the simpler free-text "Add Team Member" flow.
+const TEAM_LANES = ["Operations", "Ministry", "Next Gen", "Programming"];
+
+const LANE_ROLE_OPTIONS = {
+  "Operations": [
+    "Operations Director", "Campus Support Director", "Facilities Coordinator", "Safety Coordinator",
+    "Events Coordinator", "Campus Admin Director", "Admin Coordinator", "Reception", "Info Center",
+    "Hospitality", "Cafe",
+  ],
+  "Ministry": [
+    "Ministry Director", "Connections Director", "Outreach Coordinator", "Groups Coordinator",
+    "Next Steps Coordinator", "Life Care Director", "Prayer Coordinator", "Inner Healing Coordinator",
+    "Pastoral Care Coordinator", "Guest Services Director", "Greeters Coordinator", "Parking Coordinator",
+    "Usher Coordinator",
+  ],
+  "Next Gen": [
+    "Next Gen Director", "Kids Director", "Elementary Coordinator", "Nursery Coordinator",
+    "MDO Coordinator", "Young Adults Director", "Student's Director", "HS Coordinator", "MS Coordinator",
+  ],
+  "Programming": [
+    "Programming Director", "Worship Director", "Production Director", "Production Coordinator",
+    "Media Coordinator",
+  ],
+};
+
+// Computed once at page load (module scope, not a hook) — accurate for the life of the page,
+// and correct again on every fresh load/refresh. Was previously hardcoded to a fixed past
+// date, which quietly threw off overdue-project detection, recurring task/project
+// regeneration, and every activity/notification timestamp along with the Calendar tab.
+const _now = new Date();
+const TODAY_STR = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, "0")}-${String(_now.getDate()).padStart(2, "0")}`;
 
 // ---------- Backend API client (Google Sheets via Apps Script, through a same-origin proxy) ----------
 // This calls our own /api/sheet endpoint (a Vercel serverless function), not Apps Script
@@ -102,6 +135,9 @@ async function apiPost(body) {
 const apiCreate = (sheet, data) => apiPost({ sheet, action: "create", data });
 const apiUpdate = (sheet, id, data) => apiPost({ sheet, action: "update", id, data });
 const apiDelete = (sheet, id) => apiPost({ sheet, action: "delete", id });
+// Reads the campus's current-phase slide out of its Google Slides deck and returns
+// { people: [{ name, role, reportsTo }] } — see importOrgChartFromSlides_ in Code.gs.
+const apiImportOrgChartFromSlides = (campusId, url, phase) => apiPost({ sheet: "OrgChart", action: "importFromSlides", data: { campusId, url, phase } });
 
 
 // Prevents the page behind a modal from scrolling. Kept deliberately simple — just
@@ -312,6 +348,65 @@ const MOCK_GOOGLE_CALENDARS = [
   "Facilities Maintenance",
   "Personal",
 ];
+
+// ---------- Real per-user Google Calendar connection (read-only, permanent) ----------
+// Each person connects their OWN Google Workspace calendars to their OWN Calendar tab. This is
+// a genuine, permanent connection, not a per-session one: we use Google Identity Services' OAuth
+// CODE flow (not the simpler token flow) to get a one-time authorization code, which the backend
+// (Code.gs) exchanges for an access + refresh token and stores the refresh token server-side —
+// never in the browser. From then on, the browser just asks the backend for calendars/events;
+// Google is never called directly from here again, and no re-consent is ever needed unless the
+// person revokes access themselves at myaccount.google.com/permissions.
+//
+// Requires a real OAuth Client ID from Google Cloud Console (APIs & Services > Credentials >
+// Create OAuth client ID > Web application), with the Google Calendar API enabled and this
+// site's URL(s) added under "Authorized JavaScript origins". Paste it in below — the matching
+// Client Secret goes only in Code.gs's Script Properties, never here.
+const GOOGLE_CALENDAR_CLIENT_ID = "554435571384-jj0t9lfk8gh3kenu327phiam0c6d39b1.apps.googleusercontent.com";
+const GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly";
+
+let googleCodeClient = null;
+let googleCodeCallback = () => {};
+
+function requestGoogleAuthCode(callback) {
+  if (typeof window === "undefined" || !window.google?.accounts?.oauth2) {
+    callback({ error: "Google sign-in isn't available right now — the page may still be loading, try again in a moment." });
+    return;
+  }
+  if (!googleCodeClient) {
+    googleCodeClient = window.google.accounts.oauth2.initCodeClient({
+      client_id: GOOGLE_CALENDAR_CLIENT_ID,
+      scope: GOOGLE_CALENDAR_SCOPE,
+      ux_mode: "popup",
+      access_type: "offline", // ask for a refresh token, not just a short-lived access token
+      callback: (resp) => googleCodeCallback(resp),
+    });
+  }
+  googleCodeCallback = callback;
+  googleCodeClient.requestCode();
+}
+
+const apiConnectGoogleCalendar = (code) => apiPost({ sheet: "GoogleCalendar", action: "connect", data: { code } });
+const apiListGoogleCalendars = () => apiPost({ sheet: "GoogleCalendar", action: "listCalendars", data: {} });
+const apiListGoogleEvents = (calendarIds) => apiPost({ sheet: "GoogleCalendar", action: "listEvents", data: { calendarIds } });
+const apiDisconnectGoogleCalendar = () => apiPost({ sheet: "GoogleCalendar", action: "disconnect", data: {} });
+
+// Merges raw Google event objects (from possibly several calendars) into the same
+// { "YYYY-MM-DD": [{ time, title, attendees }] } shape the rest of CalendarPanel already reads.
+function groupGoogleEventsByDate(events) {
+  const byDate = {};
+  events.forEach((ev) => {
+    const startRaw = ev.start?.dateTime || ev.start?.date;
+    if (!startRaw) return;
+    const dateStr = startRaw.slice(0, 10);
+    const timeLabel = ev.start?.dateTime
+      ? new Date(ev.start.dateTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+      : "All day";
+    if (!byDate[dateStr]) byDate[dateStr] = [];
+    byDate[dateStr].push({ time: timeLabel, title: ev.summary || "(no title)", attendees: (ev.attendees || []).map((a) => a.displayName || a.email).filter(Boolean) });
+  });
+  return byDate;
+}
 
 const seedStaff = {
   abv: [
@@ -536,7 +631,10 @@ export default function OpsDashboard() {
   const [openProject, setOpenProject] = useState(() => readNavFromUrl().project);
   const [showNewProject, setShowNewProject] = useState(() => readNavFromUrl().isNew);
   const [detail, setDetail] = useState(() => readNavFromUrl().detail); // central callout detail modal
-  const [calDate, setCalDate] = useState("2026-07-10");
+  const [calDate, setCalDate] = useState(() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  });
   const [calView, setCalView] = useState("day");
   const [staffByCampus, setStaffByCampus] = useState(seedStaff);
   const [users, setUsers] = useState([]);
@@ -695,11 +793,37 @@ export default function OpsDashboard() {
     if (!auth) return;
     let cancelled = false;
     (async () => {
-      try {
-        const [projectRows, subtaskRows, staffRows, userRows] = await Promise.all([apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users")]);
-        if (cancelled) return;
-        setUsers(userRows.map((u) => ({ ...u, id: Number(u.id) })));
+      // Each sheet is fetched independently (allSettled, not all) — one sheet erroring (a
+      // missing tab, a transient timeout) must not wipe out the others. Previously a single
+      // failed fetch in a Promise.all rejected the whole batch and silently reset everything
+      // (staff, projects, users) back to nothing, which is exactly what happened when the
+      // CampusConfig tab didn't exist yet.
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"),
+      ]);
+      if (cancelled) return;
 
+      const failures = [];
+      const valueOr = (result, label, fallback) => {
+        if (result.status === "fulfilled") return result.value;
+        failures.push(`${label}: ${result.reason?.message || result.reason}`);
+        return fallback;
+      };
+
+      const subtaskRows = valueOr(subtasksResult, "Subtasks", []);
+      const userRows = valueOr(usersResult, "Users", []);
+      const campusConfigRows = valueOr(campusConfigResult, "CampusConfig", []);
+
+      if (usersResult.status === "fulfilled") setUsers(userRows.map((u) => ({ ...u, id: Number(u.id) })));
+
+      if (campusConfigResult.status === "fulfilled") {
+        const slidesLinks = {};
+        campusConfigRows.forEach((r) => { if (r.slidesLink) slidesLinks[r.campusId] = r.slidesLink; });
+        setCampusSlidesLinks(slidesLinks);
+      }
+
+      if (projectsResult.status === "fulfilled") {
+        const projectRows = projectsResult.value;
         if (projectRows.length === 0) {
           // Empty Sheet means empty dashboard — no auto-reseeding. Demo data is only ever
           // loaded on purpose now (see "Load Demo Data" in Reports), never silently.
@@ -734,9 +858,12 @@ export default function OpsDashboard() {
           }));
           setProjects(loadedProjects);
         }
+      }
 
-        // Staff: always reflects exactly what the Sheet has, including "nothing" — previously
-        // an empty Staff sheet was silently ignored and the old seed roster stayed forever.
+      // Staff: always reflects exactly what the Sheet has, including "nothing" — previously
+      // an empty Staff sheet was silently ignored and the old seed roster stayed forever.
+      if (staffResult.status === "fulfilled") {
+        const staffRows = staffResult.value;
         if (staffRows.length === 0) {
           setStaffByCampus({});
         } else {
@@ -752,10 +879,13 @@ export default function OpsDashboard() {
           });
           setStaffByCampus(byCampus);
         }
+      }
 
+      if (failures.length > 0) {
+        setBackendStatus("offline");
+        setBackendError(`${failures.length} sheet(s) failed to load. First: ${failures[0]}`);
+      } else {
         setBackendStatus("connected");
-      } catch (err) {
-        if (!cancelled) { setBackendStatus("offline"); setBackendError(err?.message || String(err)); }
       }
     })();
     return () => { cancelled = true; };
@@ -793,6 +923,11 @@ export default function OpsDashboard() {
   }, [displayProjects, activeCampusId]);
 
   const staff = staffByCampus[activeCampusId] || [];
+  // Central, viewing the org-wide overview (no campus drilled into), still gets a real staff
+  // roster of its own — the Central Operations Team — via the same Staff & Team machinery
+  // every campus uses, just scoped to the "central" pseudo-campus id instead of a real one.
+  const staffCampusId = activeCampusId || (role === "central" ? "central" : null);
+  const staffForPanel = staffByCampus[staffCampusId] || [];
   const notes = notesByCampus[activeCampusId] || [];
   const dayEvents = seedCalendar[calDate] || [];
 
@@ -1011,6 +1146,25 @@ export default function OpsDashboard() {
     setStaffByCampus((prev) => ({ ...prev, [campusId]: [...(prev[campusId] || []), newPerson] }));
     syncToBackend(apiCreate("Staff", { ...newPerson, campusId }));
   };
+
+  // Second, more structured way to build the roster: a person added straight into one of the
+  // 4 team lanes, with contact info and an optional reports-to captured up front — versus the
+  // simpler free-text "Add Team Member" flow above, which stays as-is alongside this.
+  const addTeamRole = (campusId, lane, data) => {
+    const newPerson = {
+      id: Date.now(),
+      name: `${data.firstName} ${data.lastName}`.trim(),
+      roles: [data.role],
+      lane,
+      email: data.email || "",
+      phone: data.phone || "",
+      reportsTo: data.reportsTo || null,
+      nextMeeting: "Not yet scheduled", lastContact: "Just added", flag: null, calendarSynced: false, calendars: [],
+    };
+    setStaffByCampus((prev) => ({ ...prev, [campusId]: [...(prev[campusId] || []), newPerson] }));
+    logActivity("added team role", `${newPerson.name} — ${data.role}`, campusId);
+    syncToBackend(apiCreate("Staff", { ...newPerson, campusId }));
+  };
   const removeStaff = (campusId, id) => {
     setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).filter((s) => s.id !== id) }));
     syncToBackend(apiDelete("Staff", id));
@@ -1026,6 +1180,34 @@ export default function OpsDashboard() {
   const addRoleOption = (roleName) => {
     const trimmed = roleName.trim();
     if (trimmed && !roleOptions.includes(trimmed)) setRoleOptions((prev) => [...prev, trimmed]);
+  };
+
+  // Persists which of their own real Google Calendars a user has chosen to show — not the
+  // OAuth connection itself (that's session-only, see requestGoogleCalendarToken). Anyone can
+  // update their own Users row (Code.gs already allows this: auth.userId === id), so this
+  // needs no backend change.
+  const saveMyGoogleCalendars = (calendarIds, calendarNames) => {
+    setUsers((prev) => prev.map((u) => u.id === auth.user.id ? { ...u, googleCalendarIds: calendarIds, googleCalendarNames: calendarNames } : u));
+    setAuth({ ...auth, user: { ...auth.user, googleCalendarIds: calendarIds, googleCalendarNames: calendarNames } });
+    syncToBackend(apiUpdate("Users", auth.user.id, { googleCalendarIds: calendarIds, googleCalendarNames: calendarNames }));
+  };
+
+  // Reflects the permanent connect/disconnect Code.gs already performed server-side (the
+  // actual connect/disconnect API calls happen in CalendarPanel) into local state, so the rest
+  // of the app immediately sees authUser.googleCalendarConnected change without a reload.
+  const setMyGoogleConnected = (connected) => {
+    setUsers((prev) => prev.map((u) => u.id === auth.user.id ? { ...u, googleCalendarConnected: connected } : u));
+    setAuth({ ...auth, user: { ...auth.user, googleCalendarConnected: connected } });
+  };
+
+  // Persists a campus's Slides org-chart link to the CampusConfig sheet (id = campusId, so
+  // this is a plain generic-CRUD upsert: create the row the first time, update it after that).
+  const setCampusSlidesLink = (campusId, url) => {
+    const hadRow = campusSlidesLinks[campusId] !== undefined;
+    setCampusSlidesLinks((prev) => ({ ...prev, [campusId]: url }));
+    syncToBackend(hadRow
+      ? apiUpdate("CampusConfig", campusId, { slidesLink: url })
+      : apiCreate("CampusConfig", { id: campusId, campusId, slidesLink: url }));
   };
 
   // Mirrors tierForRole_ in Code.gs — kept in sync locally purely so the Team Accounts panel
@@ -1060,6 +1242,31 @@ export default function OpsDashboard() {
   const removeUserAccount = (id) => {
     setUsers((prev) => prev.filter((u) => u.id !== id));
     syncToBackend(apiDelete("Users", id));
+  };
+
+  // Associates a Staff & Team roster entry with a real login (Users row) — the two stay
+  // separate systems (Staff is directory/assignment info, Users is auth), this just cross-
+  // references them so a roster entry can show and manage the account tied to that person.
+  const linkStaffUser = (campusId, staffId, userId) => {
+    setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === staffId ? { ...s, userId } : s) }));
+    syncToBackend(apiUpdate("Staff", staffId, { userId }));
+  };
+
+  // Creates a brand-new login for someone already on the roster and links it in the same
+  // step — the common case (this person doesn't have an account yet) in one action instead of
+  // creating it in Team Accounts and then separately linking it here.
+  const createAndLinkUser = (campusId, staffId, data) => {
+    const staffPerson = (staffByCampus[campusId] || []).find((s) => s.id === staffId);
+    const role = staffPerson?.roles?.[0] || "";
+    const newUser = {
+      id: Date.now(),
+      firstName: data.firstName, lastName: data.lastName, email: data.email, phone: data.phone || "",
+      campusId, role, tier: tierFromAccess(campusId, role),
+      createdAt: TODAY_STR,
+    };
+    setUsers((prev) => [...prev, newUser]);
+    syncToBackend(apiCreate("Users", { ...newUser, password: data.password }));
+    linkStaffUser(campusId, staffId, newUser.id);
   };
 
   // Commits a reviewed org-chart roster for a campus. Any role that's unchanged or brand new
@@ -1330,22 +1537,24 @@ export default function OpsDashboard() {
 
           {tab === "staff" && (
             <StaffPanel
-              staff={staff} campusLabel={activeCampus ? activeCampus.name : "Select a campus"} full
-              campusId={activeCampusId} roleOptions={roleOptions}
-              onAdd={addStaff} onRemove={removeStaff} onUpdateRoles={updateStaffRoles}
+              staff={staffForPanel} campusLabel={activeCampus ? activeCampus.name : (staffCampusId === "central" ? "Central Operations Team" : "Select a campus")} full
+              campusId={staffCampusId} roleOptions={roleOptions}
+              onAdd={addStaff} onAddTeamRole={addTeamRole} onRemove={removeStaff} onUpdateRoles={updateStaffRoles}
               onSetCalendars={setStaffCalendars} onAddRoleOption={addRoleOption}
-              slidesLink={campusSlidesLinks[activeCampusId] || ""}
-              onSetSlidesLink={(url) => setCampusSlidesLinks((prev) => ({ ...prev, [activeCampusId]: url }))}
+              slidesLink={campusSlidesLinks[staffCampusId] || ""}
+              onSetSlidesLink={(url) => setCampusSlidesLink(staffCampusId, url)}
               campusPhase={activeCampus?.phase}
               onCommitOrgChart={commitOrgChart}
-              pendingReassignments={pendingReassignments.filter((r) => r.campusId === activeCampusId)}
+              pendingReassignments={pendingReassignments.filter((r) => r.campusId === staffCampusId)}
               onResolveReassignment={resolveReassignment}
               onOpenProfile={setOpenStaffProfile}
+              users={users} onLinkUser={linkStaffUser} onCreateAndLinkUser={createAndLinkUser}
             />
           )}
 
           {tab === "calendar" && (
-            <CalendarPanel calDate={calDate} setCalDate={setCalDate} calView={calView} setCalView={setCalView} dayEvents={dayEvents} full />
+            <CalendarPanel calDate={calDate} setCalDate={setCalDate} calView={calView} setCalView={setCalView} dayEvents={dayEvents} full
+              authUser={auth.user} onSaveGoogleCalendars={saveMyGoogleCalendars} onSetGoogleConnected={setMyGoogleConnected} />
           )}
 
           {tab === "notes" && (
@@ -1726,113 +1935,9 @@ function ProgressBar({ subtasks }) {
   );
 }
 
-function OrgChartImportPanel({ campusId, onCommit }) {
-  const [status, setStatus] = useState("idle"); // idle | extracting | review | error
-  const [errorMsg, setErrorMsg] = useState("");
-  const [rows, setRows] = useState([]); // { name, role, reportsTo }
-
-  const handleFile = async (file) => {
-    if (!file) return;
-    setStatus("extracting");
-    setErrorMsg("");
-    try {
-      const base64 = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result.split(",")[1]);
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
-
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 1500,
-          messages: [{
-            role: "user",
-            content: [
-              { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } },
-              { type: "text", text: "This is a campus org chart. Extract every named team member as a JSON array with fields: name, role, reportsTo (the name of the person they report to, or null if they're at the top). Respond with ONLY the JSON array — no markdown fences, no commentary." },
-            ],
-          }],
-        }),
-      });
-
-      if (!response.ok) throw new Error(`API returned ${response.status}`);
-      const data = await response.json();
-      const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
-      const cleaned = text.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(cleaned);
-      setRows(parsed.map((p) => ({ name: p.name || "", role: p.role || "", reportsTo: p.reportsTo || "" })));
-      setStatus("review");
-    } catch (e) {
-      // Auto-extraction only works inside Claude's own preview — on a deployed site with no
-      // backend proxying the API key, this call will fail. Fall back to manual entry instead
-      // of leaving the OD stuck.
-      setErrorMsg("Couldn't auto-read this PDF here (this only works inside Claude's preview unless you've wired up a backend). You can enter the roster manually below instead.");
-      setRows([{ name: "", role: "", reportsTo: "" }]);
-      setStatus("review");
-    }
-  };
-
-  const updateRow = (i, field, value) => setRows((prev) => prev.map((r, idx) => idx === i ? { ...r, [field]: value } : r));
-  const addRow = () => setRows((prev) => [...prev, { name: "", role: "", reportsTo: "" }]);
-  const removeRow = (i) => setRows((prev) => prev.filter((_, idx) => idx !== i));
-
-  const commit = () => {
-    const clean = rows.filter((r) => r.name.trim() && r.role.trim());
-    if (clean.length === 0) return;
-    onCommit(campusId, clean);
-    setStatus("idle");
-    setRows([]);
-  };
-
-  return (
-    <div className="rounded-lg p-3 mb-4" style={{ background: "#EFEEFA", border: "1px solid #D8D5EC" }}>
-      <div className="text-[11.5px] font-medium text-[#2A2A3A] mb-1.5">Import Org Chart from PDF</div>
-
-      {status === "idle" && (
-        <div>
-          <label className="inline-flex items-center gap-1.5 text-[11px] cursor-pointer" style={{ color: "#B8862F" }}>
-            <Camera size={12} /> Upload the Slides deck exported as PDF
-            <input type="file" accept="application/pdf" className="hidden" onChange={(e) => handleFile(e.target.files[0])} />
-          </label>
-          <div className="text-[10.5px] text-[#8B889C] mt-1.5">Extracts names, roles, and who reports to whom. Auto-read works inside Claude's preview; on a deployed site without a backend, you'll enter it manually instead.</div>
-        </div>
-      )}
-
-      {status === "extracting" && <div className="text-[11.5px] text-[#6B6980]">Reading the deck…</div>}
-
-      {status === "review" && (
-        <div>
-          {errorMsg && <div className="text-[10.5px] mb-2" style={{ color: "#B5462E" }}>{errorMsg}</div>}
-          <div className="text-[10.5px] text-[#6B6980] mb-2">Review before committing — this is what gets applied to the roster.</div>
-          <div className="space-y-1.5 mb-2">
-            {rows.map((r, i) => (
-              <div key={i} className="grid grid-cols-[1fr_1fr_1fr_auto] gap-1.5">
-                <input value={r.name} onChange={(e) => updateRow(i, "name", e.target.value)} placeholder="Name"
-                  className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11px] outline-none" />
-                <input value={r.role} onChange={(e) => updateRow(i, "role", e.target.value)} placeholder="Role"
-                  className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11px] outline-none" />
-                <input value={r.reportsTo} onChange={(e) => updateRow(i, "reportsTo", e.target.value)} placeholder="Reports to"
-                  className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11px] outline-none" />
-                <button onClick={() => removeRow(i)} className="text-[#8B889C] hover:text-[#C15B5B] px-1"><Trash2 size={13} /></button>
-              </div>
-            ))}
-          </div>
-          <div className="flex gap-2 flex-wrap">
-            <button onClick={addRow} className="text-[10.5px] text-[#B8862F] flex items-center gap-1"><Plus size={11} /> Add row</button>
-            <button onClick={commit} className="text-[11px] rounded-md px-3 py-1.5 font-medium ml-auto" style={{ background: "#B8862F", color: "#F7F6FB" }}>Commit to Roster</button>
-            <button onClick={() => { setStatus("idle"); setRows([]); }} className="text-[11px] text-[#6B6980] px-2 py-1.5">Cancel</button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onRemove, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile }) {
+function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onAddTeamRole, onRemove, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile, users, onLinkUser, onCreateAndLinkUser }) {
+  const [addingLane, setAddingLane] = useState(null); // which lane's "Add Team Role" modal is open
+  const [linkingId, setLinkingId] = useState(null); // which staff row's login-linker is open
   const [editingId, setEditingId] = useState(null);
   const [calendarPickerId, setCalendarPickerId] = useState(null);
   const [adding, setAdding] = useState(false);
@@ -1840,6 +1945,9 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
   const [newRoles, setNewRoles] = useState([]);
   const [editingSlidesLink, setEditingSlidesLink] = useState(false);
   const [slidesDraft, setSlidesDraft] = useState(slidesLink || "");
+  const [importStatus, setImportStatus] = useState("idle"); // idle | loading | review | error
+  const [importError, setImportError] = useState("");
+  const [importRows, setImportRows] = useState([]); // { name, role, reportsTo }
 
   const submitAdd = () => {
     if (!newName.trim() || !campusId) return;
@@ -1850,6 +1958,30 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
   const saveSlidesLink = () => {
     onSetSlidesLink(slidesDraft.trim());
     setEditingSlidesLink(false);
+  };
+
+  const runImport = async () => {
+    setImportStatus("loading");
+    setImportError("");
+    try {
+      const result = await apiImportOrgChartFromSlides(campusId, slidesLink, campusPhase);
+      setImportRows(result.people.map((p) => ({ name: p.name || "", role: p.role || "", reportsTo: p.reportsTo || "" })));
+      setImportStatus("review");
+    } catch (e) {
+      setImportError(e?.message || String(e));
+      setImportStatus("error");
+    }
+  };
+
+  const updateImportRow = (i, field, value) => setImportRows((prev) => prev.map((r, idx) => idx === i ? { ...r, [field]: value } : r));
+  const removeImportRow = (i) => setImportRows((prev) => prev.filter((_, idx) => idx !== i));
+
+  const commitImport = () => {
+    const clean = importRows.filter((r) => r.name.trim() && r.role.trim());
+    if (clean.length === 0) return;
+    onCommitOrgChart(campusId, clean);
+    setImportStatus("idle");
+    setImportRows([]);
   };
 
   return (
@@ -1883,11 +2015,45 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
               <button onClick={() => setEditingSlidesLink(false)} className="text-[11px] text-[#6B6980] px-2">Cancel</button>
             </div>
           ) : slidesLink ? (
-            <a href={slidesLink} target="_blank" rel="noreferrer" className="text-[11.5px] flex items-center gap-1" style={{ color: "#2B4C7E" }}>
-              <Link2 size={12} /> View current phase, roles & titles deck
-            </a>
+            <div className="flex items-center gap-3 flex-wrap">
+              <a href={slidesLink} target="_blank" rel="noreferrer" className="text-[11.5px] flex items-center gap-1" style={{ color: "#2B4C7E" }}>
+                <Link2 size={12} /> View current phase, roles & titles deck
+              </a>
+              {importStatus !== "review" && (
+                <button onClick={runImport} disabled={importStatus === "loading"} className="text-[11px] rounded-md px-2.5 py-1 font-medium" style={{ background: "#B8862F", color: "#F7F6FB", opacity: importStatus === "loading" ? 0.7 : 1 }}>
+                  {importStatus === "loading" ? "Reading slide…" : "Import from this deck"}
+                </button>
+              )}
+            </div>
           ) : (
             <div className="text-[11px] text-[#8B889C]">No deck linked yet — add the Slides link showing this campus's current phase, staff roles, and titles.</div>
+          )}
+
+          {importStatus === "error" && (
+            <div className="text-[10.5px] mt-2" style={{ color: "#B5462E" }}>{importError}</div>
+          )}
+
+          {importStatus === "review" && (
+            <div className="mt-3">
+              <div className="text-[10.5px] text-[#6B6980] mb-2">Read from Phase {campusPhase} of the deck — review before committing to the roster.</div>
+              <div className="space-y-1.5 mb-2">
+                {importRows.map((r, i) => (
+                  <div key={i} className="grid grid-cols-[1fr_1fr_1fr_auto] gap-1.5">
+                    <input value={r.name} onChange={(e) => updateImportRow(i, "name", e.target.value)} placeholder="Name"
+                      className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11px] outline-none" />
+                    <input value={r.role} onChange={(e) => updateImportRow(i, "role", e.target.value)} placeholder="Role"
+                      className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11px] outline-none" />
+                    <input value={r.reportsTo} onChange={(e) => updateImportRow(i, "reportsTo", e.target.value)} placeholder="Reports to"
+                      className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11px] outline-none" />
+                    <button onClick={() => removeImportRow(i)} className="text-[#8B889C] hover:text-[#C15B5B] px-1"><Trash2 size={13} /></button>
+                  </div>
+                ))}
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                <button onClick={commitImport} className="text-[11px] rounded-md px-3 py-1.5 font-medium" style={{ background: "#B8862F", color: "#F7F6FB" }}>Commit to Roster</button>
+                <button onClick={() => { setImportStatus("idle"); setImportRows([]); }} className="text-[11px] text-[#6B6980] px-2 py-1.5">Cancel</button>
+              </div>
+            </div>
           )}
         </div>
       )}
@@ -1909,6 +2075,48 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
             ))}
           </div>
         </div>
+      )}
+
+      {full && campusId && (
+        <div className="mb-5">
+          <div className="text-[11.5px] font-medium text-[#2A2A3A] mb-2">Team Lanes</div>
+          <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            {TEAM_LANES.map((lane) => {
+              const laneStaff = staff.filter((s) => s.lane === lane);
+              return (
+                <div key={lane} className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="text-[12px] font-medium">{lane}</div>
+                    <button onClick={() => setAddingLane(lane)} className="text-[#B8862F] hover:text-[#8A6420]"><Plus size={14} /></button>
+                  </div>
+                  {laneStaff.length === 0 && <div className="text-[10.5px] text-[#8B889C]">No one yet.</div>}
+                  <div className="space-y-1.5">
+                    {laneStaff.map((s) => (
+                      <div key={s.id} className="text-[11.5px] rounded-md px-2 py-1.5" style={{ background: "#F7F6FB" }}>
+                        <div className="font-medium">{s.name}</div>
+                        <div className="text-[10.5px] text-[#6B6980]">{(s.roles || []).join(", ")}</div>
+                        {s.reportsTo && <div className="text-[10px] text-[#8B889C]">→ reports to {s.reportsTo}</div>}
+                      </div>
+                    ))}
+                  </div>
+                  <button onClick={() => setAddingLane(lane)} className="flex items-center gap-1 text-[10.5px] mt-2" style={{ color: "#B8862F" }}>
+                    <Plus size={11} /> Add Team Role
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {addingLane && (
+        <AddTeamRoleModal
+          lane={addingLane}
+          roleOptions={LANE_ROLE_OPTIONS[addingLane] || []}
+          reportsToOptions={staff}
+          onClose={() => setAddingLane(null)}
+          onCreate={(data) => { onAddTeamRole(campusId, addingLane, data); setAddingLane(null); }}
+        />
       )}
 
       {full && adding && (
@@ -1936,6 +2144,18 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                 {s.flag && <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#C15B5B22] text-[#C15B5B] flex items-center gap-1 whitespace-nowrap"><AlertTriangle size={10} />{s.flag}</span>}
                 {full && campusId && (
                   <>
+                    {(() => {
+                      const linkedUser = s.userId ? users?.find((u) => String(u.id) === String(s.userId)) : null;
+                      return linkedUser ? (
+                        <span className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#5E9E8A] text-[#5E9E8A] whitespace-nowrap flex items-center gap-1">
+                          <ShieldCheck size={10} /> {linkedUser.email}
+                        </span>
+                      ) : (
+                        <button onClick={() => setLinkingId(linkingId === s.id ? null : s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#D8D5EC] text-[#8B889C] hover:border-[#B8862F] hover:text-[#B8862F] whitespace-nowrap">
+                          Link Login
+                        </button>
+                      );
+                    })()}
                     <button onClick={() => setCalendarPickerId(calendarPickerId === s.id ? null : s.id)}
                       className={`text-[9.5px] px-2 py-0.5 rounded-full border whitespace-nowrap ${s.calendarSynced ? "border-[#5E9E8A] text-[#5E9E8A]" : "border-[#D8D5EC] text-[#8B889C]"}`}>
                       {s.calendarSynced ? `${s.calendars?.length || 0} cal${s.calendars?.length === 1 ? "" : "s"} synced` : "Sync Calendar"}
@@ -1962,9 +2182,72 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                 <CalendarSyncPicker staffer={s} onSave={(cals) => { onSetCalendars(campusId, s.id, cals); setCalendarPickerId(null); }} />
               </div>
             )}
+            {full && linkingId === s.id && (
+              <div className="mt-3 pt-3 border-t border-[#E3E1F0]">
+                <StaffLoginLinker staffPerson={s} campusId={campusId} users={users}
+                  onLink={(userId) => { onLinkUser(campusId, s.id, userId); setLinkingId(null); }}
+                  onCreateAndLink={(data) => { onCreateAndLinkUser(campusId, s.id, data); setLinkingId(null); }}
+                  onCancel={() => setLinkingId(null)} />
+              </div>
+            )}
           </div>
         ))}
         {staff.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No team members in view.</div>}
+      </div>
+    </div>
+  );
+}
+
+function AddTeamRoleModal({ lane, roleOptions, reportsToOptions, onClose, onCreate }) {
+  useLockBodyScroll();
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
+  const [email, setEmail] = useState("");
+  const [phone, setPhone] = useState("");
+  const [role, setRole] = useState(roleOptions[0] || "");
+  const [reportsTo, setReportsTo] = useState("");
+
+  const inputClass = "w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#2B4C7E]";
+  const labelClass = "text-[11px] font-medium text-[#6B6980] mb-1 block";
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!firstName.trim() || !lastName.trim()) return;
+    onCreate({ firstName: firstName.trim(), lastName: lastName.trim(), email: email.trim(), phone: phone.trim(), role, reportsTo: reportsTo || null });
+  };
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-xl p-6 w-full max-w-[420px] max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-[15px] font-semibold">Add Team Role — {lane}</h2>
+          <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
+        </div>
+        <form onSubmit={submit} className="space-y-3">
+          <div className="grid grid-cols-2 gap-2">
+            <div><label className={labelClass}>First name</label><input required value={firstName} onChange={(e) => setFirstName(e.target.value)} className={inputClass} /></div>
+            <div><label className={labelClass}>Last name</label><input required value={lastName} onChange={(e) => setLastName(e.target.value)} className={inputClass} /></div>
+          </div>
+          <div><label className={labelClass}>Email address</label><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} className={inputClass} /></div>
+          <div><label className={labelClass}>Phone number</label><input type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} className={inputClass} /></div>
+          <div>
+            <label className={labelClass}>Role / Title</label>
+            <select value={role} onChange={(e) => setRole(e.target.value)} className={inputClass}>
+              {roleOptions.map((r) => <option key={r} value={r}>{r}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className={labelClass}>Reports To (optional)</label>
+            <select value={reportsTo} onChange={(e) => setReportsTo(e.target.value)} className={inputClass}>
+              <option value="">— None —</option>
+              {reportsToOptions.map((s) => <option key={s.id} value={s.name}>{s.name} — {(s.roles || []).join(", ") || "no role set"}</option>)}
+            </select>
+          </div>
+          <div className="flex gap-2 pt-1">
+            <button type="submit" className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Add to {lane}</button>
+            <button type="button" onClick={onClose} className="text-[13px] text-[#6B6980] px-2">Cancel</button>
+          </div>
+        </form>
       </div>
     </div>
   );
@@ -2036,6 +2319,69 @@ function CalendarSyncPicker({ staffer, onSave }) {
   );
 }
 
+// Lets a Staff & Team roster entry (directory info, no login) get connected to a real Users
+// login — either an existing account (an unassigned one waiting to be claimed, or one already
+// scoped to this campus) or a brand-new one created and linked in the same step.
+function StaffLoginLinker({ staffPerson, campusId, users, onLink, onCreateAndLink, onCancel }) {
+  const [mode, setMode] = useState("pick"); // "pick" | "create"
+  const [selectedUserId, setSelectedUserId] = useState("");
+  const nameParts = (staffPerson.name || "").split(" ");
+  const [firstName, setFirstName] = useState(nameParts[0] || "");
+  const [lastName, setLastName] = useState(nameParts.slice(1).join(" "));
+  const [email, setEmail] = useState(staffPerson.email || "");
+  const [phone, setPhone] = useState(staffPerson.phone || "");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+
+  const eligibleUsers = (users || []).filter((u) => u.campusId === campusId || u.tier === "unassigned");
+
+  const submitCreate = (e) => {
+    e.preventDefault();
+    if (!firstName.trim() || !lastName.trim() || !email.trim()) { setError("First name, last name, and email are required."); return; }
+    if (password.length < 8) { setError("Password must be at least 8 characters."); return; }
+    onCreateAndLink({ firstName: firstName.trim(), lastName: lastName.trim(), email: email.trim(), phone: phone.trim(), password });
+  };
+
+  return (
+    <div className="rounded-md p-3" style={{ background: "#F7F6FB", border: "1px solid #D8D5EC" }}>
+      <div className="flex items-center gap-2 mb-2">
+        <button onClick={() => setMode("pick")} className={`text-[10.5px] px-2 py-1 rounded-md ${mode === "pick" ? "bg-[#2B4C7E] text-[#F7F6FB]" : "text-[#6B6980]"}`}>Link existing account</button>
+        <button onClick={() => setMode("create")} className={`text-[10.5px] px-2 py-1 rounded-md ${mode === "create" ? "bg-[#2B4C7E] text-[#F7F6FB]" : "text-[#6B6980]"}`}>Create new login</button>
+      </div>
+
+      {mode === "pick" ? (
+        <div className="flex gap-2 flex-wrap">
+          <select value={selectedUserId} onChange={(e) => setSelectedUserId(e.target.value)}
+            className="flex-1 min-w-[180px] bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11.5px] outline-none">
+            <option value="">Select an account…</option>
+            {eligibleUsers.map((u) => (
+              <option key={u.id} value={u.id}>{u.firstName} {u.lastName} — {u.email}{u.tier === "unassigned" ? " (unassigned)" : ""}</option>
+            ))}
+          </select>
+          <button disabled={!selectedUserId} onClick={() => onLink(selectedUserId)} className="text-[11px] rounded-md px-3 py-1.5 font-medium disabled:opacity-50" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Link</button>
+          <button onClick={onCancel} className="text-[11px] text-[#6B6980] px-2">Cancel</button>
+          {eligibleUsers.length === 0 && <div className="text-[10.5px] text-[#8B889C] w-full">No unlinked accounts found for this campus — try "Create new login" instead.</div>}
+        </div>
+      ) : (
+        <form onSubmit={submitCreate} className="space-y-2">
+          <div className="grid grid-cols-2 gap-2">
+            <input required value={firstName} onChange={(e) => setFirstName(e.target.value)} placeholder="First name" className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11.5px] outline-none" />
+            <input required value={lastName} onChange={(e) => setLastName(e.target.value)} placeholder="Last name" className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11.5px] outline-none" />
+          </div>
+          <input required type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email address" className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11.5px] outline-none" />
+          <input type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Phone (optional)" className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11.5px] outline-none" />
+          <input required type="password" minLength={8} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Temporary password" className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11.5px] outline-none" />
+          {error && <div className="text-[10.5px]" style={{ color: "#C15B5B" }}>{error}</div>}
+          <div className="flex gap-2">
+            <button type="submit" className="text-[11px] rounded-md px-3 py-1.5 font-medium" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Create & Link</button>
+            <button type="button" onClick={onCancel} className="text-[11px] text-[#6B6980] px-2">Cancel</button>
+          </div>
+        </form>
+      )}
+    </div>
+  );
+}
+
 function calToDate(s) { return new Date(s + "T00:00:00"); }
 function calFmtISO(d) { return d.toISOString().slice(0, 10); }
 function calStartOfWeek(dateStr) {
@@ -2067,18 +2413,102 @@ function calDatesInRange(startStr, endStr) {
   return days;
 }
 
-function CalendarPanel({ calDate, setCalDate, calView, setCalView, dayEvents, full }) {
+function CalendarPanel({ calDate, setCalDate, calView, setCalView, dayEvents, full, authUser, onSaveGoogleCalendars, onSetGoogleConnected }) {
   const [searchQuery, setSearchQuery] = useState("");
   const [customStart, setCustomStart] = useState(calDate);
   const [customEnd, setCustomEnd] = useState(calDate);
+
+  // Real, permanent Google Calendar connection — see requestGoogleAuthCode and the
+  // apiConnectGoogleCalendar/apiListGoogleCalendars/apiListGoogleEvents helpers above.
+  // googleEventsByDate is null until events have actually been fetched; until then every view
+  // below falls back to the seedCalendar demo data, same as before. Once authUser.
+  // googleCalendarConnected is true, this loads automatically on mount — no popup, no click.
+  const [connecting, setConnecting] = useState(false);
+  const [calError, setCalError] = useState("");
+  const [availableCalendars, setAvailableCalendars] = useState(null); // fetched list, once connected
+  const [selectedIds, setSelectedIds] = useState(() => authUser?.googleCalendarIds || []);
+  const [showPicker, setShowPicker] = useState(false);
+  const [googleEventsByDate, setGoogleEventsByDate] = useState(null);
+  const [loadingEvents, setLoadingEvents] = useState(false);
+
+  useEffect(() => {
+    if (authUser?.googleCalendarConnected && (authUser?.googleCalendarIds || []).length > 0) {
+      setLoadingEvents(true);
+      apiListGoogleEvents(authUser.googleCalendarIds)
+        .then((result) => setGoogleEventsByDate(groupGoogleEventsByDate(result.events || [])))
+        .catch((e) => setCalError(e?.message || String(e)))
+        .finally(() => setLoadingEvents(false));
+    }
+    // Only ever needs to run once per mount — reconnecting/reselecting is handled by their
+    // own explicit button clicks below, not by this effect re-firing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const connectGoogleCalendar = () => {
+    setConnecting(true);
+    setCalError("");
+    requestGoogleAuthCode(async (resp) => {
+      if (resp.error) { setConnecting(false); setCalError(typeof resp.error === "string" ? resp.error : "Couldn't connect to Google Calendar."); return; }
+      try {
+        await apiConnectGoogleCalendar(resp.code); // backend exchanges + stores the refresh token permanently
+        onSetGoogleConnected(true);
+        const { calendars } = await apiListGoogleCalendars();
+        setAvailableCalendars(calendars);
+        setShowPicker(true);
+        if ((authUser?.googleCalendarIds || []).length > 0) {
+          setLoadingEvents(true);
+          const result = await apiListGoogleEvents(authUser.googleCalendarIds);
+          setGoogleEventsByDate(groupGoogleEventsByDate(result.events || []));
+          setLoadingEvents(false);
+        }
+      } catch (e) {
+        setCalError(e?.message || String(e));
+      } finally {
+        setConnecting(false);
+      }
+    });
+  };
+
+  const disconnectGoogleCalendar = async () => {
+    setCalError("");
+    try {
+      await apiDisconnectGoogleCalendar();
+      onSetGoogleConnected(false);
+      setGoogleEventsByDate(null);
+      setAvailableCalendars(null);
+      setShowPicker(false);
+    } catch (e) {
+      setCalError(e?.message || String(e));
+    }
+  };
+
+  const toggleCalendarId = (id) => setSelectedIds((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+
+  const saveCalendarSelection = async () => {
+    const names = selectedIds.map((id) => availableCalendars?.find((c) => c.id === id)?.name || id);
+    onSaveGoogleCalendars(selectedIds, names);
+    setShowPicker(false);
+    if (selectedIds.length > 0) {
+      setLoadingEvents(true);
+      try {
+        const result = await apiListGoogleEvents(selectedIds);
+        setGoogleEventsByDate(groupGoogleEventsByDate(result.events || []));
+      } catch (e) {
+        setCalError(e?.message || String(e));
+      }
+      setLoadingEvents(false);
+    } else {
+      setGoogleEventsByDate({});
+    }
+  };
 
   const matchesSearch = (e) => {
     if (!searchQuery.trim()) return true;
     const q = searchQuery.toLowerCase();
     return e.title.toLowerCase().includes(q) || (e.attendees || []).some((a) => a.toLowerCase().includes(q));
   };
-  const eventsForDate = (d) => (seedCalendar[d] || []).filter(matchesSearch);
-  const filteredDayEvents = dayEvents.filter(matchesSearch);
+  const eventsForDate = (d) => (googleEventsByDate ? (googleEventsByDate[d] || []) : (seedCalendar[d] || [])).filter(matchesSearch);
+  const filteredDayEvents = (googleEventsByDate ? (googleEventsByDate[calDate] || []) : dayEvents).filter(matchesSearch);
 
   const weekDates = calWeekDates(calDate);
   const monthGrid = calMonthGrid(calDate);
@@ -2091,14 +2521,57 @@ function CalendarPanel({ calDate, setCalDate, calView, setCalView, dayEvents, fu
           <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
             <div>
               <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(18px,3.6vw,22px)] font-semibold tracking-tight">Calendar</h1>
-              <p className="text-[11.5px] text-[#6B6980] mt-1 flex items-center gap-1"><Link2 size={11} /> Synced from Google Calendar</p>
+              {authUser?.googleCalendarConnected ? (
+                <p className="text-[11.5px] mt-1 flex items-center gap-1" style={{ color: "#5E9E8A" }}>
+                  <Link2 size={11} /> Connected — showing {selectedIds.length} of your Google calendar{selectedIds.length === 1 ? "" : "s"}
+                  <button onClick={async () => { const { calendars } = await apiListGoogleCalendars(); setAvailableCalendars(calendars); setShowPicker((v) => !v); }} className="underline ml-1" style={{ color: "#5E9E8A" }}>change</button>
+                </p>
+              ) : (
+                <p className="text-[11.5px] text-[#6B6980] mt-1 flex items-center gap-1">
+                  <Link2 size={11} /> Showing sample data — connect your Google Calendar
+                </p>
+              )}
             </div>
-            <div className="flex gap-1 bg-[#EFEEFA] border border-[#D8D5EC] rounded-md p-0.5">
-              {["day", "week", "month", "custom"].map((v) => (
-                <button key={v} onClick={() => setCalView(v)} className={`text-[11px] px-2.5 py-1 rounded ${calView === v ? "bg-[#B8862F] text-[#F7F6FB]" : "text-[#6B6980]"}`}>{v[0].toUpperCase() + v.slice(1)}</button>
-              ))}
+            <div className="flex items-center gap-2">
+              {authUser?.googleCalendarConnected ? (
+                <button onClick={disconnectGoogleCalendar} className="text-[11.5px] rounded-md px-3 py-1.5 font-medium whitespace-nowrap" style={{ background: "#E3E1F0", color: "#2A2A3A" }}>
+                  Disconnect
+                </button>
+              ) : (
+                <button onClick={connectGoogleCalendar} disabled={connecting}
+                  className="text-[11.5px] rounded-md px-3 py-1.5 font-medium whitespace-nowrap" style={{ background: "#2B4C7E", color: "#F7F6FB", opacity: connecting ? 0.7 : 1 }}>
+                  {connecting ? "Connecting…" : "Connect Google Calendar"}
+                </button>
+              )}
+              <div className="flex gap-1 bg-[#EFEEFA] border border-[#D8D5EC] rounded-md p-0.5">
+                {["day", "week", "month", "custom"].map((v) => (
+                  <button key={v} onClick={() => setCalView(v)} className={`text-[11px] px-2.5 py-1 rounded ${calView === v ? "bg-[#B8862F] text-[#F7F6FB]" : "text-[#6B6980]"}`}>{v[0].toUpperCase() + v.slice(1)}</button>
+                ))}
+              </div>
             </div>
           </div>
+
+          {calError && <div className="text-[11px] mb-3 rounded-md px-3 py-2" style={{ background: "#C15B5B1A", color: "#C15B5B" }}>{calError}</div>}
+          {loadingEvents && <div className="text-[11px] text-[#6B6980] mb-3">Loading your calendar events…</div>}
+
+          {showPicker && availableCalendars && (
+            <div className="rounded-lg p-3 mb-4" style={{ background: "#EFEEFA", border: "1px solid #D8D5EC" }}>
+              <div className="text-[11.5px] font-medium mb-2">Choose which of your calendars to show — 1, some, or all</div>
+              <div className="space-y-1.5 mb-3">
+                {availableCalendars.map((c) => (
+                  <label key={c.id} className="flex items-center gap-2 text-[12px] cursor-pointer">
+                    <input type="checkbox" checked={selectedIds.includes(c.id)} onChange={() => toggleCalendarId(c.id)} className="accent-[#B8862F]" />
+                    {c.name}{c.primary ? " (primary)" : ""}
+                  </label>
+                ))}
+              </div>
+              <div className="flex gap-2">
+                <button onClick={saveCalendarSelection} className="text-[11.5px] rounded-md px-3 py-1.5 font-medium" style={{ background: "#B8862F", color: "#F7F6FB" }}>Save Selection</button>
+                <button onClick={() => setShowPicker(false)} className="text-[11.5px] text-[#6B6980] px-2">Cancel</button>
+              </div>
+            </div>
+          )}
+
           <div className="mb-4 flex items-center gap-2 flex-wrap">
             <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search by title or person invited…"
               className="flex-1 min-w-[200px] max-w-[360px] bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[11.5px] outline-none focus:border-[#B8862F]" />
@@ -2129,13 +2602,24 @@ function CalendarPanel({ calDate, setCalDate, calView, setCalView, dayEvents, fu
       )}
 
       {full && calView === "week" && (
-        <div className="grid grid-cols-7 gap-2">
-          {weekDates.map((d) => (
-            <button key={d} onClick={() => setCalDate(d)} className={`text-left border rounded-md p-2 min-h-[100px] ${d === calDate ? "border-[#B8862F] bg-[#EFEEFA]" : "border-[#E3E1F0] bg-[#FFFFFF]"}`}>
-              <div className="text-[10.5px] text-[#6B6980] mb-1.5">{d.slice(5)}</div>
-              {eventsForDate(d).map((e, i) => <div key={i} className="text-[9.5px] bg-[#E3E1F0] rounded px-1 py-0.5 mb-1 truncate">{e.title}</div>)}
-            </button>
-          ))}
+        <div className="grid grid-cols-7 gap-2 items-start">
+          {weekDates.map((d) => {
+            const evs = eventsForDate(d);
+            return (
+              <button key={d} onClick={() => setCalDate(d)} className={`text-left border rounded-md p-2 h-[280px] flex flex-col ${d === calDate ? "border-[#B8862F] bg-[#EFEEFA]" : "border-[#E3E1F0] bg-[#FFFFFF]"}`}>
+                <div className="text-[10.5px] font-medium text-[#6B6980] mb-1.5 shrink-0">{d.slice(5)}</div>
+                <div className="space-y-1 overflow-y-auto min-h-0">
+                  {evs.map((e, i) => (
+                    <div key={i} title={`${e.time} — ${e.title}`} className="text-[9.5px] bg-[#E3E1F0] rounded px-1.5 py-1">
+                      <div className="text-[8.5px] text-[#6B6980] font-medium leading-tight">{e.time}</div>
+                      <div className="truncate leading-tight">{e.title}</div>
+                    </div>
+                  ))}
+                  {evs.length === 0 && <div className="text-[9px] text-[#B8B5C9]">Nothing scheduled</div>}
+                </div>
+              </button>
+            );
+          })}
         </div>
       )}
 
@@ -2145,16 +2629,20 @@ function CalendarPanel({ calDate, setCalDate, calView, setCalView, dayEvents, fu
           <div className="grid grid-cols-7 gap-1.5 text-center text-[9.5px] text-[#8B889C] mb-1">
             {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => <div key={d}>{d}</div>)}
           </div>
-          <div className="grid grid-cols-7 gap-1.5">
+          <div className="grid grid-cols-7 gap-1.5 items-start">
             {monthGrid.days.map((d) => {
               const inMonth = calToDate(d).getMonth() === monthGrid.month;
               const evs = eventsForDate(d);
               return (
                 <button key={d} onClick={() => setCalDate(d)}
-                  className={`text-left border rounded-md p-1.5 min-h-[64px] ${d === calDate ? "border-[#B8862F] bg-[#EFEEFA]" : "border-[#E3E1F0] bg-[#FFFFFF]"} ${inMonth ? "" : "opacity-40"}`}>
-                  <div className="text-[9.5px] text-[#8B889C]">{Number(d.slice(8, 10))}</div>
-                  {evs.slice(0, 2).map((e, i) => <div key={i} className="text-[8.5px] bg-[#E3E1F0] rounded px-1 py-0.5 mt-0.5 truncate">{e.title}</div>)}
-                  {evs.length > 2 && <div className="text-[8px] text-[#8B889C] mt-0.5">+{evs.length - 2} more</div>}
+                  className={`text-left border rounded-md p-1.5 h-[92px] flex flex-col ${d === calDate ? "border-[#B8862F] bg-[#EFEEFA]" : "border-[#E3E1F0] bg-[#FFFFFF]"} ${inMonth ? "" : "opacity-40"}`}>
+                  <div className="text-[9.5px] text-[#8B889C] shrink-0">{Number(d.slice(8, 10))}</div>
+                  <div className="overflow-y-auto min-h-0">
+                    {evs.slice(0, 3).map((e, i) => (
+                      <div key={i} title={`${e.time} — ${e.title}`} className="text-[8.5px] bg-[#E3E1F0] rounded px-1 py-0.5 mt-0.5 truncate">{e.title}</div>
+                    ))}
+                    {evs.length > 3 && <div className="text-[8px] text-[#8B889C] mt-0.5">+{evs.length - 3} more</div>}
+                  </div>
                 </button>
               );
             })}
