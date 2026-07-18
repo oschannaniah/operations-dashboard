@@ -8,17 +8,7 @@ import {
 import { Document, Packer, Paragraph, Table, TableRow, TableCell, HeadingLevel, TextRun, WidthType } from "docx";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
-
-const CAMPUSES = [
-  { id: "abv", name: "Abbeville", abbr: "AvC", lead: "Angel Lormand", phase: 1, color: "#E91E8C" },
-  { id: "opl", name: "Opelousas", abbr: "OpC", lead: "Shaina Broussard", phase: 3, color: "#8FA05C" },
-  { id: "laf", name: "Lafayette", abbr: "LC", lead: "Katie Wilbanks", phase: 3, color: "#D6472A" },
-  { id: "mid", name: "Midtown", abbr: "MtC", lead: "SuAn McClure", phase: 2, color: "#9B87C4" },
-  { id: "brx", name: "Broussard", abbr: "BrC", lead: "Lauren Smith", phase: 2, color: "#3E7CC2" },
-  { id: "nib", name: "New Iberia", abbr: "NIC", lead: "Jared Robicheaux", phase: 3, color: "#E8A868" },
-  { id: "vpl", name: "Ville Platte", abbr: "VPC", lead: "William Reiszner", phase: 1, color: "#F2B705" },
-  { id: "ynv", name: "Youngsville", abbr: "YvC", lead: "Pastor Josh Mesa", phase: 2, color: "#17A2A0" },
-];
+import { createClient } from "@supabase/supabase-js";
 
 const CENTRAL_TEAM = ["Hannaniah Owens", "Kassi Bourgeois", "Natalie Benton", "Lauren Bostic"];
 
@@ -30,7 +20,7 @@ const TIERS = [
   { tier: 5, role: "Support role (Reception, Info Center, Hospitality, Cafe)", scope: "Task checkbox only" },
 ];
 
-const STAGES = ["Backlog", "In Progress", "Blocked", "Done"];
+const STAGES = ["Pending", "Started", "In Progress", "Stalled", "Completed"];
 
 const DEFAULT_ROLE_OPTIONS = [
   "Campus Operations Director", "Campus Support Director", "Campus Admin Director",
@@ -73,71 +63,116 @@ const LANE_ROLE_OPTIONS = {
 const _now = new Date();
 const TODAY_STR = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, "0")}-${String(_now.getDate()).padStart(2, "0")}`;
 
-// ---------- Backend API client (Google Sheets via Apps Script, through a same-origin proxy) ----------
-// This calls our own /api/sheet endpoint (a Vercel serverless function), not Apps Script
-// directly — a direct browser-to-Apps-Script call hits a CORS wall that can't be fixed from
-// the Apps Script deployment settings (Google's redirect from script.google.com to
-// script.googleusercontent.com doesn't carry CORS headers). Routing through our own domain
-// sidesteps that entirely: same-origin calls have no CORS restriction, and the proxy itself
-// talks to Apps Script server-to-server, where CORS is a non-issue.
-const API_BASE = "/api/sheet";
+// ---------- Backend: Supabase (Postgres + Auth + Row Level Security + Edge Functions) ----------
+// Replaces the old Google Sheets/Apps Script backend entirely. The URL and anon key are both
+// meant to be public (same trust level as the Google Client ID below) — every actual security
+// boundary is enforced server-side by Postgres Row Level Security policies, not by keeping
+// these secret. See supabase/migrations/ in this repo for the schema/policies, and
+// supabase/functions/ for the three Edge Functions this app calls.
+const SUPABASE_URL = "https://pcuadpgamkoaytksbkcl.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBjdWFkcGdhbWtvYXl0a3Nia2NsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQzMTc1NzcsImV4cCI6MjA5OTg5MzU3N30.V5lMQXyX2N8Cl66KayZZOSSatn0-VR_BgjRs7kHtE4A";
+// OSC's row in the "organizations" table — seeded once in migrations/0003_seed.sql. Hardcoded
+// here only because this deployment is (for now) OSC-only; a real multi-tenant signup flow
+// would resolve this from an invite/org code instead of a constant.
+const OSC_ORG_ID = "00000000-0000-0000-0000-000000000001";
 
-// Current login token, read by every apiGet/apiPost call below. Kept as a plain module
-// variable (not React state) so every existing call site — apiCreate/apiUpdate/apiDelete
-// and direct apiGet/apiPost calls scattered across the component — automatically picks up
-// whichever user is currently logged in without threading a token through every function.
-let authToken = null;
-// Set by the app on mount to clear stored auth and drop back to the login screen the moment
-// any request comes back Unauthorized (expired/invalid token) — see setAuth()/handleUnauthorized in OpsDashboard.
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// Set once auth state is wired up in OpsDashboard — calling this signs the user all the way
+// out (e.g. if a request ever comes back with an expired/invalid session).
 let handleUnauthorized = () => {};
 
-const AUTH_STORAGE_KEY = "opscore_auth";
+// The rest of this app (every apiGet/apiCreate/apiUpdate/apiDelete call site, built up over
+// the Sheets-backed version of this app) speaks the old "sheet name" + camelCase-field
+// vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
+// the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
+// snake_case columns — so every existing call site keeps working unchanged.
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads" };
 
-function loadStoredAuth() {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = window.localStorage.getItem(AUTH_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch (e) {
-    return null;
-  }
+// Every table's primary key is "id" except campus_config, whose natural key (campus_id) is
+// also its actual Postgres primary key column — there's no separate surrogate "id" there.
+const PK_MAP = { campus_config: "campus_id" };
+
+const FIELD_MAPS = {
+  projects: { organizationId: "organization_id", createdBy: "created_by", completedOn: "completed_on", sharedWith: "shared_with", dueTime: "due_time" },
+  subtasks: { projectId: "project_id", createdBy: "created_by", dueTime: "due_time" },
+  staff: { organizationId: "organization_id", campusId: "campus_id", reportsTo: "reports_to", nextMeeting: "next_meeting", lastContact: "last_contact", calendarSynced: "calendar_synced", userId: "user_id" },
+  profiles: { organizationId: "organization_id", firstName: "first_name", lastName: "last_name", campusId: "campus_id", googleCalendarIds: "google_calendar_ids", googleCalendarNames: "google_calendar_names" },
+  campus_config: { campusId: "campus_id", slidesLink: "slides_link" },
+  notifications: { organizationId: "organization_id", forUser: "for_user_name", projectId: "project_id" },
+  campuses: { organizationId: "organization_id", lead: "lead_name", leadProfileId: "lead_profile_id" },
+  central_threads: { organizationId: "organization_id", threadKey: "thread_key" },
+};
+
+function toSnakeRow(table, obj) {
+  const map = FIELD_MAPS[table] || {};
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) out[map[k] || k] = v;
+  return out;
 }
 
-function persistAuth(auth) {
-  if (typeof window === "undefined") return;
-  if (auth) window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(auth));
-  else window.localStorage.removeItem(AUTH_STORAGE_KEY);
+function toCamelRow(table, row) {
+  const map = FIELD_MAPS[table] || {};
+  const reverse = Object.fromEntries(Object.entries(map).map(([k, v]) => [v, k]));
+  const out = {};
+  for (const [k, v] of Object.entries(row)) out[reverse[k] || k] = v;
+  return out;
+}
+
+function throwOrHandle(error) {
+  if (!error) return;
+  if (error.code === "PGRST301" || /JWT/i.test(error.message || "")) handleUnauthorized();
+  throw new Error(error.message || String(error));
 }
 
 async function apiGet(sheet, params = {}) {
-  const qs = new URLSearchParams({ sheet, token: authToken || "", ...params }).toString();
-  const res = await fetch(`${API_BASE}?${qs}`);
-  if (!res.ok) throw new Error(`Backend returned ${res.status}`);
-  const data = await res.json();
-  if (data && data.error === "Unauthorized") handleUnauthorized();
-  if (data && data.error) throw new Error(data.error);
-  return Array.isArray(data) ? data : [];
+  const table = TABLE_MAP[sheet] || sheet;
+  let query = supabase.from(table).select("*");
+  const map = FIELD_MAPS[table] || {};
+  Object.entries(params).forEach(([key, value]) => { query = query.eq(map[key] || key, value); });
+  const { data, error } = await query;
+  throwOrHandle(error);
+  return (data || []).map((row) => toCamelRow(table, row));
 }
 
-async function apiPost(body) {
-  const res = await fetch(API_BASE, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...body, token: authToken }),
-  });
-  if (!res.ok) throw new Error(`Backend returned ${res.status}`);
-  const data = await res.json();
-  if (data && data.error === "Unauthorized") handleUnauthorized();
-  if (data && data.error) throw new Error(data.error);
-  return data;
+async function apiCreate(sheet, data) {
+  const table = TABLE_MAP[sheet] || sheet;
+  const { data: inserted, error } = await supabase.from(table).insert(toSnakeRow(table, data)).select().single();
+  throwOrHandle(error);
+  return toCamelRow(table, inserted);
 }
 
-const apiCreate = (sheet, data) => apiPost({ sheet, action: "create", data });
-const apiUpdate = (sheet, id, data) => apiPost({ sheet, action: "update", id, data });
-const apiDelete = (sheet, id) => apiPost({ sheet, action: "delete", id });
+async function apiUpdate(sheet, id, data) {
+  const table = TABLE_MAP[sheet] || sheet;
+  const { error } = await supabase.from(table).update(toSnakeRow(table, data)).eq(PK_MAP[table] || "id", id);
+  throwOrHandle(error);
+  return { ok: true };
+}
+
+async function apiDelete(sheet, id) {
+  const table = TABLE_MAP[sheet] || sheet;
+  const { error } = await supabase.from(table).delete().eq(PK_MAP[table] || "id", id);
+  throwOrHandle(error);
+  return { ok: true };
+}
+
+// The three Edge Functions (supabase/functions/) — anything requiring the service role key
+// (admin account creation, the permanent Google connection, reading Slides with it) runs
+// server-side here instead of directly against a table.
+async function invokeFunction(name, action, data) {
+  const { data: result, error } = await supabase.functions.invoke(name, { body: { action, data } });
+  if (error) throw new Error(error.message || String(error));
+  if (result && result.error) throw new Error(result.error);
+  return result;
+}
+const apiAdminAccounts = (action, data) => invokeFunction("admin-accounts", action, data);
+const apiConnectGoogleCalendar = (code) => invokeFunction("google-calendar", "connect", { code });
+const apiListGoogleCalendars = () => invokeFunction("google-calendar", "listCalendars", {});
+const apiListGoogleEvents = (calendarIds) => invokeFunction("google-calendar", "listEvents", { calendarIds });
+const apiDisconnectGoogleCalendar = () => invokeFunction("google-calendar", "disconnect", {});
 // Reads the campus's current-phase slide out of its Google Slides deck and returns
 // { people: [{ name, role, reportsTo }] } — see importOrgChartFromSlides_ in Code.gs.
-const apiImportOrgChartFromSlides = (campusId, url, phase) => apiPost({ sheet: "OrgChart", action: "importFromSlides", data: { campusId, url, phase } });
+const apiImportOrgChartFromSlides = (campusId, url, phase) => invokeFunction("import-org-chart", null, { campusId, url, phase });
 
 
 // Prevents the page behind a modal from scrolling. Kept deliberately simple — just
@@ -248,7 +283,7 @@ function resolveSubtask(s) {
 function resolveProject(p) {
   const subtasks = (p.subtasks || []).map(resolveSubtask);
   let result = { ...p, subtasks };
-  if (p.recurrence && p.recurrence.freq !== "none" && p.stage === "Done") {
+  if (p.recurrence && p.recurrence.freq !== "none" && p.stage === "Completed") {
     const r = p.recurrence;
     const nextDue = addInterval(p.due, r);
     if (TODAY_STR >= nextDue) {
@@ -260,7 +295,7 @@ function resolveProject(p) {
       }
       if (r.endType === "date" && r.untilDate && nextDue > r.untilDate) exhausted = true;
       if (!exhausted) {
-        result = { ...result, due: nextDue, stage: "Backlog", recurrence: { ...r, count: carryCount }, subtasks: subtasks.map((s) => ({ ...s, done: false })) };
+        result = { ...result, due: nextDue, stage: "Pending", recurrence: { ...r, count: carryCount }, subtasks: subtasks.map((s) => ({ ...s, done: false })) };
       }
     }
   }
@@ -294,7 +329,7 @@ const seedProjects = [
     notes: [{ ts: "2026-07-09 14:40", author: "Katie", text: "Confirmed 6 volunteers, still need 2 for parking." }],
   },
   {
-    id: 3, campus: "laf", title: "Guest connect flow — NFC to CCB", stage: "Blocked", createdAt: "2026-06-01", completedOn: null,
+    id: 3, campus: "laf", title: "Guest connect flow — NFC to CCB", stage: "Stalled", createdAt: "2026-06-01", completedOn: null,
     owner: "Katie Wilbanks", createdBy: "Katie Wilbanks", team: ["Admin Coor"], collaborators: ["Connections Team"], due: "2026-07-30",
     cost: 2400, spent: 1900, shared: true, sharedWith: ["opl", "mid"],
     subtasks: [
@@ -306,13 +341,13 @@ const seedProjects = [
     notes: [{ ts: "2026-07-07 11:02", author: "Shaina", text: "Blocked on Pushpay confirming API tier access." }],
   },
   {
-    id: 4, campus: "opl", title: "OD transition planning", stage: "Backlog", owner: "Shaina Broussard", createdBy: "Shaina Broussard", createdAt: "2026-07-01", completedOn: null, team: [], collaborators: [],
+    id: 4, campus: "opl", title: "OD transition planning", stage: "Pending", owner: "Shaina Broussard", createdBy: "Shaina Broussard", createdAt: "2026-07-01", completedOn: null, team: [], collaborators: [],
     due: "2026-08-01", cost: 0, spent: 0, shared: false,
     subtasks: [{ id: 401, t: "Draft comms", done: false, cost: 0, spent: 0, createdBy: "Shaina Broussard", photos: [], notes: [] }],
     photos: [], notes: [],
   },
   {
-    id: 5, campus: "ynv", title: "Safety Team SOP drills — Q3", stage: "Backlog", owner: "Pastor Josh Mesa", createdBy: "Pastor Josh Mesa", createdAt: "2026-07-05", completedOn: null, team: ["Safety Coor"],
+    id: 5, campus: "ynv", title: "Safety Team SOP drills — Q3", stage: "Pending", owner: "Pastor Josh Mesa", createdBy: "Pastor Josh Mesa", createdAt: "2026-07-05", completedOn: null, team: ["Safety Coor"],
     collaborators: [], due: "2026-08-10", cost: 300, spent: 0, shared: true, sharedWith: ["nib"],
     subtasks: [{ id: 501, t: "Schedule drill weekend", done: false, cost: 0, spent: 0, createdBy: "Pastor Josh Mesa", photos: [], notes: [] }],
     photos: [], notes: [],
@@ -385,11 +420,6 @@ function requestGoogleAuthCode(callback) {
   googleCodeCallback = callback;
   googleCodeClient.requestCode();
 }
-
-const apiConnectGoogleCalendar = (code) => apiPost({ sheet: "GoogleCalendar", action: "connect", data: { code } });
-const apiListGoogleCalendars = () => apiPost({ sheet: "GoogleCalendar", action: "listCalendars", data: {} });
-const apiListGoogleEvents = (calendarIds) => apiPost({ sheet: "GoogleCalendar", action: "listEvents", data: { calendarIds } });
-const apiDisconnectGoogleCalendar = () => apiPost({ sheet: "GoogleCalendar", action: "disconnect", data: {} });
 
 // Merges raw Google event objects (from possibly several calendars) into the same
 // { "YYYY-MM-DD": [{ time, title, attendees }] } shape the rest of CalendarPanel already reads.
@@ -466,8 +496,12 @@ function projectBudget(p) {
   return { total: (Number(p.cost) || 0) + subtaskCost, spent: (Number(p.spent) || 0) + subtaskSpent };
 }
 
+// Completed projects are excluded from every budget outlook — their spending is finalized and
+// closed out, so they'd only clutter forward-looking "how are we tracking" totals. Their own
+// final cost/spent/outcome is still fully preserved on the project record itself and shown
+// wherever that specific project is viewed (see budgetOutcomeLabel) — this only affects sums.
 function rollupBudget(projectsList) {
-  return projectsList.reduce(
+  return projectsList.filter((p) => p.stage !== "Completed").reduce(
     (acc, p) => {
       const b = projectBudget(p);
       acc.total += b.total;
@@ -494,7 +528,7 @@ function tierForRole(roleId) { return roleId === "central" ? TIERS[0] : TIERS[1]
 // Shown whenever there's no valid auth in state — either a returning user logging back in,
 // or (only reachable while the Users sheet is completely empty — see handleBootstrap_ in
 // Code.gs) the very first Central account being created for a fresh deploy.
-function LoginScreen({ onAuthenticated }) {
+function LoginScreen() {
   const [mode, setMode] = useState("login"); // "login" | "register"
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -502,6 +536,7 @@ function LoginScreen({ onAuthenticated }) {
   const [lastName, setLastName] = useState("");
   const [phone, setPhone] = useState("");
   const [error, setError] = useState("");
+  const [checkEmail, setCheckEmail] = useState(false);
   const [loading, setLoading] = useState(false);
 
   const inputClass = "w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13.5px] outline-none focus:border-[#2B4C7E]";
@@ -509,15 +544,25 @@ function LoginScreen({ onAuthenticated }) {
 
   const submit = async (e) => {
     e.preventDefault();
-    setError(""); setLoading(true);
+    setError(""); setCheckEmail(false); setLoading(true);
     try {
       if (mode === "login") {
-        const result = await apiPost({ sheet: "Users", action: "login", data: { email, password } });
-        onAuthenticated({ token: result.token, user: result.user });
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        // onAuthStateChange (wired up in OpsDashboard) picks up the new session from here.
       } else {
         if (password.length < 8) throw new Error("Password must be at least 8 characters.");
-        const result = await apiPost({ sheet: "Users", action: "register", data: { firstName, lastName, email, phone, password } });
-        onAuthenticated({ token: result.token, user: result.user });
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { data: { organization_id: OSC_ORG_ID, first_name: firstName, last_name: lastName, phone } },
+        });
+        if (error) throw error;
+        // Email confirmation is required on this project — signUp() succeeds but returns no
+        // session until the link in that email is clicked, so there's nothing for
+        // onAuthStateChange to pick up yet. Without this, the form just looked like it did
+        // nothing.
+        if (!data.session) setCheckEmail(true);
       }
     } catch (err) {
       setError(err?.message || String(err));
@@ -573,6 +618,7 @@ function LoginScreen({ onAuthenticated }) {
             </div>
 
             {error && <div className="text-[12px] rounded-md px-3 py-2" style={{ background: "#C15B5B1A", color: "#C15B5B" }}>{error}</div>}
+            {checkEmail && <div className="text-[12px] rounded-md px-3 py-2" style={{ background: "#5E9E8A1A", color: "#5E9E8A" }}>Account created — check your email for a confirmation link, then come back and sign in.</div>}
 
             <button type="submit" disabled={loading}
               className="w-full text-[13.5px] font-medium rounded-md px-3 py-2.5 mt-1"
@@ -637,6 +683,7 @@ export default function OpsDashboard() {
   });
   const [calView, setCalView] = useState("day");
   const [staffByCampus, setStaffByCampus] = useState(seedStaff);
+  const [campuses, setCampuses] = useState([]);
   const [users, setUsers] = useState([]);
   const [campusSlidesLinks, setCampusSlidesLinks] = useState({});
   const [orgChartByCampus, setOrgChartByCampus] = useState({});
@@ -653,19 +700,29 @@ export default function OpsDashboard() {
   const [bootstrapProgress, setBootstrapProgress] = useState(null); // { done, total } while seeding a fresh Sheet
   const [showNotifications, setShowNotifications] = useState(false);
   const [openStaffProfile, setOpenStaffProfile] = useState(null);
-  const [auth, setAuthState] = useState(() => {
-    const stored = loadStoredAuth();
-    authToken = stored ? stored.token : null; // sync the module-level var before any effect can fire
-    return stored;
-  });
+  // Auth now rides on Supabase's own session (it persists/refreshes itself — no manual
+  // localStorage handling needed), with the campus/role/tier fields the rest of this app
+  // expects on auth.user pulled from that person's own "profiles" row.
+  const [auth, setAuthState] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const suppressPush = useRef(false);
 
-  const setAuth = (next) => {
-    authToken = next ? next.token : null;
-    persistAuth(next);
-    setAuthState(next);
-  };
-  handleUnauthorized = () => setAuth(null); // reassigned each render — always closes over the latest setAuth
+  const setAuth = (next) => setAuthState(next); // null = signed out
+  handleUnauthorized = () => { supabase.auth.signOut(); setAuthState(null); };
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadForSession = async (session) => {
+      if (!session) { if (!cancelled) { setAuthState(null); setAuthLoading(false); } return; }
+      const { data: profileRow } = await supabase.from("profiles").select("*").eq("id", session.user.id).single();
+      if (cancelled) return;
+      setAuthState(profileRow ? { token: session.access_token, user: toCamelRow("profiles", profileRow) } : null);
+      setAuthLoading(false);
+    };
+    supabase.auth.getSession().then(({ data }) => loadForSession(data.session));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => loadForSession(session));
+    return () => { cancelled = true; sub.subscription.unsubscribe(); };
+  }, []);
 
   // Restore state when the browser's Back/Forward buttons are used.
   useEffect(() => {
@@ -696,7 +753,7 @@ export default function OpsDashboard() {
   }, [role, tab, selectedCampus, openProject, showNewProject, detail]);
 
   const activeCampusId = role === "central" ? selectedCampus : role;
-  const activeCampus = CAMPUSES.find((c) => c.id === activeCampusId);
+  const activeCampus = campuses.find((c) => c.id === activeCampusId);
   const tier = tierForRole(role);
   const currentViewerName = auth?.user
     ? (`${auth.user.firstName || ""} ${auth.user.lastName || ""}`.trim() || auth.user.email)
@@ -720,7 +777,7 @@ export default function OpsDashboard() {
     if (!activeCampusId) {
       return CENTRAL_TEAM.map((name) => ({ name, roles: ["Central Team"] }));
     }
-    const campus = CAMPUSES.find((c) => c.id === activeCampusId);
+    const campus = campuses.find((c) => c.id === activeCampusId);
     const lead = campus ? [{ name: campus.lead, roles: ["Campus Operations Director"] }] : [];
     const campusStaff = (staffByCampus[activeCampusId] || []).map((s) => ({ name: s.name, roles: s.roles || [] }));
     return [...lead, ...campusStaff];
@@ -728,7 +785,7 @@ export default function OpsDashboard() {
 
   const fullRoster = useMemo(() => {
     const central = CENTRAL_TEAM.map((name) => ({ name, roles: ["Central Team"] }));
-    const leads = CAMPUSES.map((c) => ({ name: c.lead, roles: ["Campus Operations Director"] }));
+    const leads = campuses.map((c) => ({ name: c.lead, roles: ["Campus Operations Director"] }));
     const allStaff = Object.values(staffByCampus).flat().map((s) => ({ name: s.name, roles: s.roles || [] }));
     const combined = [...central, ...leads, ...allStaff];
     const seen = new Set();
@@ -798,8 +855,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"),
       ]);
       if (cancelled) return;
 
@@ -813,8 +870,25 @@ export default function OpsDashboard() {
       const subtaskRows = valueOr(subtasksResult, "Subtasks", []);
       const userRows = valueOr(usersResult, "Users", []);
       const campusConfigRows = valueOr(campusConfigResult, "CampusConfig", []);
+      const campusRows = valueOr(campusesResult, "Campuses", []);
 
       if (usersResult.status === "fulfilled") setUsers(userRows.map((u) => ({ ...u, id: Number(u.id) })));
+
+      // RLS scopes notifications to the signed-in user automatically (for_user_name =
+      // my_name()) and central_threads to central tier only — no client-side filtering needed.
+      if (notificationsResult.status === "fulfilled") setNotifications(notificationsResult.value);
+
+      if (centralThreadsResult.status === "fulfilled") {
+        const byKey = {};
+        centralThreadsResult.value.forEach((t) => { byKey[t.threadKey] = { tags: t.tags || [], messages: t.messages || [] }; });
+        setCentralThreads(byKey);
+      }
+
+      // Replaces the old hardcoded campuses const — Central can now add/rename campuses
+      // through the database instead of a code change. The "central" pseudo-campus row
+      // (seeded to satisfy the campus_id FK elsewhere) isn't a real campus, so it's excluded
+      // from what the UI shows as a campus.
+      if (campusesResult.status === "fulfilled") setCampuses(campusRows.filter((c) => c.id !== "central"));
 
       if (campusConfigResult.status === "fulfilled") {
         const slidesLinks = {};
@@ -940,13 +1014,34 @@ export default function OpsDashboard() {
     ]);
   };
 
-  const notifyCompletion = (project, itemTitle, createdBy) => {
-    const forUser = createdBy || project.owner;
-    if (!forUser) return;
-    setNotifications((prev) => [
-      { id: Date.now() + Math.random(), forUser, completedBy: currentViewerName, itemTitle, projectId: project.id, ts: TODAY_STR, read: false },
-      ...prev,
-    ]);
+  // Notifies everyone meaningfully connected to a project — owner, creator, team, that
+  // campus's own Operations Director, plus anyone explicitly named (e.g. a subtask's
+  // assignees) — never the person who just took the action. `summary` is the ready-to-read
+  // description of what happened; recipients see "<actor> <summary>" in their bell.
+  const notifyInvolved = (project, summary, extraRecipients) => {
+    if (!project) return;
+    const campus = campuses.find((c) => c.id === project.campus);
+    const names = new Set([
+      project.owner, project.createdBy, ...(project.team || []), ...(extraRecipients || []),
+      campus?.lead,
+    ].filter(Boolean));
+    names.delete(currentViewerName);
+    if (names.size === 0) return;
+    const rows = Array.from(names).map((forUser) => ({
+      forUser, actor: currentViewerName, summary, projectId: project.id, ts: TODAY_STR, read: false,
+    }));
+    setNotifications((prev) => [...rows.map((r) => ({ ...r, id: `${Date.now()}-${Math.random()}` })), ...prev]);
+    syncToBackend(Promise.all(rows.map((r) => apiCreate("Notifications", { ...r, organizationId: OSC_ORG_ID }))));
+  };
+
+  // Bulk-marks every one of the viewer's own notifications read — a single UPDATE rather than
+  // one apiUpdate per row, since RLS already scopes this to the signed-in user's own rows.
+  const markAllNotificationsRead = () => {
+    setNotifications((prev) => prev.map((n) => n.forUser === currentViewerName ? { ...n, read: true } : n));
+    syncToBackend(
+      supabase.from("notifications").update({ read: true }).eq("for_user_name", currentViewerName).eq("read", false)
+        .then(({ error }) => { if (error) throw new Error(error.message); })
+    );
   };
 
   const addProjectNote = (projId, text) => {
@@ -990,26 +1085,28 @@ export default function OpsDashboard() {
     setProjects((ps) => ps.map((p) => {
       if (p.id !== id) return p;
       const resolved = resolveProject(p); // catch the project up to its current scheduled cycle first
-      const wasDone = resolved.stage === "Done";
-      if (stage === "Done" && !wasDone) {
-        notifyCompletion(resolved, resolved.title, resolved.createdBy);
+      const wasDone = resolved.stage === "Completed";
+      if (stage === "Completed" && !wasDone) {
+        notifyInvolved(resolved, `marked "${resolved.title}" complete (ended ${BUDGET_STATUS_LABEL[budgetStatus(resolved)].toLowerCase()})`);
         logActivity("completed project", resolved.title, resolved.campus, { itemType: "project", createdBy: resolved.createdBy, budgetStatusVal: budgetStatus(resolved), projectId: resolved.id });
       } else if (stage !== resolved.stage) {
+        notifyInvolved(resolved, `moved "${resolved.title}" to ${stage}`);
         logActivity(`moved "${resolved.title}" to ${stage}`, "", resolved.campus);
       }
-      newCompletedOn = stage === "Done" ? TODAY_STR : (stage !== "Done" ? null : resolved.completedOn);
+      newCompletedOn = stage === "Completed" ? TODAY_STR : (stage !== "Completed" ? null : resolved.completedOn);
       return { ...resolved, stage, completedOn: newCompletedOn };
     }));
     syncToBackend(apiUpdate("Projects", id, { stage, completedOn: newCompletedOn }));
   };
 
-  const setProjectDue = (id, due) => {
+  const setProjectDue = (id, due, dueTime) => {
     setProjects((ps) => ps.map((p) => {
       if (p.id !== id) return p;
+      notifyInvolved(p, `changed the deadline on "${p.title}" to ${due}${dueTime ? ` at ${dueTime}` : ""}`);
       logActivity(`changed the deadline on "${p.title}"`, `now due ${due}`, p.campus);
-      return { ...p, due };
+      return { ...p, due, dueTime: dueTime || null };
     }));
-    syncToBackend(apiUpdate("Projects", id, { due }));
+    syncToBackend(apiUpdate("Projects", id, { due, dueTime: dueTime || null }));
   };
 
   const addProject = (data) => {
@@ -1018,7 +1115,7 @@ export default function OpsDashboard() {
       id: Date.now(),
       campus: data.campus || activeCampusId || "central",
       title: data.title,
-      stage: data.stage || "Backlog",
+      stage: data.stage || "Pending",
       owner: data.owner || "Unassigned",
       createdBy: currentViewerName,
       createdAt: TODAY_STR,
@@ -1026,6 +1123,7 @@ export default function OpsDashboard() {
       team: data.team ? data.team.split(",").map((s) => s.trim()).filter(Boolean) : [],
       collaborators: data.collaborators ? data.collaborators.split(",").map((s) => s.trim()).filter(Boolean) : [],
       due: data.due,
+      dueTime: data.dueTime || null,
       cost: Number(data.cost) || 0,
       spent: 0,
       shared: !!data.shared,
@@ -1036,6 +1134,7 @@ export default function OpsDashboard() {
       notes: [],
     };
     setProjects((ps) => [...ps, newProject]);
+    notifyInvolved(newProject, `created the project "${newProject.title}"`);
     const { subtasks, ...projectRow } = newProject;
     syncToBackend(apiCreate("Projects", projectRow));
   };
@@ -1054,9 +1153,10 @@ export default function OpsDashboard() {
       subtasks[idx] = { ...target, done: newDone };
       updatedSubtask = subtasks[idx];
       if (newDone) {
-        notifyCompletion(resolved, target.t, target.createdBy);
+        notifyInvolved(resolved, `completed "${target.t}" on "${resolved.title}"`, target.assignees);
         logActivity("completed task", `${target.t} (${resolved.title})`, resolved.campus, { itemType: "task", createdBy: target.createdBy, projectId: resolved.id });
       } else {
+        notifyInvolved(resolved, `reopened "${target.t}" on "${resolved.title}"`, target.assignees);
         logActivity("reopened task", target.t, resolved.campus);
       }
       return { ...resolved, subtasks };
@@ -1064,33 +1164,62 @@ export default function OpsDashboard() {
     if (updatedSubtask) syncToBackend(apiUpdate("Subtasks", updatedSubtask.id, { done: updatedSubtask.done, due: updatedSubtask.due, recurrence: updatedSubtask.recurrence }));
   };
 
-  const addSubtask = (projId, text, recurrence, due, cost) => {
+  const addSubtask = (projId, text, recurrence, due, cost, dueTime, assignees) => {
     const proj = projects.find((p) => p.id === projId);
     logActivity("added task", `"${text}" to ${proj?.title || "a project"}`, proj?.campus);
-    const newSubtask = { id: Date.now(), t: text, done: false, due: due || null, createdBy: currentViewerName, photos: [], notes: [], cost: Number(cost) || 0, spent: 0, recurrence: recurrence?.freq === "none" ? null : recurrence };
+    const newSubtask = {
+      id: Date.now(), t: text, done: false, due: due || null, dueTime: dueTime || null, assignees: assignees || [],
+      createdBy: currentViewerName, photos: [], notes: [], cost: Number(cost) || 0, spent: 0, recurrence: recurrence?.freq === "none" ? null : recurrence,
+    };
     setProjects((ps) => ps.map((p) => p.id === projId ? { ...p, subtasks: [...p.subtasks, newSubtask] } : p));
+    if (proj) {
+      const summary = (assignees || []).length > 0
+        ? `assigned you "${text}" on "${proj.title}"${due ? `, due ${due}${dueTime ? ` at ${dueTime}` : ""}` : ""}`
+        : `added the task "${text}" to "${proj.title}"`;
+      notifyInvolved(proj, summary, assignees);
+    }
     syncToBackend(apiCreate("Subtasks", { ...newSubtask, projectId: projId }));
   };
 
-  const setSubtaskDue = (projId, idx, due) => {
+  const assignSubtask = (projId, idx, assignees) => {
+    let subtaskId = null; let subtaskTitle = "";
+    const proj = projects.find((p) => p.id === projId);
+    setProjects((ps) => ps.map((p) => {
+      if (p.id !== projId) return p;
+      const subtasks = [...p.subtasks];
+      subtaskTitle = subtasks[idx].t;
+      subtasks[idx] = { ...subtasks[idx], assignees };
+      subtaskId = subtasks[idx].id;
+      return { ...p, subtasks };
+    }));
+    if (proj) notifyInvolved(proj, `assigned you to "${subtaskTitle}" on "${proj.title}"`, assignees);
+    logActivity(`assigned "${subtaskTitle}"`, assignees.join(", "), proj?.campus);
+    if (subtaskId) syncToBackend(apiUpdate("Subtasks", subtaskId, { assignees }));
+  };
+
+  const setSubtaskDue = (projId, idx, due, dueTime) => {
     let subtaskId = null;
+    const proj = projects.find((p) => p.id === projId);
     setProjects((ps) => ps.map((p) => {
       if (p.id !== projId) return p;
       const subtasks = [...p.subtasks];
       logActivity(`changed the deadline on "${subtasks[idx].t}"`, `now due ${due}`, p.campus);
-      subtasks[idx] = { ...subtasks[idx], due };
+      if (proj) notifyInvolved(proj, `changed the deadline on "${subtasks[idx].t}" to ${due}${dueTime ? ` at ${dueTime}` : ""}`, subtasks[idx].assignees);
+      subtasks[idx] = { ...subtasks[idx], due, dueTime: dueTime || null };
       subtaskId = subtasks[idx].id;
       return { ...p, subtasks };
     }));
-    if (subtaskId) syncToBackend(apiUpdate("Subtasks", subtaskId, { due }));
+    if (subtaskId) syncToBackend(apiUpdate("Subtasks", subtaskId, { due, dueTime: dueTime || null }));
   };
 
   const updateSubtaskBudget = (projId, idx, cost, spent) => {
     let subtaskId = null;
+    const proj = projects.find((p) => p.id === projId);
     setProjects((ps) => ps.map((p) => {
       if (p.id !== projId) return p;
       const subtasks = [...p.subtasks];
       logActivity("updated task budget", subtasks[idx].t, p.campus);
+      if (proj) notifyInvolved(proj, `updated the budget on "${subtasks[idx].t}"`, subtasks[idx].assignees);
       subtasks[idx] = { ...subtasks[idx], cost: Number(cost) || 0, spent: Number(spent) || 0 };
       subtaskId = subtasks[idx].id;
       return { ...p, subtasks };
@@ -1101,14 +1230,47 @@ export default function OpsDashboard() {
   const updateProjectBudget = (projId, cost, spent) => {
     const proj = projects.find((p) => p.id === projId);
     logActivity("updated project budget", proj?.title, proj?.campus);
+    if (proj) notifyInvolved(proj, `updated the budget on "${proj.title}"`);
     setProjects((ps) => ps.map((p) => p.id === projId ? { ...p, cost: Number(cost) || 0, spent: Number(spent) || 0 } : p));
     syncToBackend(apiUpdate("Projects", projId, { cost: Number(cost) || 0, spent: Number(spent) || 0 }));
+  };
+
+  const deleteProject = (projId) => {
+    const proj = projects.find((p) => p.id === projId);
+    if (proj) {
+      notifyInvolved(proj, `deleted the project "${proj.title}"`);
+      logActivity(`deleted "${proj.title}"`, "", proj.campus);
+    }
+    setProjects((ps) => ps.filter((p) => p.id !== projId));
+    syncToBackend(apiDelete("Projects", projId));
+  };
+
+  const deleteSubtask = (projId, idx) => {
+    const proj = projects.find((p) => p.id === projId);
+    const subtask = proj?.subtasks?.[idx];
+    if (proj && subtask) {
+      notifyInvolved(proj, `deleted the task "${subtask.t}" from "${proj.title}"`, subtask.assignees);
+      logActivity(`deleted task "${subtask.t}"`, proj.title, proj.campus);
+    }
+    setProjects((ps) => ps.map((p) => p.id === projId ? { ...p, subtasks: p.subtasks.filter((_, i) => i !== idx) } : p));
+    if (subtask) syncToBackend(apiDelete("Subtasks", subtask.id));
   };
 
   const addSection = (name) => setSections((prev) => prev.includes(name) ? prev : [...prev, name]);
   const setProjectSection = (projId, section) => {
     setProjects((ps) => ps.map((p) => p.id === projId ? { ...p, section } : p));
     syncToBackend(apiUpdate("Projects", projId, { section }));
+  };
+
+  // One row per thread (organization_id, thread_key unique) — every mutation upserts the
+  // thread's whole tags/messages state, same "small object, whole-row upsert" shape as
+  // setCampusSlidesLink above.
+  const persistCentralThread = (threadKey, thread) => {
+    syncToBackend(
+      supabase.from("central_threads")
+        .upsert({ organization_id: OSC_ORG_ID, thread_key: String(threadKey), tags: thread.tags, messages: thread.messages }, { onConflict: "organization_id,thread_key" })
+        .then(({ error }) => { if (error) throw new Error(error.message); })
+    );
   };
 
   // Central-only tagging & discussion — never exposed to campus-scoped views.
@@ -1118,26 +1280,31 @@ export default function OpsDashboard() {
     setCentralThreads((prev) => {
       const t = prev[projId] || { tags: [], messages: [] };
       if (t.tags.includes(clean)) return prev;
-      return { ...prev, [projId]: { ...t, tags: [...t.tags, clean] } };
+      const updated = { ...t, tags: [...t.tags, clean] };
+      persistCentralThread(projId, updated);
+      return { ...prev, [projId]: updated };
     });
   };
   const removeCentralTag = (projId, tag) =>
     setCentralThreads((prev) => {
       const t = prev[projId] || { tags: [], messages: [] };
-      return { ...prev, [projId]: { ...t, tags: t.tags.filter((x) => x !== tag) } };
+      const updated = { ...t, tags: t.tags.filter((x) => x !== tag) };
+      persistCentralThread(projId, updated);
+      return { ...prev, [projId]: updated };
     });
   const addCentralMessage = (threadKey, text, assignedTo) => {
     if (!text.trim()) return;
     setCentralThreads((prev) => {
       const t = prev[threadKey] || { tags: [], messages: [] };
       const msg = { author: currentViewerName, text: text.trim(), ts: TODAY_STR + " " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), assignedTo: assignedTo || null };
-      return { ...prev, [threadKey]: { ...t, messages: [...t.messages, msg] } };
+      const updated = { ...t, messages: [...t.messages, msg] };
+      persistCentralThread(threadKey, updated);
+      return { ...prev, [threadKey]: updated };
     });
     if (assignedTo && assignedTo !== currentViewerName) {
-      setNotifications((prev) => [
-        { id: Date.now() + Math.random(), forUser: assignedTo, completedBy: currentViewerName, itemTitle: `Central note: "${text.trim().slice(0, 60)}${text.trim().length > 60 ? "…" : ""}"`, projectId: null, ts: TODAY_STR, read: false, isAssignment: true },
-        ...prev,
-      ]);
+      const note = { forUser: assignedTo, actor: currentViewerName, summary: `assigned you a central note: "${text.trim().slice(0, 60)}${text.trim().length > 60 ? "…" : ""}"`, projectId: null, ts: TODAY_STR, read: false };
+      setNotifications((prev) => [{ ...note, id: `${Date.now()}-${Math.random()}` }, ...prev]);
+      syncToBackend(apiCreate("Notifications", { ...note, organizationId: OSC_ORG_ID }));
     }
   };
 
@@ -1207,7 +1374,7 @@ export default function OpsDashboard() {
     setCampusSlidesLinks((prev) => ({ ...prev, [campusId]: url }));
     syncToBackend(hadRow
       ? apiUpdate("CampusConfig", campusId, { slidesLink: url })
-      : apiCreate("CampusConfig", { id: campusId, campusId, slidesLink: url }));
+      : apiCreate("CampusConfig", { campusId, slidesLink: url }));
   };
 
   // Mirrors tierForRole_ in Code.gs — kept in sync locally purely so the Team Accounts panel
@@ -1216,32 +1383,48 @@ export default function OpsDashboard() {
   const tierFromAccess = (campusId, role) => campusId === "central" ? "central" : (role === "Campus Operations Director" ? "od" : "staff");
 
   // Creates a real login — a normal, ordinary account, exactly like every account after the
-  // very first. Only Central can do this (enforced server-side too); the password set here is
-  // a one-time credential the person can start signing in with immediately.
+  // very first. Only Central can do this (enforced server-side too, via the admin-accounts
+  // Edge Function — creating an account for someone else with a chosen password needs the
+  // service role key, which never runs in the browser). The new profile's id is assigned by
+  // Supabase Auth, so unlike other creates here this can't be applied optimistically — local
+  // state waits for the Edge Function to return the real id.
   const addUserAccount = (data) => {
-    const newUser = {
-      id: Date.now(),
-      firstName: data.firstName, lastName: data.lastName, email: data.email, phone: data.phone || "",
-      campusId: data.campusId, role: data.role, tier: tierFromAccess(data.campusId, data.role),
-      createdAt: TODAY_STR,
-    };
-    setUsers((prev) => [...prev, newUser]);
-    logActivity("created a login for", `${data.firstName} ${data.lastName}`.trim(), data.campusId);
-    syncToBackend(apiCreate("Users", { ...newUser, password: data.password }));
+    const tier = tierFromAccess(data.campusId, data.role);
+    setSyncing(true);
+    apiAdminAccounts("create", { firstName: data.firstName, lastName: data.lastName, email: data.email, phone: data.phone || "", campusId: data.campusId, role: data.role, password: data.password })
+      .then((result) => {
+        const newUser = { id: result.id, firstName: data.firstName, lastName: data.lastName, email: data.email, phone: data.phone || "", campusId: data.campusId, role: data.role, tier, createdAt: TODAY_STR };
+        setUsers((prev) => [...prev, newUser]);
+        logActivity("created a login for", `${data.firstName} ${data.lastName}`.trim(), data.campusId);
+        setBackendStatus("connected"); setBackendError("");
+      })
+      .catch((err) => { setBackendStatus("offline"); setBackendError(err?.message || String(err)); })
+      .finally(() => setSyncing(false));
   };
 
-  // Reassigns which campus (or Central) and role a login has access to. This is the whole
-  // point of the panel — the backend derives tier from these two fields on every write, so
-  // row-level authorization updates immediately the next time that person's token is checked.
+  // Reassigns which campus (or Central) and role a login has access to. Routed through
+  // admin-accounts rather than a direct profiles update — the column-grant policy that lets
+  // Central update others' rows would, if used to also let it change tier/campus/role, equally
+  // let anyone self-elevate, so that recompute happens server-side under the service role.
   const updateUserAccess = (id, campusId, role) => {
-    setUsers((prev) => prev.map((u) => u.id === id ? { ...u, campusId, role, tier: tierFromAccess(campusId, role) } : u));
-    logActivity("updated account access for", users.find((u) => u.id === id)?.email || String(id), campusId);
-    syncToBackend(apiUpdate("Users", id, { campusId, role }));
+    const tier = tierFromAccess(campusId, role);
+    setSyncing(true);
+    apiAdminAccounts("updateAccess", { userId: id, campusId, role })
+      .then(() => {
+        setUsers((prev) => prev.map((u) => u.id === id ? { ...u, campusId, role, tier } : u));
+        logActivity("updated account access for", users.find((u) => u.id === id)?.email || String(id), campusId);
+        setBackendStatus("connected"); setBackendError("");
+      })
+      .catch((err) => { setBackendStatus("offline"); setBackendError(err?.message || String(err)); })
+      .finally(() => setSyncing(false));
   };
 
   const removeUserAccount = (id) => {
-    setUsers((prev) => prev.filter((u) => u.id !== id));
-    syncToBackend(apiDelete("Users", id));
+    setSyncing(true);
+    apiAdminAccounts("delete", { userId: id })
+      .then(() => { setUsers((prev) => prev.filter((u) => u.id !== id)); setBackendStatus("connected"); setBackendError(""); })
+      .catch((err) => { setBackendStatus("offline"); setBackendError(err?.message || String(err)); })
+      .finally(() => setSyncing(false));
   };
 
   // Associates a Staff & Team roster entry with a real login (Users row) — the two stay
@@ -1254,19 +1437,22 @@ export default function OpsDashboard() {
 
   // Creates a brand-new login for someone already on the roster and links it in the same
   // step — the common case (this person doesn't have an account yet) in one action instead of
-  // creating it in Team Accounts and then separately linking it here.
+  // creating it in Team Accounts and then separately linking it here. Same server-assigned-id
+  // constraint as addUserAccount, so the link only happens once the real id comes back.
   const createAndLinkUser = (campusId, staffId, data) => {
     const staffPerson = (staffByCampus[campusId] || []).find((s) => s.id === staffId);
     const role = staffPerson?.roles?.[0] || "";
-    const newUser = {
-      id: Date.now(),
-      firstName: data.firstName, lastName: data.lastName, email: data.email, phone: data.phone || "",
-      campusId, role, tier: tierFromAccess(campusId, role),
-      createdAt: TODAY_STR,
-    };
-    setUsers((prev) => [...prev, newUser]);
-    syncToBackend(apiCreate("Users", { ...newUser, password: data.password }));
-    linkStaffUser(campusId, staffId, newUser.id);
+    const tier = tierFromAccess(campusId, role);
+    setSyncing(true);
+    apiAdminAccounts("create", { firstName: data.firstName, lastName: data.lastName, email: data.email, phone: data.phone || "", campusId, role, password: data.password })
+      .then((result) => {
+        const newUser = { id: result.id, firstName: data.firstName, lastName: data.lastName, email: data.email, phone: data.phone || "", campusId, role, tier, createdAt: TODAY_STR };
+        setUsers((prev) => [...prev, newUser]);
+        linkStaffUser(campusId, staffId, newUser.id);
+        setBackendStatus("connected"); setBackendError("");
+      })
+      .catch((err) => { setBackendStatus("offline"); setBackendError(err?.message || String(err)); })
+      .finally(() => setSyncing(false));
   };
 
   // Commits a reviewed org-chart roster for a campus. Any role that's unchanged or brand new
@@ -1363,12 +1549,13 @@ export default function OpsDashboard() {
     { id: "notes", label: "Notes", icon: StickyNote },
     { id: "activity", label: "Activity", icon: ActivityIcon },
     { id: "events", label: "Cross-Campus Events", icon: Link2 },
-    ...(auth?.user?.tier === "central" ? [{ id: "accounts", label: "Team Accounts", icon: ShieldCheck }] : []),
+    ...(auth?.user?.tier === "central" ? [{ id: "accounts", label: "User Management", icon: ShieldCheck }] : []),
     { id: "reports", label: "Reports", icon: FileText },
   ];
 
-  if (!auth) return <LoginScreen onAuthenticated={setAuth} />;
-  if (auth.user.tier === "unassigned") return <PendingAssignmentScreen user={auth.user} onSignOut={() => setAuth(null)} />;
+  if (authLoading) return null; // Supabase checking for an existing session — near-instant, avoids a login-screen flash
+  if (!auth) return <LoginScreen />;
+  if (auth.user.tier === "unassigned") return <PendingAssignmentScreen user={auth.user} onSignOut={() => supabase.auth.signOut()} />;
 
   return (
     <div style={{ fontFamily: "'Inter', sans-serif", background: "#F7F6FB", color: "#2A2A3A" }} className="min-h-screen w-full">
@@ -1434,13 +1621,13 @@ export default function OpsDashboard() {
                 <div className="px-3 py-2.5 border-b border-[#E3E1F0] flex items-center justify-between">
                   <span className="text-[12.5px] font-bold text-[#2A2A3A]">Notifications</span>
                   {myNotifications.length > 0 && (
-                    <button onClick={() => setNotifications((prev) => prev.map((n) => n.forUser === currentViewerName ? { ...n, read: true } : n))} className="text-[10.5px] text-[#B8862F]">Mark all read</button>
+                    <button onClick={markAllNotificationsRead} className="text-[10.5px] text-[#B8862F]">Mark all read</button>
                   )}
                 </div>
                 {myNotifications.length === 0 && <div className="text-[11.5px] text-[#6B6980] px-3 py-6 text-center">Nothing yet, {currentViewerName}.</div>}
                 {myNotifications.map((n) => (
                   <div key={n.id} className="px-3 py-2.5 border-b border-[#E3E1F0] last:border-0" style={{ background: n.read ? "transparent" : "#5E9E8A0F" }}>
-                    <div className="text-[12px] text-[#2A2A3A]"><span className="font-medium">{n.completedBy}</span> {n.isAssignment ? "assigned you" : "completed"} <span className="font-medium">{n.isAssignment ? n.itemTitle : `"${n.itemTitle}"`}</span></div>
+                    <div className="text-[12px] text-[#2A2A3A]"><span className="font-medium">{n.actor}</span> {n.summary}</div>
                     <div className="text-[10px] text-[#8B889C] mt-0.5">{n.ts}</div>
                   </div>
                 ))}
@@ -1452,7 +1639,7 @@ export default function OpsDashboard() {
               className="text-[13px] rounded-md px-2.5 py-1.5 outline-none"
               style={{ background: "rgba(247,246,251,0.14)", border: "1px solid rgba(247,246,251,0.35)", color: "#F7F6FB" }}>
               <option value="central" style={{ color: "#2A2A3A" }}>Central Operations Director</option>
-              {CAMPUSES.map((c) => <option key={c.id} value={c.id} style={{ color: "#2A2A3A" }}>{c.name} ({c.abbr}) — Campus OD</option>)}
+              {campuses.map((c) => <option key={c.id} value={c.id} style={{ color: "#2A2A3A" }}>{c.name} ({c.abbr}) — Campus OD</option>)}
             </select>
           ) : (
             <div className="text-[12.5px] px-2.5 py-1.5" style={{ color: "#C9D6E8" }}>{activeCampus?.name} ({activeCampus?.abbr})</div>
@@ -1505,7 +1692,7 @@ export default function OpsDashboard() {
           </div>
 
           {tab === "overview" && role === "central" && !selectedCampus && (
-            <CentralOverview campuses={CAMPUSES} orgBudgetUsed={orgBudgetUsed} orgBudgetTotal={orgBudgetTotal}
+            <CentralOverview campuses={campuses} orgBudgetUsed={orgBudgetUsed} orgBudgetTotal={orgBudgetTotal}
               projects={displayProjects} staffByCampus={staffByCampus} onSelectCampus={(id) => { setSelectedCampus(id); setTab("overview"); }}
               centralThreads={centralThreads} onAddTag={addCentralTag} onRemoveTag={removeCentralTag} onAddMessage={addCentralMessage}
               currentViewerName={currentViewerName} onOpenProject={setOpenProject}
@@ -1529,7 +1716,7 @@ export default function OpsDashboard() {
           {tab === "budget" && (
             <BudgetPanel
               projects={activeCampusId ? displayProjects.filter((p) => p.campus === activeCampusId) : displayProjects}
-              campuses={CAMPUSES} campusLabel={activeCampus ? activeCampus.name : "All Campuses"}
+              campuses={campuses} campusLabel={activeCampus ? activeCampus.name : "All Campuses"}
               onOpenProject={setOpenProject} onSelectCampus={activeCampusId ? null : (id) => { setSelectedCampus(id); setTab("budget"); }}
               accentColor={activeCampus?.color}
             />
@@ -1569,16 +1756,16 @@ export default function OpsDashboard() {
             />
           )}
 
-          {tab === "events" && <EventsList campusId={activeCampusId} />}
+          {tab === "events" && <EventsList campusId={activeCampusId} campuses={campuses} />}
 
           {tab === "accounts" && auth.user.tier === "central" && (
-            <AccountsPanel users={users} campuses={CAMPUSES} roleOptions={roleOptions}
+            <AccountsPanel users={users} campuses={campuses} roleOptions={roleOptions}
               onCreate={addUserAccount} onUpdateAccess={updateUserAccess} onRemove={removeUserAccount}
               currentUserId={auth.user.id} />
           )}
 
           {tab === "reports" && (
-            <ReportsPanel projects={displayProjects} campuses={CAMPUSES} staffByCampus={staffByCampus} roster={roster} isCentral={role === "central" && !selectedCampus} onClearAllProjects={clearAllProjects} onLoadDemoData={loadDemoData} />
+            <ReportsPanel projects={displayProjects} campuses={campuses} staffByCampus={staffByCampus} roster={roster} isCentral={role === "central" && !selectedCampus} onClearAllProjects={clearAllProjects} onLoadDemoData={loadDemoData} />
           )}
         </main>
       </div>
@@ -1591,6 +1778,8 @@ export default function OpsDashboard() {
           onAddProjectPhoto={addProjectPhoto} onAddSubtaskPhoto={addSubtaskPhoto}
           onUpdateProjectBudget={updateProjectBudget} onUpdateSubtaskBudget={updateSubtaskBudget}
           onSetDue={setProjectDue} onSetSubtaskDue={setSubtaskDue}
+          onAssignSubtask={assignSubtask} onDeleteSubtask={deleteSubtask} onDeleteProject={deleteProject}
+          roster={fullRoster}
         />
       )}
       {showNewProject && <NewProjectModal onClose={() => setShowNewProject(false)} onCreate={(data) => { addProject(data); setShowNewProject(false); }} sections={sections} campusRoster={campusRoster} fullRoster={fullRoster} campusLabel={activeCampus ? `${activeCampus.name} (${activeCampus.abbr})` : "Central"} />}
@@ -1762,7 +1951,7 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
         <p className="text-[13px] text-[#6B6980] mt-1">Organization-wide standing, at a glance.</p>
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-7">
-        <SummaryCard onClick={() => setDetail("projects")} icon={ListChecks} label="Open Projects" value={projects.filter((p) => p.stage !== "Done").length} sub="org-wide" color="#2B4C7E" />
+        <SummaryCard onClick={() => setDetail("projects")} icon={ListChecks} label="Open Projects" value={projects.filter((p) => p.stage !== "Completed").length} sub="org-wide" color="#2B4C7E" />
         <SummaryCard onClick={() => setDetail("budget")} icon={DollarSign} label="Budget Used" value={`${Math.round((orgBudgetUsed / orgBudgetTotal) * 100)}%`} sub={`${fmtMoney(orgBudgetUsed)} of ${fmtMoney(orgBudgetTotal)}`} color="#B8862F" />
         <SummaryCard onClick={() => setDetail("campuses")} icon={Building2} label="Campuses" value={campuses.length} sub="active sites" color="#5E9E8A" />
         <SummaryCard onClick={() => setDetail("shared")} icon={Link2} label="Shared Projects" value={sharedProjects.length} sub="cross-campus" color="#6B4FA0" />
@@ -1783,7 +1972,7 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
 
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3 mb-8 mt-7">
         {campuses.map((c) => {
-          const campusProjects = projects.filter((p) => p.stage !== "Done" && (p.campus === c.id || (p.shared && (p.sharedWith?.includes(c.id) || p.sharedWith?.includes("all")))));
+          const campusProjects = projects.filter((p) => p.stage !== "Completed" && (p.campus === c.id || (p.shared && (p.sharedWith?.includes(c.id) || p.sharedWith?.includes("all")))));
           const overdue = campusProjects.filter((p) => p.due < TODAY_STR).length;
           const cb = rollupBudget(projects.filter((p) => p.campus === c.id));
           const cbPct = cb.total ? Math.round((cb.spent / cb.total) * 100) : 0;
@@ -1849,7 +2038,7 @@ function CampusDashboard({ campus, projects, staff, notes, activity, dayEvents, 
           <p className="text-[12.5px] text-[#6B6980] mt-1">Campus Operations Director: {campus.lead} · Phase {campus.phase}</p>
         </div>
         <div className="text-right">
-          <div className="text-[20px] font-medium" style={{ fontFamily: "'JetBrains Mono', monospace" }}>{projects.filter((p) => p.stage !== "Done").length}</div>
+          <div className="text-[20px] font-medium" style={{ fontFamily: "'JetBrains Mono', monospace" }}>{projects.filter((p) => p.stage !== "Completed").length}</div>
           <div className="text-[10px] text-[#6B6980]">open projects</div>
         </div>
       </div>
@@ -2900,10 +3089,10 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, sections, onAdd
     setNewSectionName(""); setAddingSection(false);
   };
 
-  const completedCount = projects.filter((p) => p.stage === "Done").length;
+  const completedCount = projects.filter((p) => p.stage === "Completed").length;
 
   let list = projects.filter(
-    (p) => (filterStage === "All" || p.stage === filterStage) && (filterSection === "All" || (p.section || "General") === filterSection) && (showCompleted || p.stage !== "Done")
+    (p) => (filterStage === "All" || p.stage === filterStage) && (filterSection === "All" || (p.section || "General") === filterSection) && (showCompleted || p.stage !== "Completed")
   );
   list = [...list].sort(SORTERS[sortBy]);
 
@@ -2978,6 +3167,11 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, sections, onAdd
                     </div>
                     <ProgressBar subtasks={p.subtasks} />
                     <div className="text-[10.5px] text-[#6B6980] my-2">{p.owner} · Due {p.due}</div>
+                    {p.stage === "Completed" && (
+                      <span className="text-[9.5px] px-1.5 py-0.5 rounded-full inline-block mb-1" style={{ background: `${BUDGET_STATUS_COLOR[budgetStatus(p)]}22`, color: BUDGET_STATUS_COLOR[budgetStatus(p)] }}>
+                        Ended {BUDGET_STATUS_LABEL[budgetStatus(p)].toLowerCase()}
+                      </span>
+                    )}
                   </button>
                   <div className="flex items-center justify-between">
                     <button onClick={() => onCycle(p.id)}><StageBadge stage={p.stage} /></button>
@@ -2999,7 +3193,7 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, sections, onAdd
   );
 }
 
-function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetStage, onAddProjectNote, onAddSubtaskNote, onAddProjectPhoto, onAddSubtaskPhoto, onUpdateProjectBudget, onUpdateSubtaskBudget, onSetDue, onSetSubtaskDue }) {
+function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetStage, onAddProjectNote, onAddSubtaskNote, onAddProjectPhoto, onAddSubtaskPhoto, onUpdateProjectBudget, onUpdateSubtaskBudget, onSetDue, onSetSubtaskDue, onAssignSubtask, onDeleteSubtask, onDeleteProject, roster }) {
   const [showAddSubtask, setShowAddSubtask] = useState(false);
   const [subtaskText, setSubtaskText] = useState("");
   const [subtaskCost, setSubtaskCost] = useState("");
@@ -3022,14 +3216,22 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
   const [subtaskSort, setSubtaskSort] = useState("default");
   const [editingDue, setEditingDue] = useState(false);
   const [dueDraft, setDueDraft] = useState("");
+  const [dueTimeDraft, setDueTimeDraft] = useState("");
   const [editingSubtaskDue, setEditingSubtaskDue] = useState(null);
   const [subtaskDueDraft, setSubtaskDueDraft] = useState("");
+  const [subtaskDueTimeDraft, setSubtaskDueTimeDraft] = useState("");
+  const [editingAssignees, setEditingAssignees] = useState(null);
+  const [subtaskAssigneesDraft, setSubtaskAssigneesDraft] = useState([]);
+  const [newSubtaskTime, setNewSubtaskTime] = useState("");
+  const [newSubtaskAssignees, setNewSubtaskAssignees] = useState([]);
+  const [confirmDeleteProject, setConfirmDeleteProject] = useState(false);
+  const [confirmDeleteSubtask, setConfirmDeleteSubtask] = useState(null);
   useLockBodyScroll();
 
   if (!project) return null;
   const pct = project.subtasks?.length ? Math.round((project.subtasks.filter((s) => s.done).length / project.subtasks.length) * 100) : 0;
   const allSubtasksDone = project.subtasks?.length > 0 && project.subtasks.every((s) => s.done);
-  const readyToComplete = allSubtasksDone && project.stage !== "Done";
+  const readyToComplete = allSubtasksDone && project.stage !== "Completed";
   const budgetRoll = projectBudget(project);
   const subtaskEntries = (project.subtasks || []).map((s, i) => ({ s, i }));
   if (subtaskSort === "team") subtaskEntries.sort((a, b) => (a.s.createdBy || "").localeCompare(b.s.createdBy || ""));
@@ -3037,9 +3239,13 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
   const submitSubtask = () => {
     if (!subtaskText.trim()) return;
     const recurrence = recurFreq === "none" ? { freq: "none" } : { freq: recurFreq, customEvery, customUnit, endType, count, untilDate };
-    onAddSubtask(project.id, subtaskText.trim(), recurrence, recurFreq !== "none" ? startDate : null, subtaskCost);
-    setSubtaskText(""); setSubtaskCost(""); setRecurFreq("none"); setEndType("never"); setShowAddSubtask(false);
+    const due = recurFreq !== "none" ? startDate : (startDate || null);
+    onAddSubtask(project.id, subtaskText.trim(), recurrence, due, subtaskCost, newSubtaskTime, newSubtaskAssignees);
+    setSubtaskText(""); setSubtaskCost(""); setRecurFreq("none"); setEndType("never"); setStartDate(TODAY_STR); setNewSubtaskTime(""); setNewSubtaskAssignees([]); setShowAddSubtask(false);
   };
+
+  const toggleNewSubtaskAssignee = (name) =>
+    setNewSubtaskAssignees((prev) => prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]);
 
   const startEditBudget = () => { setBudgetDraft({ cost: project.cost || 0, spent: project.spent || 0 }); setEditingBudget(true); };
   const saveBudget = () => { onUpdateProjectBudget(project.id, budgetDraft.cost, budgetDraft.spent); setEditingBudget(false); };
@@ -3072,31 +3278,47 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
       <div className="border rounded-xl max-w-[560px] w-full my-8 mx-auto p-5" style={{ background: "#FFFFFF", borderColor: "#D8D5EC", color: "#2A2A3A", fontFamily: "'Inter', sans-serif" }} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between mb-3 gap-2">
           <div className="flex items-center gap-1.5 min-w-0">{project.shared && <Link2 size={13} className="text-[#B8862F] shrink-0" />}<h2 className="text-[clamp(14px,3vw,16px)] font-medium truncate">{project.title}</h2></div>
-          <button onClick={onClose} className="text-[#6B6980] hover:text-[#2A2A3A] shrink-0"><X size={18} /></button>
+          <div className="flex items-center gap-2 shrink-0">
+            {confirmDeleteProject ? (
+              <span className="flex items-center gap-1">
+                <button onClick={() => { onDeleteProject(project.id); onClose(); }} className="text-[10.5px] font-medium px-2 py-1 rounded" style={{ background: "#C15B5B", color: "#FFFFFF" }}>Confirm delete</button>
+                <button onClick={() => setConfirmDeleteProject(false)} className="text-[10.5px] text-[#8B889C]">Cancel</button>
+              </span>
+            ) : (
+              <button onClick={() => setConfirmDeleteProject(true)} className="text-[#8B889C] hover:text-[#C15B5B]"><Trash2 size={15} /></button>
+            )}
+            <button onClick={onClose} className="text-[#6B6980] hover:text-[#2A2A3A]"><X size={18} /></button>
+          </div>
         </div>
         <div className="flex items-center gap-3 text-[11px] text-[#6B6980] mb-4 flex-wrap">
           <span>Owner: {project.owner}</span><span>·</span>
           {editingDue ? (
             <span className="flex items-center gap-1">
               <input type="date" value={dueDraft} onChange={(e) => setDueDraft(e.target.value)} className="bg-[#EFEEFA] border border-[#D8D5EC] rounded px-1.5 py-0.5 text-[10.5px] outline-none" />
-              <button onClick={() => { onSetDue(project.id, dueDraft); setEditingDue(false); }} className="text-[#B8862F] font-medium">Save</button>
+              <input type="time" value={dueTimeDraft} onChange={(e) => setDueTimeDraft(e.target.value)} className="bg-[#EFEEFA] border border-[#D8D5EC] rounded px-1.5 py-0.5 text-[10.5px] outline-none" />
+              <button onClick={() => { onSetDue(project.id, dueDraft, dueTimeDraft); setEditingDue(false); }} className="text-[#B8862F] font-medium">Save</button>
               <button onClick={() => setEditingDue(false)} className="text-[#8B889C]">Cancel</button>
             </span>
           ) : (
             <span className="flex items-center gap-1">
-              Due {project.due}
-              <button onClick={() => { setDueDraft(project.due); setEditingDue(true); }} className="text-[#B8862F] underline decoration-dotted">edit</button>
+              Due {project.due}{project.dueTime ? ` ${project.dueTime}` : ""}
+              <button onClick={() => { setDueDraft(project.due); setDueTimeDraft(project.dueTime || ""); setEditingDue(true); }} className="text-[#B8862F] underline decoration-dotted">edit</button>
             </span>
           )}
           <StageBadge stage={project.stage} />
+          {project.stage === "Completed" && (
+            <span className="text-[10.5px] px-2 py-0.5 rounded-full" style={{ background: `${BUDGET_STATUS_COLOR[budgetStatus(project)]}22`, color: BUDGET_STATUS_COLOR[budgetStatus(project)] }}>
+              Ended {BUDGET_STATUS_LABEL[budgetStatus(project)].toLowerCase()}
+            </span>
+          )}
         </div>
 
         {readyToComplete && (
           <div className="rounded-md p-3 mb-4 flex items-center justify-between gap-3 flex-wrap" style={{ background: "#5E9E8A18", border: "1px solid #5E9E8A55" }}>
             <div className="flex items-center gap-2 text-[12.5px]" style={{ color: "#3D6B5C" }}>
-              <CheckCircle2 size={15} /> All sub-tasks are complete. Mark this project Done?
+              <CheckCircle2 size={15} /> All sub-tasks are complete. Mark this project Completed?
             </div>
-            <button onClick={() => onSetStage(project.id, "Done")} className="text-[11.5px] rounded-md px-3 py-1.5 font-medium shrink-0" style={{ background: "#5E9E8A", color: "#FFFFFF" }}>
+            <button onClick={() => onSetStage(project.id, "Completed")} className="text-[11.5px] rounded-md px-3 py-1.5 font-medium shrink-0" style={{ background: "#5E9E8A", color: "#FFFFFF" }}>
               Mark Complete
             </button>
           </div>
@@ -3203,13 +3425,17 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
                     {editingSubtaskDue === i ? (
                       <span className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
                         <input type="date" value={subtaskDueDraft} onChange={(e) => setSubtaskDueDraft(e.target.value)} className="bg-[#EFEEFA] border border-[#D8D5EC] rounded px-1 py-0.5 text-[9.5px] outline-none" />
-                        <button onClick={() => { onSetSubtaskDue(project.id, i, subtaskDueDraft); setEditingSubtaskDue(null); }} className="text-[9.5px] text-[#B8862F] font-medium">Save</button>
+                        <input type="time" value={subtaskDueTimeDraft} onChange={(e) => setSubtaskDueTimeDraft(e.target.value)} className="bg-[#EFEEFA] border border-[#D8D5EC] rounded px-1 py-0.5 text-[9.5px] outline-none" />
+                        <button onClick={() => { onSetSubtaskDue(project.id, i, subtaskDueDraft, subtaskDueTimeDraft); setEditingSubtaskDue(null); }} className="text-[9.5px] text-[#B8862F] font-medium">Save</button>
                       </span>
                     ) : (
                       <span className="flex items-center gap-0.5 whitespace-nowrap">
-                        {s.due && <span className="text-[9.5px] text-[#8B889C]">· {s.due}</span>}
-                        <button onClick={(e) => { e.stopPropagation(); setSubtaskDueDraft(s.due || TODAY_STR); setEditingSubtaskDue(i); }} className="text-[9px] text-[#B8862F] underline decoration-dotted">edit</button>
+                        {s.due && <span className="text-[9.5px] text-[#8B889C]">· {s.due}{s.dueTime ? ` ${s.dueTime}` : ""}</span>}
+                        <button onClick={(e) => { e.stopPropagation(); setSubtaskDueDraft(s.due || TODAY_STR); setSubtaskDueTimeDraft(s.dueTime || ""); setEditingSubtaskDue(i); }} className="text-[9px] text-[#B8862F] underline decoration-dotted">edit</button>
                       </span>
+                    )}
+                    {s.assignees?.length > 0 && (
+                      <span className="text-[9.5px] px-1.5 py-0.5 rounded-full bg-[#B8862F22] text-[#B8862F] whitespace-nowrap truncate max-w-[120px]">{s.assignees.join(", ")}</span>
                     )}
                     {s.recurrence && describeRecurrence(s.recurrence) && (
                       <span className="text-[9.5px] px-1.5 py-0.5 rounded-full bg-[#2B4C7E22] text-[#2B4C7E] whitespace-nowrap">🔁 {describeRecurrence(s.recurrence)}</span>
@@ -3218,6 +3444,14 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
                     <button onClick={() => setExpandedSubtask(expandedSubtask === i ? null : i)} className="text-[#8B889C] hover:text-[#B8862F] text-[10px] px-1 whitespace-nowrap">
                       {expandedSubtask === i ? "Close" : "Details"}
                     </button>
+                    {confirmDeleteSubtask === i ? (
+                      <span className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+                        <button onClick={() => { onDeleteSubtask(project.id, i); setConfirmDeleteSubtask(null); }} className="text-[9.5px] font-medium px-1.5 py-0.5 rounded" style={{ background: "#C15B5B", color: "#FFFFFF" }}>Confirm</button>
+                        <button onClick={() => setConfirmDeleteSubtask(null)} className="text-[9.5px] text-[#8B889C]">Cancel</button>
+                      </span>
+                    ) : (
+                      <button onClick={(e) => { e.stopPropagation(); setConfirmDeleteSubtask(i); }} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><Trash2 size={12} /></button>
+                    )}
                   </div>
                 </div>
 
@@ -3248,6 +3482,35 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
                         </div>
                       ) : (
                         <div className="text-[11px] text-[#6B6980]">{fmtMoney(s.spent || 0)} / {fmtMoney(s.cost || 0)} spent</div>
+                      )}
+                    </div>
+                    {/* sub-task assignees */}
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="text-[10px] text-[#6B6980]">Assigned to</span>
+                        {editingAssignees !== i && (
+                          <button onClick={() => { setSubtaskAssigneesDraft(s.assignees || []); setEditingAssignees(i); }} className="text-[10px] text-[#B8862F]">Edit</button>
+                        )}
+                      </div>
+                      {editingAssignees === i ? (
+                        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-md p-2">
+                          <div className="flex flex-wrap gap-x-3 gap-y-1 mb-2">
+                            {(roster || []).map((r) => (
+                              <label key={r.name} className="flex items-center gap-1 text-[10.5px] cursor-pointer">
+                                <input type="checkbox" checked={subtaskAssigneesDraft.includes(r.name)}
+                                  onChange={() => setSubtaskAssigneesDraft((prev) => prev.includes(r.name) ? prev.filter((n) => n !== r.name) : [...prev, r.name])}
+                                  className="accent-[#B8862F]" />
+                                {r.name}
+                              </label>
+                            ))}
+                          </div>
+                          <div className="flex gap-1.5">
+                            <button onClick={() => { onAssignSubtask(project.id, i, subtaskAssigneesDraft); setEditingAssignees(null); }} className="text-[10.5px] bg-[#B8862F] text-[#F7F6FB] rounded px-2 py-1 font-medium">Save</button>
+                            <button onClick={() => setEditingAssignees(null)} className="text-[10.5px] text-[#6B6980] px-1">Cancel</button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="text-[11px] text-[#6B6980]">{s.assignees?.length > 0 ? s.assignees.join(", ") : "No one assigned"}</div>
                       )}
                     </div>
                     {/* sub-task photos */}
@@ -3311,9 +3574,26 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
               <input value={subtaskText} onChange={(e) => setSubtaskText(e.target.value)} placeholder="Sub-task title"
                 className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[12px] outline-none focus:border-[#B8862F]" />
               <div className="flex items-center gap-2">
+                <span className="text-[10.5px] text-[#6B6980] w-[60px] shrink-0">Due</span>
+                <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11px] outline-none" />
+                <input type="time" value={newSubtaskTime} onChange={(e) => setNewSubtaskTime(e.target.value)} className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11px] outline-none" />
+              </div>
+              <div className="flex items-center gap-2">
                 <span className="text-[10.5px] text-[#6B6980] w-[60px] shrink-0">Est. cost</span>
                 <input type="number" value={subtaskCost} onChange={(e) => setSubtaskCost(e.target.value)} placeholder="0"
                   className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11px] outline-none" />
+              </div>
+              <div className="flex items-start gap-2">
+                <span className="text-[10.5px] text-[#6B6980] w-[60px] shrink-0 pt-1">Assign to</span>
+                <div className="flex-1 flex flex-wrap gap-x-3 gap-y-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5">
+                  {(roster || []).map((r) => (
+                    <label key={r.name} className="flex items-center gap-1 text-[10.5px] cursor-pointer">
+                      <input type="checkbox" checked={newSubtaskAssignees.includes(r.name)} onChange={() => toggleNewSubtaskAssignee(r.name)} className="accent-[#B8862F]" />
+                      {r.name}
+                    </label>
+                  ))}
+                  {(!roster || roster.length === 0) && <span className="text-[10px] text-[#8B889C]">No one available to assign yet.</span>}
+                </div>
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-[10.5px] text-[#6B6980] w-[60px] shrink-0">Repeats</span>
@@ -3321,12 +3601,6 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
                   {RECUR_FREQ.map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}
                 </select>
               </div>
-              {recurFreq !== "none" && (
-                <div className="flex items-center gap-2">
-                  <span className="text-[10.5px] text-[#6B6980] w-[60px] shrink-0">Starts</span>
-                  <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11px] outline-none" />
-                </div>
-              )}
               {recurFreq === "custom" && (
                 <div className="flex items-center gap-2">
                   <span className="text-[10.5px] text-[#6B6980] w-[60px] shrink-0">Every</span>
@@ -3377,7 +3651,7 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
 }
 
 function StageBadge({ stage }) {
-  const map = { "Backlog": "#8B889C", "In Progress": "#2B4C7E", "Blocked": "#C15B5B", "Done": "#5E9E8A" };
+  const map = { "Pending": "#8B889C", "Started": "#B8862F", "In Progress": "#2B4C7E", "Stalled": "#C15B5B", "Completed": "#5E9E8A" };
   return <span className="inline-block text-[10.5px] px-2 py-0.5 rounded-full" style={{ background: `${map[stage]}22`, color: map[stage] }}>{stage}</span>;
 }
 
@@ -3387,7 +3661,7 @@ const seedEvents = [
   { id: 3, title: "Central Ops / OD Touchpoint", date: "2026-07-17", campuses: ["all"], type: "Central" },
   { id: 4, title: "Safety Drill Weekend", date: "2026-08-10", campuses: ["ynv", "nib"], type: "Cross-Campus" },
 ];
-function EventsList({ campusId }) {
+function EventsList({ campusId, campuses }) {
   const events = seedEvents.filter((e) => !campusId || e.campuses.includes(campusId) || e.campuses.includes("all"));
   const typeColor = { "Campus": "#2B4C7E", "Cross-Campus": "#B8862F", "Central": "#6B4FA0" };
   return (
@@ -3398,7 +3672,7 @@ function EventsList({ campusId }) {
           <div key={e.id} className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg px-4 py-3 flex items-center justify-between">
             <div>
               <div className="text-[13.5px]">{e.title}</div>
-              <div className="text-[11px] text-[#6B6980] mt-0.5">{e.date} · {e.campuses.includes("all") ? "All campuses" : e.campuses.map((id) => CAMPUSES.find((c) => c.id === id)?.name).join(", ")}</div>
+              <div className="text-[11px] text-[#6B6980] mt-0.5">{e.date} · {e.campuses.includes("all") ? "All campuses" : e.campuses.map((id) => campuses.find((c) => c.id === id)?.name).join(", ")}</div>
             </div>
             <span className="text-[10.5px] px-2 py-0.5 rounded-full" style={{ background: `${typeColor[e.type]}22`, color: typeColor[e.type] }}>{e.type}</span>
           </div>
@@ -3411,8 +3685,9 @@ function EventsList({ campusId }) {
 function NewProjectModal({ onClose, onCreate, sections, campusRoster, fullRoster, campusLabel }) {
   const [title, setTitle] = useState("");
   const [section, setSection] = useState(sections[0] || "General");
-  const [stage, setStage] = useState("Backlog");
+  const [stage, setStage] = useState("Pending");
   const [due, setDue] = useState(TODAY_STR);
+  const [dueTime, setDueTime] = useState("");
   const [cost, setCost] = useState("");
   const [owner, setOwner] = useState("");
   const [team, setTeam] = useState("");
@@ -3431,7 +3706,7 @@ function NewProjectModal({ onClose, onCreate, sections, campusRoster, fullRoster
   const submit = () => {
     if (!title.trim()) return;
     const recurrence = recurFreq === "none" ? { freq: "none" } : { freq: recurFreq, customEvery, customUnit, endType, count, untilDate };
-    onCreate({ title: title.trim(), section, stage, due, cost, owner: owner.trim(), team, collaborators, recurrence, shared: isCrossCampus });
+    onCreate({ title: title.trim(), section, stage, due, dueTime, cost, owner: owner.trim(), team, collaborators, recurrence, shared: isCrossCampus });
   };
 
   return (
@@ -3464,10 +3739,14 @@ function NewProjectModal({ onClose, onCreate, sections, campusRoster, fullRoster
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-3 gap-3">
             <div>
               <label className="text-[10.5px] text-[#6B6980] block mb-1">Due date</label>
               <input type="date" value={due} onChange={(e) => setDue(e.target.value)} className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2 py-2 text-[12.5px] outline-none" />
+            </div>
+            <div>
+              <label className="text-[10.5px] text-[#6B6980] block mb-1">Due time (optional)</label>
+              <input type="time" value={dueTime} onChange={(e) => setDueTime(e.target.value)} className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2 py-2 text-[12.5px] outline-none" />
             </div>
             <div>
               <label className="text-[10.5px] text-[#6B6980] block mb-1">Estimated cost ($)</label>
@@ -3566,7 +3845,7 @@ function SummaryDetailModal({ type, onClose, campuses, projects, sharedProjects,
         {type === "projects" && (
           <div className="space-y-4">
             {(() => {
-              const open = projects.filter((p) => p.stage !== "Done");
+              const open = projects.filter((p) => p.stage !== "Completed");
               const central = open.filter((p) => p.campus === "central");
               const sortedCampuses = [...campuses].sort((a, b) => a.name.localeCompare(b.name));
               return (
@@ -3965,7 +4244,7 @@ function AccountsPanel({ users, campuses, roleOptions, onCreate, onUpdateAccess,
     <div>
       <div className="flex items-start justify-between mb-6 gap-3 flex-wrap">
         <div>
-          <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(20px,4vw,26px)] font-semibold tracking-tight">Team Accounts</h1>
+          <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(20px,4vw,26px)] font-semibold tracking-tight">User Management</h1>
           <p className="text-[13px] text-[#6B6980] mt-1">Create logins and control which campus and role each person's account has access to.</p>
         </div>
         <button onClick={() => setShowCreate(true)} className="flex items-center gap-1.5 text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>
@@ -4110,13 +4389,13 @@ function StaffProfileModal({ name, projects, onClose, onOpenProject }) {
   const isInvolved = (p) => p.owner === name || (p.team || []).includes(name) || (p.subtasks || []).some((s) => s.createdBy === name);
 
   const involved = projects.filter(isInvolved);
-  const completedProjects = involved.filter((p) => p.stage === "Done").sort((a, b) => (b.completedOn || "").localeCompare(a.completedOn || "")).slice(0, 8);
+  const completedProjects = involved.filter((p) => p.stage === "Completed").sort((a, b) => (b.completedOn || "").localeCompare(a.completedOn || "")).slice(0, 8);
   const completedTasks = [];
   involved.forEach((p) => (p.subtasks || []).forEach((s) => { if (s.done && s.createdBy === name) completedTasks.push({ ...s, projectTitle: p.title, projectId: p.id }); }));
   completedTasks.sort((a, b) => (b.due || "").localeCompare(a.due || ""));
 
-  const current = involved.filter((p) => p.stage !== "Done");
-  const needsAttention = current.filter((p) => p.stage === "Blocked" || (p.due && p.due < TODAY_STR) || (p.subtasks || []).some((s) => !s.done && s.due && s.due < TODAY_STR));
+  const current = involved.filter((p) => p.stage !== "Completed");
+  const needsAttention = current.filter((p) => p.stage === "Stalled" || (p.due && p.due < TODAY_STR) || (p.subtasks || []).some((s) => !s.done && s.due && s.due < TODAY_STR));
 
   return (
     <div className="fixed inset-0 z-30 overflow-y-auto p-4" style={{ background: "rgba(0,0,0,0.65)", WebkitOverflowScrolling: "touch" }} onClick={onClose}>

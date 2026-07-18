@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "operations-dashboard",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["devserver.js"],
+      "port": 8734
+    }
+  ]
+}
