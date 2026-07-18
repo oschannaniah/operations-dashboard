@@ -3,7 +3,8 @@ import {
   LayoutGrid, ListChecks, CalendarDays, Users, DollarSign,
   ChevronLeft, ChevronRight, Plus, Circle, CheckCircle2, AlertTriangle,
   Link2, Building2, ShieldCheck, X, StickyNote, Activity as ActivityIcon,
-  MessageSquare, Mic, Image as ImageIcon, Trash2, Clock, Bell, Camera, FileText
+  MessageSquare, Mic, Image as ImageIcon, Trash2, Clock, Bell, Camera, FileText,
+  MoreHorizontal
 } from "lucide-react";
 import { Document, Packer, Paragraph, Table, TableRow, TableCell, HeadingLevel, TextRun, WidthType } from "docx";
 import jsPDF from "jspdf";
@@ -11,6 +12,9 @@ import autoTable from "jspdf-autotable";
 import { createClient } from "@supabase/supabase-js";
 
 const CENTRAL_TEAM = ["Hannaniah Owens", "Kassi Bourgeois", "Natalie Benton", "Lauren Bostic"];
+// Groups navItems into labeled clusters — shared by the desktop sidebar and the mobile "More"
+// sheet so both present the same mental model.
+const NAV_SECTIONS = ["Overview", "Work", "People", "Admin"];
 
 const TIERS = [
   { tier: 1, role: "Central Operations Director", scope: "All campuses, full edit" },
@@ -33,6 +37,12 @@ const DEFAULT_ROLE_OPTIONS = [
 // builds a person straight into one of these, as a second, more structured way to build the
 // roster alongside the simpler free-text "Add Team Member" flow.
 const TEAM_LANES = ["Operations", "Ministry", "Next Gen", "Programming"];
+
+// A project's Ministry Area — same 4 lanes staff already get organized under, plus Central for
+// work that belongs to Central itself rather than any one lane. Fixed on purpose (replacing
+// the old free-text "section" concept): tagging Central here is a real signal Central needs to
+// see land in their notifications, which a freeform label could never guarantee.
+const MINISTRY_AREA_OPTIONS = [...TEAM_LANES, "Central"];
 
 const LANE_ROLE_OPTIONS = {
   "Operations": [
@@ -87,14 +97,15 @@ let handleUnauthorized = () => {};
 // vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
 // the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
 // snake_case columns — so every existing call site keeps working unchanged.
-const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads" };
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members" };
 
-// Every table's primary key is "id" except campus_config, whose natural key (campus_id) is
-// also its actual Postgres primary key column — there's no separate surrogate "id" there.
-const PK_MAP = { campus_config: "campus_id" };
+// Every table's primary key is "id" except campus_config (natural key campus_id) and
+// margin_scores (natural key staff_id, one row per staff member) — neither has a separate
+// surrogate "id" column.
+const PK_MAP = { campus_config: "campus_id", margin_scores: "staff_id" };
 
 const FIELD_MAPS = {
-  projects: { organizationId: "organization_id", createdBy: "created_by", completedOn: "completed_on", sharedWith: "shared_with", dueTime: "due_time" },
+  projects: { organizationId: "organization_id", createdBy: "created_by", completedOn: "completed_on", sharedWith: "shared_with", dueTime: "due_time", seasonId: "season_id" },
   subtasks: { projectId: "project_id", createdBy: "created_by", dueTime: "due_time" },
   staff: { organizationId: "organization_id", campusId: "campus_id", reportsTo: "reports_to", nextMeeting: "next_meeting", lastContact: "last_contact", calendarSynced: "calendar_synced", userId: "user_id" },
   profiles: { organizationId: "organization_id", firstName: "first_name", lastName: "last_name", campusId: "campus_id", googleCalendarIds: "google_calendar_ids", googleCalendarNames: "google_calendar_names" },
@@ -102,6 +113,12 @@ const FIELD_MAPS = {
   notifications: { organizationId: "organization_id", forUser: "for_user_name", projectId: "project_id" },
   campuses: { organizationId: "organization_id", lead: "lead_name", leadProfileId: "lead_profile_id" },
   central_threads: { organizationId: "organization_id", threadKey: "thread_key" },
+  margin_scores: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", calibrationGap: "calibration_gap", lastSurveyAt: "last_survey_at", lastPulseAt: "last_pulse_at", updatedAt: "updated_at" },
+  margin_surveys: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", odProfileId: "od_profile_id", createdAt: "created_at" },
+  margin_pulses: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", sentBy: "sent_by", sentAt: "sent_at", respondedAt: "responded_at" },
+  seasons: { organizationId: "organization_id", startsOn: "starts_on", endsOn: "ends_on", createdBy: "created_by", createdAt: "created_at" },
+  teams: { organizationId: "organization_id", campusId: "campus_id", createdAt: "created_at" },
+  team_members: { teamId: "team_id", staffId: "staff_id", roleInTeam: "role_in_team", addedAt: "added_at" },
 };
 
 function toSnakeRow(table, obj) {
@@ -173,6 +190,18 @@ const apiDisconnectGoogleCalendar = () => invokeFunction("google-calendar", "dis
 // Reads the campus's current-phase slide out of its Google Slides deck and returns
 // { people: [{ name, role, reportsTo }] } — see importOrgChartFromSlides_ in Code.gs.
 const apiImportOrgChartFromSlides = (campusId, url, phase) => invokeFunction("import-org-chart", null, { campusId, url, phase });
+
+// Asana/Slack connect scaffolding — genuinely inert until real OAuth apps exist (see
+// supabase/functions/asana-connect and slack-connect); every call below fails cleanly with a
+// "not configured" error until then, which is the correct behavior right now, not a bug.
+const apiAsanaStatus = () => invokeFunction("asana-connect", "status", {});
+const apiAsanaAuthorizeUrl = () => invokeFunction("asana-connect", "authorizeUrl", {});
+const apiAsanaConnect = (code) => invokeFunction("asana-connect", "connect", { code });
+const apiAsanaDisconnect = () => invokeFunction("asana-connect", "disconnect", {});
+const apiSlackStatus = () => invokeFunction("slack-connect", "status", {});
+const apiSlackAuthorizeUrl = () => invokeFunction("slack-connect", "authorizeUrl", {});
+const apiSlackConnect = (code) => invokeFunction("slack-connect", "connect", { code });
+const apiSlackDisconnect = () => invokeFunction("slack-connect", "disconnect", {});
 
 
 // Prevents the page behind a modal from scrolling. Kept deliberately simple — just
@@ -523,6 +552,87 @@ function budgetStatus(project) {
 const BUDGET_STATUS_LABEL = { under: "Under budget", at: "On budget", over: "Over budget" };
 const BUDGET_STATUS_COLOR = { under: "#5E9E8A", at: "#B8862F", over: "#C15B5B" };
 
+// Financial stewardship, deliberately scoped narrow: not a campus budget system, just how well
+// completed projects were actually estimated. Variance is signed — negative means it landed
+// under, positive means over — so "average variance" reads as a real trend, not just a
+// magnitude.
+function estimateAccuracy(projectsList) {
+  const completed = projectsList.filter((p) => p.stage === "Completed");
+  const scored = completed.map((p) => {
+    const b = projectBudget(p);
+    const variance = b.total > 0 ? ((b.spent - b.total) / b.total) * 100 : 0;
+    return { project: p, budget: b, variance, status: budgetStatus(p) };
+  });
+  const atOrUnder = scored.filter((s) => s.status !== "over").length;
+  return {
+    count: scored.length,
+    atOrUnderPct: scored.length ? Math.round((atOrUnder / scored.length) * 100) : null,
+    avgVariance: scored.length ? scored.reduce((sum, s) => sum + s.variance, 0) / scored.length : 0,
+    worst: [...scored].sort((a, b) => b.variance - a.variance).slice(0, 5),
+  };
+}
+
+// Margin — deliberately separate from Budget, both in data (own tables, see
+// migrations/0006_margin.sql) and here in the UI's color vocabulary, even though it borrows
+// the same three-color traffic-light convention.
+const MARGIN_STATUS_LABEL = { comfortable: "Comfortable", full: "Full", stretched: "Stretched", over_capacity: "Over capacity" };
+const MARGIN_STATUS_COLOR = { comfortable: "#5E9E8A", full: "#5E9E8A", stretched: "#B8862F", over_capacity: "#C15B5B" };
+
+// Team Health flag — a fixed, short vocabulary rather than the free-text field this used to
+// be, so it reads as a real signal instead of a stray note. Deliberately low-stakes: a
+// pastoral prompt, not a performance record.
+const TEAM_HEALTH_FLAG_OPTIONS = ["Overloaded", "New", "Needs encouragement", "At-risk"];
+
+// A staff row whose lastContact is either unset, still holding one of the old placeholder
+// strings from before check-ins were tracked ("Just added", "Not yet scheduled", "Imported
+// from org chart"), or more than 30 days old all read the same way: nobody's actually checked
+// in recently, so don't quietly treat legacy data as fine.
+function needsCheckIn(lastContact) {
+  if (!lastContact) return true;
+  const parsed = new Date(lastContact);
+  if (isNaN(parsed.getTime())) return true;
+  return (Date.now() - parsed.getTime()) / (1000 * 60 * 60 * 24) > 30;
+}
+
+// The OD's 10-question survey — sets the Margin benchmark for one team member. Q9/Q10 are the
+// OD's own calibration read, compared against the computed score server-side rather than
+// blended into it (see recompute_margin_score() in migrations/0006_margin.sql).
+const MARGIN_SURVEY_QUESTIONS = [
+  { key: "q1", text: "Right now, how many active projects or responsibilities are they carrying, relative to what's typical for their role?",
+    options: [["fewer", "Fewer than usual"], ["typical", "About typical"], ["more", "More than usual"], ["significantly_more", "Significantly more"]] },
+  { key: "q2", text: "Over the last month, has their workload trended up, held steady, or come down?",
+    options: [["down", "Down"], ["steady", "Steady"], ["up", "Up"]] },
+  { key: "q3", text: "When you hand them something new, how do they typically turn it around against the deadline?",
+    options: [["well_ahead", "Well ahead"], ["on_time", "On time"], ["occasionally_late", "Occasionally late"], ["often_late", "Often late"]] },
+  { key: "q4", text: "How much of what they're carrying right now is high-stakes or complex, versus routine?",
+    options: [["mostly_routine", "Mostly routine"], ["mixed", "Mixed"], ["mostly_high_stakes", "Mostly high-stakes"]] },
+  { key: "q5", text: "If they needed to hand something off this week, is there someone else who could actually pick it up?",
+    options: [["easily", "Easily"], ["with_rampup", "With some ramp-up"], ["no_one_else", "No one else could"]] },
+  { key: "q6", text: "How long have they been in this specific role?",
+    options: [["under_3mo", "Under 3 months"], ["3_12mo", "3–12 months"], ["over_1yr", "1+ year"]] },
+  { key: "q7", text: "Have they asked for help, flagged being stretched, or shown signs of being overwhelmed recently?",
+    options: [["not_that_ive_seen", "Not that I've seen"], ["a_little", "A little"], ["clearly_more_than_once", "Clearly, more than once"]] },
+  { key: "q8", text: "Do they carry responsibilities that pull them outside their home campus or into central-level work?",
+    options: [["no", "No"], ["some", "Some"], ["significant", "Significant"]] },
+  { key: "q9", text: "Being honest with yourself — how much more could you actually ask of them this week without it costing something?",
+    options: [["a_lot_more", "A lot more"], ["a_little_more", "A little more"], ["nothing_more", "Nothing more"], ["less_not_more", "Less, not more"]] },
+  { key: "q10", text: "Overall, where would you place them right now?",
+    options: [["plenty_of_room", "Plenty of room"], ["comfortably_full", "Comfortably full"], ["stretched", "Stretched"], ["over_capacity", "Over capacity"]] },
+];
+
+// The pulse — pushed by the OD, answered by the team member directly. p3/p4 double as an
+// optional short note; p5 is pure open text and isn't scored.
+const MARGIN_PULSE_QUESTIONS = [
+  { key: "p1", text: "Right now, how full does your plate feel?",
+    options: [["light", "Light"], ["comfortably_full", "Comfortably full"], ["stretched", "Stretched"], ["overwhelmed", "Overwhelmed"]] },
+  { key: "p2", text: "If something new landed on your desk this week, could you take it on without anything else slipping?",
+    options: [["yes_easily", "Yes, easily"], ["yes_but_something_slips", "Yes, but something would slip"], ["no_not_right_now", "No, not right now"]] },
+  { key: "p3", text: "Is anything on your plate right now taking more out of you than its size would suggest — something heavy, sensitive, or draining?",
+    options: [["no", "No"], ["yes", "Yes"]] },
+  { key: "p4", text: "Is there anything you're carrying that could realistically be delegated, delayed, or dropped?",
+    options: [["no", "No"], ["yes", "Yes"]] },
+];
+
 function tierForRole(roleId) { return roleId === "central" ? TIERS[0] : TIERS[1]; }
 
 // Shown whenever there's no valid auth in state — either a returning user logging back in,
@@ -573,7 +683,6 @@ function LoginScreen() {
 
   return (
     <div className="min-h-screen w-full flex items-center justify-center px-4" style={{ fontFamily: "'Inter', sans-serif", background: "#F7F6FB", color: "#2A2A3A" }}>
-      <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" />
       <div className="w-full max-w-[380px]">
         <div className="flex items-center gap-3 mb-6 justify-center">
           <div className="w-9 h-9 rounded-md flex items-center justify-center shrink-0" style={{ background: "#2B4C7E" }}><Building2 size={18} color="#F7F6FB" /></div>
@@ -667,6 +776,40 @@ function PendingAssignmentScreen({ user, onSignOut }) {
   );
 }
 
+// Mobile-only "More" sheet — holds every tab that doesn't fit in the bottom bar's 4 slots,
+// grouped by the same sections as the desktop sidebar. Slides up from the bottom rather than
+// centering like the rest of the app's modals, since it's a nav surface, not a form.
+function MobileMoreSheet({ navItems, tab, onSelect, onClose }) {
+  useLockBodyScroll();
+  return (
+    <div className="fixed inset-0 z-40 md:hidden flex items-end" style={{ background: "rgba(42,42,58,0.45)" }} onClick={onClose}>
+      <div className="w-full max-h-[75vh] overflow-y-auto rounded-t-2xl bg-[#FFFFFF] pb-[env(safe-area-inset-bottom)]" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 pt-4 pb-2">
+          <span className="text-[14px] font-semibold text-[#2A2A3A]">More</span>
+          <button onClick={onClose} className="w-7 h-7 rounded-md flex items-center justify-center text-[#6B6980] hover:bg-[#EFEEFA]"><X size={15} /></button>
+        </div>
+        <div className="px-3 pb-4">
+          {NAV_SECTIONS.map((section) => {
+            const items = navItems.filter((item) => item.section === section);
+            if (items.length === 0) return null;
+            return (
+              <div key={section} className="mt-3 first:mt-0">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] px-2 mb-1">{section}</div>
+                {items.map((item) => (
+                  <button key={item.id} onClick={() => { onSelect(item.id); onClose(); }}
+                    className={`w-full flex items-center gap-2.5 px-2 py-2.5 rounded-md text-[13.5px] text-left transition ${tab === item.id ? "bg-[#E3E1F0] text-[#2A2A3A]" : "text-[#2A2A3A] hover:bg-[#EFEEFA]"}`}>
+                    <item.icon size={16} strokeWidth={2} />{item.label}
+                  </button>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function OpsDashboard() {
   const [role, setRole] = useState(() => readNavFromUrl().role);
   const [tab, setTab] = useState(() => readNavFromUrl().tab);
@@ -683,6 +826,12 @@ export default function OpsDashboard() {
   });
   const [calView, setCalView] = useState("day");
   const [staffByCampus, setStaffByCampus] = useState(seedStaff);
+  const [marginScores, setMarginScores] = useState({}); // { [staffId]: { score, status, calibrationGap } } — empty for a 'staff'-tier viewer, by RLS, not by client-side filtering
+  const [seasons, setSeasons] = useState([]);
+  const [teams, setTeams] = useState([]);
+  const [teamMembers, setTeamMembers] = useState([]);
+  const [showSeasons, setShowSeasons] = useState(false);
+  const [pendingMarginPulse, setPendingMarginPulse] = useState(null);
   const [campuses, setCampuses] = useState([]);
   const [users, setUsers] = useState([]);
   const [campusSlidesLinks, setCampusSlidesLinks] = useState({});
@@ -690,7 +839,6 @@ export default function OpsDashboard() {
   const [pendingReassignments, setPendingReassignments] = useState([]);
   const [roleOptions, setRoleOptions] = useState(DEFAULT_ROLE_OPTIONS);
   const [myCalendarSynced, setMyCalendarSynced] = useState(true);
-  const [sections, setSections] = useState(["General", "Central Initiatives"]);
   const [centralThreads, setCentralThreads] = useState({});
   const [notifications, setNotifications] = useState([]);
   const [activityLog, setActivityLog] = useState([]);
@@ -699,6 +847,7 @@ export default function OpsDashboard() {
   const [syncing, setSyncing] = useState(false);
   const [bootstrapProgress, setBootstrapProgress] = useState(null); // { done, total } while seeding a fresh Sheet
   const [showNotifications, setShowNotifications] = useState(false);
+  const [showMoreSheet, setShowMoreSheet] = useState(false);
   const [openStaffProfile, setOpenStaffProfile] = useState(null);
   // Auth now rides on Supabase's own session (it persists/refreshes itself — no manual
   // localStorage handling needed), with the campus/role/tier fields the rest of this app
@@ -723,6 +872,21 @@ export default function OpsDashboard() {
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => loadForSession(session));
     return () => { cancelled = true; sub.subscription.unsubscribe(); };
   }, []);
+
+  // Completes an Asana/Slack connection after the provider redirects back here with
+  // ?oauthProvider=asana|slack&code=... — mirrors how the Google Calendar popup flow finishes,
+  // just via a full-page redirect instead of a popup since neither provider offers Google's
+  // postMessage-based code-client helper.
+  useEffect(() => {
+    if (!auth) return;
+    const params = new URLSearchParams(window.location.search);
+    const provider = params.get("oauthProvider");
+    const code = params.get("code");
+    if (!provider || !code) return;
+    window.history.replaceState(null, "", window.location.pathname);
+    (provider === "asana" ? apiAsanaConnect(code) : provider === "slack" ? apiSlackConnect(code) : Promise.reject(new Error("Unknown provider")))
+      .catch((err) => setBackendError(err?.message || String(err)));
+  }, [auth]);
 
   // Restore state when the browser's Back/Forward buttons are used.
   useEffect(() => {
@@ -855,8 +1019,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"),
       ]);
       if (cancelled) return;
 
@@ -955,6 +1119,30 @@ export default function OpsDashboard() {
         }
       }
 
+      // Margin: empty for a 'staff'-tier viewer by RLS, not by any client-side check — see
+      // migrations/0006_margin.sql. Keyed by staffId for O(1) lookup from StaffPanel rows.
+      if (marginScoresResult.status === "fulfilled") {
+        const byStaffId = {};
+        marginScoresResult.value.forEach((m) => { byStaffId[Number(m.staffId)] = m; });
+        setMarginScores(byStaffId);
+      }
+
+      // A pending pulse addressed to ME, regardless of my own tier — an OD/Central viewer's
+      // broader margin_pulses access would otherwise also match other people's pending pulses,
+      // so this narrows to the one row (if any) whose staff_id is MY OWN linked staff record.
+      if (marginPulsesResult.status === "fulfilled" && staffResult.status === "fulfilled") {
+        const myStaff = staffResult.value.find((s) => s.userId === auth?.user?.id);
+        const mine = myStaff ? marginPulsesResult.value.find((p) => String(p.staffId) === String(myStaff.id)) : null;
+        setPendingMarginPulse(mine || null);
+      }
+
+      // Read-only for od/staff by RLS, full access for central — see 0018_seasons.sql.
+      if (seasonsResult.status === "fulfilled") setSeasons(seasonsResult.value);
+
+      // RLS already scopes both to campuses the viewer can manage — see 0020_teams.sql.
+      if (teamsResult.status === "fulfilled") setTeams(teamsResult.value);
+      if (teamMembersResult.status === "fulfilled") setTeamMembers(teamMembersResult.value);
+
       if (failures.length > 0) {
         setBackendStatus("offline");
         setBackendError(`${failures.length} sheet(s) failed to load. First: ${failures[0]}`);
@@ -1025,6 +1213,21 @@ export default function OpsDashboard() {
       project.owner, project.createdBy, ...(project.team || []), ...(extraRecipients || []),
       campus?.lead,
     ].filter(Boolean));
+    names.delete(currentViewerName);
+    if (names.size === 0) return;
+    const rows = Array.from(names).map((forUser) => ({
+      forUser, actor: currentViewerName, summary, projectId: project.id, ts: TODAY_STR, read: false,
+    }));
+    setNotifications((prev) => [...rows.map((r) => ({ ...r, id: `${Date.now()}-${Math.random()}` })), ...prev]);
+    syncToBackend(Promise.all(rows.map((r) => apiCreate("Notifications", { ...r, organizationId: OSC_ORG_ID }))));
+  };
+
+  // Tagging a project's Ministry Area as Central is a real signal, not just a label — Central
+  // needs to actually see it land, so every central-tier person (not just whoever's currently
+  // viewing) gets a notification, the same way notifyInvolved already works for project team
+  // members.
+  const notifyCentral = (project, summary) => {
+    const names = new Set(users.filter((u) => u.tier === "central").map((u) => `${u.firstName || ""} ${u.lastName || ""}`.trim()).filter(Boolean));
     names.delete(currentViewerName);
     if (names.size === 0) return;
     const rows = Array.from(names).map((forUser) => ({
@@ -1127,7 +1330,7 @@ export default function OpsDashboard() {
       cost: Number(data.cost) || 0,
       spent: 0,
       shared: !!data.shared,
-      section: data.section || "General",
+      section: data.section || MINISTRY_AREA_OPTIONS[0],
       recurrence: data.recurrence?.freq === "none" ? null : data.recurrence,
       subtasks: [],
       photos: [],
@@ -1135,8 +1338,9 @@ export default function OpsDashboard() {
     };
     setProjects((ps) => [...ps, newProject]);
     notifyInvolved(newProject, `created the project "${newProject.title}"`);
+    if (newProject.section === "Central") notifyCentral(newProject, `tagged "${newProject.title}" as a Central Ministry Area project`);
     const { subtasks, ...projectRow } = newProject;
-    syncToBackend(apiCreate("Projects", projectRow));
+    syncToBackend(apiCreate("Projects", { ...projectRow, organizationId: OSC_ORG_ID }));
   };
 
   // Marking a recurring task done never spawns or resets anything immediately — it just
@@ -1256,10 +1460,13 @@ export default function OpsDashboard() {
     if (subtask) syncToBackend(apiDelete("Subtasks", subtask.id));
   };
 
-  const addSection = (name) => setSections((prev) => prev.includes(name) ? prev : [...prev, name]);
   const setProjectSection = (projId, section) => {
+    const prevProject = projects.find((p) => p.id === projId);
     setProjects((ps) => ps.map((p) => p.id === projId ? { ...p, section } : p));
     syncToBackend(apiUpdate("Projects", projId, { section }));
+    if (section === "Central" && prevProject?.section !== "Central" && prevProject) {
+      notifyCentral({ ...prevProject, section }, `moved "${prevProject.title}" into the Central Ministry Area`);
+    }
   };
 
   // One row per thread (organization_id, thread_key unique) — every mutation upserts the
@@ -1308,10 +1515,35 @@ export default function OpsDashboard() {
     }
   };
 
-  const addStaff = (campusId, name, roles) => {
+  // Shared final step for both "Add Team Member" flows below — creates the login too when an
+  // email was given, reusing the exact create+link sequence createAndLinkUser already
+  // established elsewhere, just starting from a brand-new staff row instead of an existing
+  // one. `loginData.password` absent means "send an invite" (admin-accounts routes that to
+  // inviteUserByEmail instead of createUser — see that function's comment).
+  const createLoginForNewStaff = async (campusId, staffId, name, role, loginData) => {
+    const [firstName, ...rest] = name.trim().split(" ");
+    const lastName = rest.join(" ");
+    setSyncing(true);
+    try {
+      const result = await apiAdminAccounts("create", {
+        firstName, lastName, email: loginData.email, phone: loginData.phone || "",
+        campusId, role: role || "", password: loginData.password || undefined,
+      });
+      setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === staffId ? { ...s, userId: result.id } : s) }));
+      await apiUpdate("Staff", staffId, { userId: result.id });
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const addStaff = (campusId, name, roles, loginData) => {
     const newPerson = { id: Date.now(), name, roles: roles.slice(0, 2), nextMeeting: "Not yet scheduled", lastContact: "Just added", flag: null, calendarSynced: false, calendars: [] };
     setStaffByCampus((prev) => ({ ...prev, [campusId]: [...(prev[campusId] || []), newPerson] }));
-    syncToBackend(apiCreate("Staff", { ...newPerson, campusId }));
+    syncToBackend(apiCreate("Staff", { ...newPerson, campusId, organizationId: OSC_ORG_ID }));
+    if (loginData?.email) createLoginForNewStaff(campusId, newPerson.id, name, roles[0], loginData);
   };
 
   // Second, more structured way to build the roster: a person added straight into one of the
@@ -1330,7 +1562,10 @@ export default function OpsDashboard() {
     };
     setStaffByCampus((prev) => ({ ...prev, [campusId]: [...(prev[campusId] || []), newPerson] }));
     logActivity("added team role", `${newPerson.name} — ${data.role}`, campusId);
-    syncToBackend(apiCreate("Staff", { ...newPerson, campusId }));
+    syncToBackend(apiCreate("Staff", { ...newPerson, campusId, organizationId: OSC_ORG_ID }));
+    if (data.loginMode && data.loginMode !== "none" && data.email) {
+      createLoginForNewStaff(campusId, newPerson.id, newPerson.name, data.role, { email: data.email, phone: data.phone, password: data.loginMode === "password" ? data.password : undefined });
+    }
   };
   const removeStaff = (campusId, id) => {
     setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).filter((s) => s.id !== id) }));
@@ -1340,6 +1575,16 @@ export default function OpsDashboard() {
     setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, roles: roles.slice(0, 2) } : s) }));
     syncToBackend(apiUpdate("Staff", id, { roles: roles.slice(0, 2) }));
   };
+  const setStaffFlag = (campusId, id, flag) => {
+    setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, flag } : s) }));
+    syncToBackend(apiUpdate("Staff", id, { flag }));
+  };
+  // A pastoral prompt, not a performance record — just marks "someone actually checked in with
+  // this person today," reusing the same date-string convention as due/completedOn elsewhere.
+  const logStaffCheckIn = (campusId, id) => {
+    setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, lastContact: TODAY_STR } : s) }));
+    syncToBackend(apiUpdate("Staff", id, { lastContact: TODAY_STR }));
+  };
   const setStaffCalendars = (campusId, id, calendars) => {
     setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, calendars, calendarSynced: calendars.length > 0 } : s) }));
     syncToBackend(apiUpdate("Staff", id, { calendars, calendarSynced: calendars.length > 0 }));
@@ -1347,6 +1592,36 @@ export default function OpsDashboard() {
   const addRoleOption = (roleName) => {
     const trimmed = roleName.trim();
     if (trimmed && !roleOptions.includes(trimmed)) setRoleOptions((prev) => [...prev, trimmed]);
+  };
+
+  // Margin — submits the OD's 10-question survey. The resulting score is computed server-side
+  // (recompute_margin_score() in migrations/0006_margin.sql), so this re-fetches the one row
+  // rather than optimistically guessing the number client-side.
+  const submitMarginSurvey = async (staffId, campusId, answers) => {
+    setSyncing(true);
+    try {
+      await apiCreate("MarginSurveys", { organizationId: OSC_ORG_ID, campusId, staffId, odProfileId: auth.user.id, answers });
+      const rows = await apiGet("MarginScores", { staffId });
+      if (rows[0]) setMarginScores((prev) => ({ ...prev, [staffId]: rows[0] }));
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  // Pushes the 4-5 question pulse to a team member — nothing to show yet, the score updates
+  // once they respond (same trigger, fired from their own answer instead of the OD's survey).
+  const sendMarginPulse = (staffId, campusId) => {
+    syncToBackend(apiCreate("MarginPulses", { organizationId: OSC_ORG_ID, campusId, staffId, sentBy: auth.user.id, status: "pending" }));
+  };
+
+  // A team member answering their own pending pulse — the only margin write a 'staff'-tier
+  // account is allowed to make (see the column-level grant in migrations/0006_margin.sql).
+  const respondToMarginPulse = (pulseId, answers) => {
+    setPendingMarginPulse(null);
+    syncToBackend(apiUpdate("MarginPulses", pulseId, { answers, status: "answered", respondedAt: new Date().toISOString() }));
   };
 
   // Persists which of their own real Google Calendars a user has chosen to show — not the
@@ -1365,6 +1640,66 @@ export default function OpsDashboard() {
   const setMyGoogleConnected = (connected) => {
     setUsers((prev) => prev.map((u) => u.id === auth.user.id ? { ...u, googleCalendarConnected: connected } : u));
     setAuth({ ...auth, user: { ...auth.user, googleCalendarConnected: connected } });
+  };
+
+  // A named, time-bound window (Easter, Christmas, VBS...) any project across any campus can
+  // be tagged into — Central-only to create, org-wide to read (see 0018_seasons.sql).
+  const createSeason = async (name, startsOn, endsOn) => {
+    setSyncing(true);
+    try {
+      const created = await apiCreate("Seasons", { organizationId: OSC_ORG_ID, name, startsOn: startsOn || null, endsOn: endsOn || null, createdBy: auth.user.id });
+      setSeasons((prev) => [...prev, created]);
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+  const setProjectSeason = (projId, seasonId) => {
+    setProjects((ps) => ps.map((p) => p.id === projId ? { ...p, seasonId } : p));
+    syncToBackend(apiUpdate("Projects", projId, { seasonId }));
+  };
+
+  // Named, ad-hoc Teams within Staff & Team — distinct from Team Lanes (the 4 fixed ministry
+  // categories) and Ministry Area (what a project belongs to). A person can be on more than one
+  // team, with a different role_in_team on each — see 0020_teams.sql.
+  const createTeam = async (campusId, name) => {
+    setSyncing(true);
+    try {
+      const created = await apiCreate("Teams", { organizationId: OSC_ORG_ID, campusId, name });
+      setTeams((prev) => [...prev, created]);
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+  const deleteTeam = (teamId) => {
+    setTeams((prev) => prev.filter((t) => t.id !== teamId));
+    setTeamMembers((prev) => prev.filter((m) => m.teamId !== teamId));
+    syncToBackend(apiDelete("Teams", teamId));
+  };
+  const addTeamMember = async (teamId, staffId, roleInTeam) => {
+    setSyncing(true);
+    try {
+      const created = await apiCreate("TeamMembers", { teamId, staffId, roleInTeam: roleInTeam || null });
+      setTeamMembers((prev) => [...prev, created]);
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+  const removeTeamMember = (memberRowId) => {
+    setTeamMembers((prev) => prev.filter((m) => m.id !== memberRowId));
+    syncToBackend(apiDelete("TeamMembers", memberRowId));
+  };
+  const setTeamMemberRole = (memberRowId, roleInTeam) => {
+    setTeamMembers((prev) => prev.map((m) => m.id === memberRowId ? { ...m, roleInTeam } : m));
+    syncToBackend(apiUpdate("TeamMembers", memberRowId, { roleInTeam }));
   };
 
   // Persists a campus's Slides org-chart link to the CampusConfig sheet (id = campusId, so
@@ -1540,17 +1875,20 @@ export default function OpsDashboard() {
   const orgBudgetUsed = orgBudget.spent;
   const orgBudgetTotal = orgBudget.total;
 
+  // "section" groups these into labeled clusters in the sidebar/mobile sheet (Overview/Work/
+  // People/Admin) — presentation only, the id values themselves are load-bearing (URL deep
+  // links, cross-tab onGoTab callbacks) and must never change.
   const navItems = [
-    { id: "overview", label: role === "central" && !selectedCampus ? "All Campuses" : "Dashboard", icon: LayoutGrid },
-    { id: "projects", label: "Projects & Tasks", icon: ListChecks },
-    { id: "budget", label: "Budget", icon: DollarSign },
-    { id: "staff", label: "Staff & Team", icon: Users },
-    { id: "calendar", label: "Calendar", icon: CalendarDays },
-    { id: "notes", label: "Notes", icon: StickyNote },
-    { id: "activity", label: "Activity", icon: ActivityIcon },
-    { id: "events", label: "Cross-Campus Events", icon: Link2 },
-    ...(auth?.user?.tier === "central" ? [{ id: "accounts", label: "User Management", icon: ShieldCheck }] : []),
-    { id: "reports", label: "Reports", icon: FileText },
+    { id: "overview", label: role === "central" && !selectedCampus ? "All Campuses" : "Campus View", icon: LayoutGrid, section: "Overview" },
+    { id: "projects", label: "Projects & Tasks", icon: ListChecks, section: "Work" },
+    { id: "budget", label: "Budget", icon: DollarSign, section: "Work" },
+    { id: "calendar", label: "Calendar", icon: CalendarDays, section: "Work" },
+    { id: "notes", label: "Notes", icon: StickyNote, section: "Work" },
+    { id: "activity", label: "Activity", icon: ActivityIcon, section: "Work" },
+    { id: "staff", label: "Staff & Team", icon: Users, section: "People" },
+    { id: "events", label: "Cross-Campus Events", icon: Link2, section: "People" },
+    ...(auth?.user?.tier === "central" ? [{ id: "accounts", label: "User Management", icon: ShieldCheck, section: "Admin" }] : []),
+    { id: "reports", label: "Reports", icon: FileText, section: "Admin" },
   ];
 
   if (authLoading) return null; // Supabase checking for an existing session — near-instant, avoids a login-screen flash
@@ -1559,44 +1897,13 @@ export default function OpsDashboard() {
 
   return (
     <div style={{ fontFamily: "'Inter', sans-serif", background: "#F7F6FB", color: "#2A2A3A" }} className="min-h-screen w-full">
-      <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" />
-      <style dangerouslySetInnerHTML={{ __html: `
-      /* Explicit fallback rules using attribute selectors — no escaping needed,
-         guarantees theme colors render regardless of Tailwind JIT behavior. */
-      [class*="bg-[#2B4C7E]"] { background-color: #2B4C7E !important; }
-      [class*="bg-[#B8862F]"] { background-color: #B8862F !important; }
-      [class*="bg-[#E3E1F0]"] { background-color: #E3E1F0 !important; }
-      [class*="bg-[#EFEAFB]"] { background-color: #EFEAFB !important; }
-      [class*="bg-[#EFEEFA]"] { background-color: #EFEEFA !important; }
-      [class*="bg-[#F3EFFC]"] { background-color: #F3EFFC !important; }
-      [class*="bg-[#FFFFFF]"] { background-color: #FFFFFF !important; }
-      [class*="border-[#5E9E8A]"] { border-color: #5E9E8A !important; }
-      [class*="border-[#B8862F]"] { border-color: #B8862F !important; }
-      [class*="border-[#D8D5EC]"] { border-color: #D8D5EC !important; }
-      [class*="border-[#D9CFF0]"] { border-color: #D9CFF0 !important; }
-      [class*="border-[#E3E1F0]"] { border-color: #E3E1F0 !important; }
-      [class*="text-[#2A2A3A]"] { color: #2A2A3A !important; }
-      [class*="text-[#2B4C7E]"] { color: #2B4C7E !important; }
-      [class*="text-[#5E9E8A]"] { color: #5E9E8A !important; }
-      [class*="text-[#6B6980]"] { color: #6B6980 !important; }
-      [class*="text-[#8B889C]"] { color: #8B889C !important; }
-      [class*="text-[#A8A5BE]"] { color: #A8A5BE !important; }
-      [class*="text-[#B8862F]"] { color: #B8862F !important; }
-      [class*="text-[#C15B5B]"] { color: #C15B5B !important; }
-      [class*="text-[#F7F6FB]"] { color: #F7F6FB !important; }
-      [class*="hover:bg-[#EFEEFA]"]:hover { background-color: #EFEEFA !important; }
-      [class*="hover:border-[#C7C3E0]"]:hover { border-color: #C7C3E0 !important; }
-      [class*="hover:text-[#2A2A3A]"]:hover { color: #2A2A3A !important; }
-      [class*="hover:text-[#B8862F]"]:hover { color: #B8862F !important; }
-      [class*="hover:text-[#C15B5B]"]:hover { color: #C15B5B !important; }
-      ` }} />
 
       <header className="px-6 py-4 flex items-center justify-between sticky top-0 backdrop-blur z-20 gap-3 flex-wrap" style={{ background: "rgba(43,76,126,0.97)" }}>
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-md flex items-center justify-center shrink-0" style={{ background: "#F7F6FB" }}><Building2 size={17} color="#2B4C7E" /></div>
           <div>
             <div style={{ fontFamily: "'Fraunces', serif", color: "#F7F6FB" }} className="text-[17px] font-semibold leading-none tracking-tight">OpsCore</div>
-            <div className="text-[11px] mt-0.5 tracking-wide" style={{ color: "#C9D6E8" }}>Reaching People · Building Lives</div>
+            <div className="text-[11px] mt-0.5 tracking-wide hidden sm:block" style={{ color: "#C9D6E8" }}>Reaching People · Building Lives</div>
           </div>
           {role === "central" && selectedCampus && (
             <button onClick={() => { setSelectedCampus(null); setTab("overview"); }}
@@ -1617,7 +1924,7 @@ export default function OpsDashboard() {
               )}
             </button>
             {showNotifications && (
-              <div className="absolute right-0 top-10 w-[300px] max-h-[380px] overflow-y-auto rounded-lg shadow-xl z-30" style={{ background: "#FFFFFF", border: "1px solid #D8D5EC" }}>
+              <div className="absolute right-0 top-10 w-[calc(100vw-32px)] max-w-[300px] max-h-[380px] overflow-y-auto rounded-lg shadow-xl z-30" style={{ background: "#FFFFFF", border: "1px solid #D8D5EC" }}>
                 <div className="px-3 py-2.5 border-b border-[#E3E1F0] flex items-center justify-between">
                   <span className="text-[12.5px] font-bold text-[#2A2A3A]">Notifications</span>
                   {myNotifications.length > 0 && (
@@ -1645,7 +1952,7 @@ export default function OpsDashboard() {
             <div className="text-[12.5px] px-2.5 py-1.5" style={{ color: "#C9D6E8" }}>{activeCampus?.name} ({activeCampus?.abbr})</div>
           )}
           <div className="flex items-center gap-2 pl-2 ml-1" style={{ borderLeft: "1px solid rgba(247,246,251,0.25)" }}>
-            <span className="text-[12px]" style={{ color: "#C9D6E8" }}>{currentViewerName}</span>
+            <span className="text-[12px] hidden sm:inline" style={{ color: "#C9D6E8" }}>{currentViewerName}</span>
             <button onClick={() => setAuth(null)} className="text-[11.5px] rounded-md px-2.5 py-1.5"
               style={{ background: "rgba(247,246,251,0.14)", border: "1px solid rgba(247,246,251,0.35)", color: "#F7F6FB" }}>
               Sign out
@@ -1656,12 +1963,25 @@ export default function OpsDashboard() {
 
       <div className="flex">
         <nav className="w-[188px] shrink-0 border-r border-[#E3E1F0] px-3 py-5 hidden md:flex flex-col gap-1">
-          {navItems.map((item) => (
-            <button key={item.id} onClick={() => setTab(item.id)}
-              className={`flex items-center gap-2.5 px-3 py-2 rounded-md text-[13px] text-left transition ${tab === item.id ? "bg-[#E3E1F0] text-[#2A2A3A]" : "text-[#6B6980] hover:text-[#2A2A3A] hover:bg-[#EFEEFA]"}`}>
-              <item.icon size={15} strokeWidth={2} />{item.label}
-            </button>
-          ))}
+          {NAV_SECTIONS.map((section) => {
+            const items = navItems.filter((item) => item.section === section);
+            if (items.length === 0) return null;
+            return (
+              <div key={section} className={section === "Overview" ? "" : "mt-4"}>
+                {section !== "Overview" && (
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] px-3 mb-1">{section}</div>
+                )}
+                <div className="flex flex-col gap-1">
+                  {items.map((item) => (
+                    <button key={item.id} onClick={() => setTab(item.id)}
+                      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-[13px] text-left transition ${tab === item.id ? "bg-[#E3E1F0] text-[#2A2A3A]" : "text-[#6B6980] hover:text-[#2A2A3A] hover:bg-[#EFEEFA]"}`}>
+                      <item.icon size={15} strokeWidth={2} />{item.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
           {role === "central" && selectedCampus && (
             <button onClick={() => setSelectedCampus(null)} className="mt-4 flex items-center gap-2 px-3 py-2 rounded-md text-[12px] text-[#B8862F] hover:bg-[#EFEEFA]">
               <ChevronLeft size={14} /> All campuses
@@ -1671,9 +1991,9 @@ export default function OpsDashboard() {
             <div className="flex items-center gap-1.5 px-1 mb-1">
               <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: backendStatus === "connected" ? "#5E9E8A" : (backendStatus === "loading" || backendStatus === "bootstrapping") ? "#B8862F" : "#C15B5B" }} />
               <span className="text-[10px] font-medium" style={{ color: backendStatus === "connected" ? "#5E9E8A" : (backendStatus === "loading" || backendStatus === "bootstrapping") ? "#B8862F" : "#C15B5B" }}>
-                {backendStatus === "connected" ? (syncing ? "Saving…" : "Synced to Sheet")
+                {backendStatus === "connected" ? (syncing ? "Saving…" : "Synced")
                   : backendStatus === "loading" ? "Connecting…"
-                  : backendStatus === "bootstrapping" ? `Setting up your Sheet… ${bootstrapProgress ? `${bootstrapProgress.done}/${bootstrapProgress.total}` : ""}`
+                  : backendStatus === "bootstrapping" ? `Setting up your workspace… ${bootstrapProgress ? `${bootstrapProgress.done}/${bootstrapProgress.total}` : ""}`
                   : "Offline — not saving"}
               </span>
             </div>
@@ -1681,22 +2001,14 @@ export default function OpsDashboard() {
           </div>
         </nav>
 
-        <main className="flex-1 min-w-0 px-6 py-6 max-w-[1180px]">
-          <div className="flex md:hidden gap-1 mb-5 overflow-x-auto">
-            {navItems.map((item) => (
-              <button key={item.id} onClick={() => setTab(item.id)}
-                className={`px-3 py-1.5 rounded-full text-[12px] whitespace-nowrap border ${tab === item.id ? "bg-[#B8862F] text-[#F7F6FB] border-[#B8862F]" : "border-[#D8D5EC] text-[#6B6980]"}`}>
-                {item.label}
-              </button>
-            ))}
-          </div>
-
+        <main className="flex-1 min-w-0 px-6 py-6 max-w-[1180px] pb-24 md:pb-6">
           {tab === "overview" && role === "central" && !selectedCampus && (
             <CentralOverview campuses={campuses} orgBudgetUsed={orgBudgetUsed} orgBudgetTotal={orgBudgetTotal}
               projects={displayProjects} staffByCampus={staffByCampus} onSelectCampus={(id) => { setSelectedCampus(id); setTab("overview"); }}
               centralThreads={centralThreads} onAddTag={addCentralTag} onRemoveTag={removeCentralTag} onAddMessage={addCentralMessage}
               currentViewerName={currentViewerName} onOpenProject={setOpenProject}
-              detail={detail} setDetail={setDetail} />
+              detail={detail} setDetail={setDetail} onGoTab={setTab}
+              seasons={seasons} onOpenSeasons={() => setShowSeasons(true)} />
           )}
 
           {tab === "overview" && (role !== "central" || selectedCampus) && activeCampus && (
@@ -1704,12 +2016,14 @@ export default function OpsDashboard() {
               campus={activeCampus} projects={scopedProjects} staff={staff} notes={notes} activity={activityLog}
               dayEvents={dayEvents} calDate={calDate}
               onOpenProject={setOpenProject} onGoTab={setTab} onOpenProfile={setOpenStaffProfile}
+              marginScores={marginScores} canManageMargin={auth.user.tier === "central" || auth.user.tier === "od"}
+              seasons={seasons}
             />
           )}
 
           {tab === "projects" && (
             <ProjectsBoard projects={scopedProjects} campusLabel={activeCampus ? activeCampus.name : "All Campuses"}
-              onCycle={cycleStage} onOpen={setOpenProject} sections={sections} onAddSection={addSection} onSetSection={setProjectSection}
+              onCycle={cycleStage} onOpen={setOpenProject} onSetSection={setProjectSection}
               onNewProject={() => setShowNewProject(true)} />
           )}
 
@@ -1736,6 +2050,12 @@ export default function OpsDashboard() {
               onResolveReassignment={resolveReassignment}
               onOpenProfile={setOpenStaffProfile}
               users={users} onLinkUser={linkStaffUser} onCreateAndLinkUser={createAndLinkUser}
+              marginScores={marginScores} canManageMargin={auth.user.tier === "central" || auth.user.tier === "od"}
+              onSubmitMarginSurvey={submitMarginSurvey} onSendMarginPulse={sendMarginPulse}
+              onSetFlag={setStaffFlag} onLogCheckIn={logStaffCheckIn}
+              teams={teams} teamMembers={teamMembers}
+              onCreateTeam={createTeam} onDeleteTeam={deleteTeam}
+              onAddTeamMember={addTeamMember} onRemoveTeamMember={removeTeamMember} onSetTeamMemberRole={setTeamMemberRole}
             />
           )}
 
@@ -1770,6 +2090,31 @@ export default function OpsDashboard() {
         </main>
       </div>
 
+      <nav className="md:hidden fixed bottom-0 inset-x-0 z-30 flex border-t border-[#E3E1F0] bg-[#FFFFFF] pb-[env(safe-area-inset-bottom)]">
+        {navItems.filter((item) => ["overview", "projects", "calendar"].includes(item.id)).map((item) => (
+          <button key={item.id} onClick={() => setTab(item.id)}
+            className={`flex-1 flex flex-col items-center justify-center gap-0.5 py-2 text-[10.5px] ${tab === item.id ? "text-[#B8862F]" : "text-[#6B6980]"}`}>
+            <item.icon size={18} strokeWidth={2} />{item.label === "All Campuses" ? "Campuses" : item.label.split(" ")[0]}
+          </button>
+        ))}
+        <button onClick={() => setShowMoreSheet(true)}
+          className={`flex-1 flex flex-col items-center justify-center gap-0.5 py-2 text-[10.5px] ${showMoreSheet ? "text-[#B8862F]" : "text-[#6B6980]"}`}>
+          <MoreHorizontal size={18} strokeWidth={2} />More
+        </button>
+      </nav>
+      {showMoreSheet && <MobileMoreSheet navItems={navItems} tab={tab} onSelect={setTab} onClose={() => setShowMoreSheet(false)} />}
+
+      {pendingMarginPulse && (
+        <MarginPulseCheckPrompt pulse={pendingMarginPulse}
+          onSubmit={(answers) => respondToMarginPulse(pendingMarginPulse.id, answers)} />
+      )}
+
+      {showSeasons && (
+        <SeasonsModal seasons={seasons} projects={displayProjects} campuses={campuses}
+          onCreateSeason={createSeason} onClose={() => setShowSeasons(false)}
+          onOpenProject={(id) => { setShowSeasons(false); setOpenProject(id); }} />
+      )}
+
       {openProject && (
         <ProjectModal
           project={displayProjects.find((p) => p.id === openProject)} onClose={() => setOpenProject(null)}
@@ -1779,10 +2124,10 @@ export default function OpsDashboard() {
           onUpdateProjectBudget={updateProjectBudget} onUpdateSubtaskBudget={updateSubtaskBudget}
           onSetDue={setProjectDue} onSetSubtaskDue={setSubtaskDue}
           onAssignSubtask={assignSubtask} onDeleteSubtask={deleteSubtask} onDeleteProject={deleteProject}
-          roster={fullRoster}
+          roster={fullRoster} seasons={seasons} onSetSeason={setProjectSeason}
         />
       )}
-      {showNewProject && <NewProjectModal onClose={() => setShowNewProject(false)} onCreate={(data) => { addProject(data); setShowNewProject(false); }} sections={sections} campusRoster={campusRoster} fullRoster={fullRoster} campusLabel={activeCampus ? `${activeCampus.name} (${activeCampus.abbr})` : "Central"} />}
+      {showNewProject && <NewProjectModal onClose={() => setShowNewProject(false)} onCreate={(data) => { addProject(data); setShowNewProject(false); }} campusRoster={campusRoster} fullRoster={fullRoster} campusLabel={activeCampus ? `${activeCampus.name} (${activeCampus.abbr})` : "Central"} />}
       {openStaffProfile && <StaffProfileModal name={openStaffProfile} projects={displayProjects} onClose={() => setOpenStaffProfile(null)} onOpenProject={(id) => { setOpenStaffProfile(null); setOpenProject(id); }} />}
     </div>
   );
@@ -1942,7 +2287,7 @@ function CentralTeamWindow({ projects, campuses, centralThreads, onAddTag, onRem
   );
 }
 
-function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, onOpenProject, detail, setDetail }) {
+function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, onOpenProject, detail, setDetail, onGoTab, seasons, onOpenSeasons }) {
   const sharedProjects = projects.filter((p) => p.shared);
   return (
     <div>
@@ -1966,6 +2311,36 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
           onSelectCampus={(id) => { setDetail(null); onSelectCampus(id); }}
         />
       )}
+
+      <button onClick={() => onGoTab("staff")}
+        className="w-full flex items-center justify-between gap-3 bg-[#FFFFFF] rounded-lg p-4 mb-6 text-left transition"
+        style={{ border: "1.5px solid #2B4C7E55" }}
+        onMouseEnter={(e) => e.currentTarget.style.borderColor = "#2B4C7E"}
+        onMouseLeave={(e) => e.currentTarget.style.borderColor = "#2B4C7E55"}>
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-md flex items-center justify-center shrink-0" style={{ background: "#2B4C7E" }}><Users size={16} color="#F7F6FB" /></div>
+          <div>
+            <div className="text-[13.5px] font-medium">Central Team</div>
+            <div className="text-[11.5px] text-[#6B6980]">Build and manage the roster of people working directly under Central — same tools as every campus.</div>
+          </div>
+        </div>
+        <ChevronRight size={16} className="text-[#8B889C] shrink-0" />
+      </button>
+
+      <button onClick={onOpenSeasons}
+        className="w-full flex items-center justify-between gap-3 bg-[#FFFFFF] rounded-lg p-4 mb-6 text-left transition"
+        style={{ border: "1.5px solid #6B4FA055" }}
+        onMouseEnter={(e) => e.currentTarget.style.borderColor = "#6B4FA0"}
+        onMouseLeave={(e) => e.currentTarget.style.borderColor = "#6B4FA055"}>
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-md flex items-center justify-center shrink-0" style={{ background: "#6B4FA0" }}><CalendarDays size={16} color="#F7F6FB" /></div>
+          <div>
+            <div className="text-[13.5px] font-medium">Seasons</div>
+            <div className="text-[11.5px] text-[#6B6980]">{seasons.length > 0 ? `${seasons.length} season${seasons.length === 1 ? "" : "s"} tracked` : "Easter, Christmas, VBS"} — see every campus's plan for a season in one place.</div>
+          </div>
+        </div>
+        <ChevronRight size={16} className="text-[#8B889C] shrink-0" />
+      </button>
 
       <CentralTeamWindow projects={projects} campuses={campuses} centralThreads={centralThreads} onAddTag={onAddTag} onRemoveTag={onRemoveTag}
         onAddMessage={onAddMessage} currentViewerName={currentViewerName} />
@@ -2029,7 +2404,11 @@ function SummaryCard({ icon: Icon, label, value, sub, color, onClick }) {
   );
 }
 
-function CampusDashboard({ campus, projects, staff, notes, activity, dayEvents, calDate, onOpenProject, onGoTab, onOpenProfile }) {
+function CampusDashboard({ campus, projects, staff, notes, activity, dayEvents, calDate, onOpenProject, onGoTab, onOpenProfile, marginScores, canManageMargin, seasons }) {
+  const today = seasons?.find((s) => (!s.startsOn || s.startsOn <= TODAY_STR) && (!s.endsOn || s.endsOn >= TODAY_STR));
+  const upcoming = !today && seasons?.filter((s) => s.startsOn && s.startsOn > TODAY_STR).sort((a, b) => a.startsOn.localeCompare(b.startsOn))[0];
+  const activeSeason = today || upcoming;
+  const seasonProjects = activeSeason ? projects.filter((p) => p.seasonId === activeSeason.id) : [];
   return (
     <div>
       <div className="mb-5 flex items-start justify-between">
@@ -2045,8 +2424,34 @@ function CampusDashboard({ campus, projects, staff, notes, activity, dayEvents, 
 
       <div className="grid lg:grid-cols-2 gap-4">
         <Window title="Staff & Team" icon={Users} onExpand={() => onGoTab("staff")} accentColor={campus.color}>
-          <StaffPanel staff={staff} compact onOpenProfile={onOpenProfile} />
+          <StaffPanel staff={staff} compact onOpenProfile={onOpenProfile} marginScores={marginScores} />
         </Window>
+
+        {canManageMargin && (
+          <Window title="Margin" icon={ActivityIcon} onExpand={() => onGoTab("staff")} accentColor={campus.color}>
+            <div className="space-y-1.5">
+              {staff.filter((s) => marginScores?.[s.id]).sort((a, b) => marginScores[a.id].score - marginScores[b.id].score).map((s) => (
+                <div key={s.id} className="flex items-center justify-between gap-2 bg-[#EFEEFA] border border-[#E3E1F0] rounded-md px-3 py-2">
+                  <span className="text-[12px] truncate">{s.name}</span>
+                  <span className="text-[10.5px] px-2 py-0.5 rounded-full shrink-0" style={{ background: `${MARGIN_STATUS_COLOR[marginScores[s.id].status]}22`, color: MARGIN_STATUS_COLOR[marginScores[s.id].status] }}>
+                    {MARGIN_STATUS_LABEL[marginScores[s.id].status] || marginScores[s.id].status}
+                  </span>
+                </div>
+              ))}
+              {staff.filter((s) => marginScores?.[s.id]).length === 0 && <div className="text-[11.5px] text-[#8B889C] py-4 text-center">No assessments yet — start one from Staff & Team.</div>}
+            </div>
+          </Window>
+        )}
+
+
+        {activeSeason && (
+          <Window title="Season Readiness" icon={CalendarDays} onExpand={() => onGoTab("projects")} accentColor={campus.color}>
+            <div className="text-[12.5px] font-medium mb-1">{activeSeason.name}{today ? " · underway" : " · upcoming"}</div>
+            <div className="text-[10.5px] text-[#6B6980] mb-2">{activeSeason.startsOn || "?"} – {activeSeason.endsOn || "?"}</div>
+            <div className="text-[11.5px] text-[#2A2A3A]">{seasonProjects.length} project{seasonProjects.length === 1 ? "" : "s"} tagged for {campus.name}</div>
+            {seasonProjects.length === 0 && <div className="text-[10.5px] text-[#8B889C] mt-1">Nothing tagged yet — add a season to a project from its detail view.</div>}
+          </Window>
+        )}
 
         <Window title="Projects / Tasks" icon={ListChecks} onExpand={() => onGoTab("projects")} accentColor={campus.color}>
           <div className="space-y-2">
@@ -2124,14 +2529,26 @@ function ProgressBar({ subtasks }) {
   );
 }
 
-function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onAddTeamRole, onRemove, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile, users, onLinkUser, onCreateAndLinkUser }) {
+function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onAddTeamRole, onRemove, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile, users, onLinkUser, onCreateAndLinkUser, marginScores, canManageMargin, onSubmitMarginSurvey, onSendMarginPulse, onSetFlag, onLogCheckIn, teams, teamMembers, onCreateTeam, onDeleteTeam, onAddTeamMember, onRemoveTeamMember, onSetTeamMemberRole }) {
   const [addingLane, setAddingLane] = useState(null); // which lane's "Add Team Role" modal is open
+  const [creatingTeam, setCreatingTeam] = useState(false);
+  const [newTeamName, setNewTeamName] = useState("");
+  const [expandedTeamId, setExpandedTeamId] = useState(null);
+  const [addMemberTeamId, setAddMemberTeamId] = useState(null); // which team's "add member" row is open
+  const [newMemberStaffId, setNewMemberStaffId] = useState("");
+  const [newMemberRole, setNewMemberRole] = useState("");
+  const [editingRoleId, setEditingRoleId] = useState(null); // which team_member row's role is being edited
+  const [roleDraft, setRoleDraft] = useState("");
   const [linkingId, setLinkingId] = useState(null); // which staff row's login-linker is open
   const [editingId, setEditingId] = useState(null);
   const [calendarPickerId, setCalendarPickerId] = useState(null);
+  const [assessingId, setAssessingId] = useState(null); // which staff row's Margin survey modal is open
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
   const [newRoles, setNewRoles] = useState([]);
+  const [newEmail, setNewEmail] = useState("");
+  const [newLoginMode, setNewLoginMode] = useState("invite");
+  const [newPassword, setNewPassword] = useState("");
   const [editingSlidesLink, setEditingSlidesLink] = useState(false);
   const [slidesDraft, setSlidesDraft] = useState(slidesLink || "");
   const [importStatus, setImportStatus] = useState("idle"); // idle | loading | review | error
@@ -2140,13 +2557,35 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
 
   const submitAdd = () => {
     if (!newName.trim() || !campusId) return;
-    onAdd(campusId, newName.trim(), newRoles);
-    setNewName(""); setNewRoles([]); setAdding(false);
+    onAdd(campusId, newName.trim(), newRoles, newEmail.trim() ? { email: newEmail.trim(), password: newLoginMode === "password" ? newPassword : undefined } : null);
+    setNewName(""); setNewRoles([]); setNewEmail(""); setNewLoginMode("invite"); setNewPassword(""); setAdding(false);
   };
 
   const saveSlidesLink = () => {
     onSetSlidesLink(slidesDraft.trim());
     setEditingSlidesLink(false);
+  };
+
+  const campusTeams = campusId ? (teams || []).filter((t) => String(t.campusId) === String(campusId)) : [];
+
+  const submitCreateTeam = () => {
+    if (!newTeamName.trim() || !campusId) return;
+    onCreateTeam(campusId, newTeamName.trim());
+    setNewTeamName("");
+    setCreatingTeam(false);
+  };
+
+  const submitAddMember = (teamId) => {
+    if (!newMemberStaffId) return;
+    onAddTeamMember(teamId, Number(newMemberStaffId), newMemberRole.trim());
+    setNewMemberStaffId("");
+    setNewMemberRole("");
+    setAddMemberTeamId(null);
+  };
+
+  const saveRoleDraft = (memberRowId) => {
+    onSetTeamMemberRole(memberRowId, roleDraft.trim());
+    setEditingRoleId(null);
   };
 
   const runImport = async () => {
@@ -2298,6 +2737,97 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
         </div>
       )}
 
+      {full && campusId && (
+        <div className="mb-5">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-[11.5px] font-medium text-[#2A2A3A]">Teams</div>
+            <button onClick={() => setCreatingTeam((v) => !v)} className="flex items-center gap-1 text-[10.5px]" style={{ color: "#B8862F" }}>
+              <Plus size={11} /> New Team
+            </button>
+          </div>
+
+          {creatingTeam && (
+            <div className="flex gap-2 mb-3 flex-wrap">
+              <input value={newTeamName} onChange={(e) => setNewTeamName(e.target.value)} placeholder="Team name (e.g. Worship Team)"
+                className="flex-1 min-w-[180px] bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[11.5px] outline-none focus:border-[#B8862F]" />
+              <button onClick={submitCreateTeam} className="text-[11px] rounded-md px-2.5 py-1 font-medium" style={{ background: "#B8862F", color: "#F7F6FB" }}>Create</button>
+              <button onClick={() => { setCreatingTeam(false); setNewTeamName(""); }} className="text-[11px] text-[#6B6980] px-2">Cancel</button>
+            </div>
+          )}
+
+          {campusTeams.length === 0 && !creatingTeam && (
+            <div className="text-[10.5px] text-[#8B889C]">No teams yet.</div>
+          )}
+
+          <div className="space-y-2">
+            {campusTeams.map((team) => {
+              const members = teamMembers.filter((m) => m.teamId === team.id);
+              const isExpanded = expandedTeamId === team.id;
+              const memberStaffIds = new Set(members.map((m) => String(m.staffId)));
+              const availableStaff = staff.filter((s) => !memberStaffIds.has(String(s.id)));
+              return (
+                <div key={team.id} className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-3">
+                  <div className="flex items-center justify-between">
+                    <button onClick={() => setExpandedTeamId(isExpanded ? null : team.id)} className="flex items-center gap-1.5 text-left flex-1 min-w-0">
+                      <span className="text-[12px] font-medium truncate">{team.name}</span>
+                      <span className="text-[10.5px] text-[#8B889C] shrink-0">({members.length})</span>
+                    </button>
+                    <button onClick={() => onDeleteTeam(team.id)} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><Trash2 size={13} /></button>
+                  </div>
+
+                  {isExpanded && (
+                    <div className="mt-2.5 pt-2.5 border-t border-[#E3E1F0] space-y-1.5">
+                      {members.length === 0 && <div className="text-[10.5px] text-[#8B889C]">No members yet.</div>}
+                      {members.map((m) => {
+                        const person = staff.find((s) => String(s.id) === String(m.staffId));
+                        const isEditingRole = editingRoleId === m.id;
+                        return (
+                          <div key={m.id} className="flex items-center justify-between gap-2 text-[11.5px] rounded-md px-2 py-1.5 flex-wrap" style={{ background: "#F7F6FB" }}>
+                            <div className="min-w-0 flex-1">
+                              <div className="font-medium">{person ? person.name : "Unknown"}</div>
+                              {isEditingRole ? (
+                                <div className="flex gap-1.5 mt-1">
+                                  <input value={roleDraft} onChange={(e) => setRoleDraft(e.target.value)} placeholder="Role in team"
+                                    className="flex-1 min-w-[100px] bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 text-[10.5px] outline-none" />
+                                  <button onClick={() => saveRoleDraft(m.id)} className="text-[10px] rounded-md px-2 py-1 font-medium" style={{ background: "#B8862F", color: "#F7F6FB" }}>Save</button>
+                                </div>
+                              ) : (
+                                <button onClick={() => { setEditingRoleId(m.id); setRoleDraft(m.roleInTeam || ""); }} className="text-[10.5px] text-[#6B6980] hover:text-[#B8862F]">
+                                  {m.roleInTeam || "Set role…"}
+                                </button>
+                              )}
+                            </div>
+                            <button onClick={() => onRemoveTeamMember(m.id)} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><Trash2 size={12} /></button>
+                          </div>
+                        );
+                      })}
+
+                      {addMemberTeamId === team.id ? (
+                        <div className="flex gap-1.5 flex-wrap mt-1.5">
+                          <select value={newMemberStaffId} onChange={(e) => setNewMemberStaffId(e.target.value)}
+                            className="bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11px] outline-none">
+                            <option value="">Select person…</option>
+                            {availableStaff.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                          </select>
+                          <input value={newMemberRole} onChange={(e) => setNewMemberRole(e.target.value)} placeholder="Role in team (optional)"
+                            className="flex-1 min-w-[120px] bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[11px] outline-none" />
+                          <button onClick={() => submitAddMember(team.id)} className="text-[11px] rounded-md px-2.5 py-1 font-medium" style={{ background: "#B8862F", color: "#F7F6FB" }}>Add</button>
+                          <button onClick={() => { setAddMemberTeamId(null); setNewMemberStaffId(""); setNewMemberRole(""); }} className="text-[11px] text-[#6B6980] px-2">Cancel</button>
+                        </div>
+                      ) : (
+                        <button onClick={() => setAddMemberTeamId(team.id)} className="flex items-center gap-1 text-[10.5px] mt-1" style={{ color: "#B8862F" }}>
+                          <Plus size={11} /> Add member
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {addingLane && (
         <AddTeamRoleModal
           lane={addingLane}
@@ -2314,9 +2844,12 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
             className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-3 py-2 text-[12.5px] outline-none focus:border-[#B8862F] mb-2" />
           <div className="text-[10.5px] text-[#6B6980] mb-1.5">Role(s) — up to 2</div>
           <RolePicker selected={newRoles} onChange={setNewRoles} roleOptions={roleOptions} onAddRoleOption={onAddRoleOption} />
+          <input type="email" value={newEmail} onChange={(e) => setNewEmail(e.target.value)} placeholder="Email (optional — sets up a login)"
+            className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-3 py-2 text-[12.5px] outline-none focus:border-[#B8862F] mt-2 mb-2" />
+          <LoginSetupFields email={newEmail} loginMode={newLoginMode} setLoginMode={setNewLoginMode} password={newPassword} setPassword={setNewPassword} />
           <div className="flex gap-2 mt-3">
             <button onClick={submitAdd} className="text-[12px] bg-[#B8862F] text-[#F7F6FB] rounded-md px-3 py-1.5 font-medium">Save</button>
-            <button onClick={() => { setAdding(false); setNewName(""); setNewRoles([]); }} className="text-[12px] text-[#6B6980] px-3 py-1.5">Cancel</button>
+            <button onClick={() => { setAdding(false); setNewName(""); setNewRoles([]); setNewEmail(""); setNewLoginMode("invite"); setNewPassword(""); }} className="text-[12px] text-[#6B6980] px-3 py-1.5">Cancel</button>
           </div>
         </div>
       )}
@@ -2331,6 +2864,24 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
               </div>
               <div className="flex items-center gap-1.5 flex-wrap justify-end">
                 {s.flag && <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#C15B5B22] text-[#C15B5B] flex items-center gap-1 whitespace-nowrap"><AlertTriangle size={10} />{s.flag}</span>}
+                {full && campusId && needsCheckIn(s.lastContact) && (
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#B8862F22] text-[#B8862F] whitespace-nowrap">Needs check-in</span>
+                )}
+                {marginScores?.[s.id] && (
+                  <span className="text-[9.5px] px-2 py-0.5 rounded-full whitespace-nowrap" style={{ background: `${MARGIN_STATUS_COLOR[marginScores[s.id].status]}22`, color: MARGIN_STATUS_COLOR[marginScores[s.id].status] }}>
+                    Margin: {MARGIN_STATUS_LABEL[marginScores[s.id].status] || marginScores[s.id].status}
+                  </span>
+                )}
+                {full && campusId && canManageMargin && (
+                  <>
+                    <button onClick={() => setAssessingId(assessingId === s.id ? null : s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#B8862F66] text-[#B8862F] hover:border-[#B8862F] whitespace-nowrap">
+                      {marginScores?.[s.id] ? "Re-assess" : "Assess"}
+                    </button>
+                    <button onClick={() => onSendMarginPulse(s.id, campusId)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#6B4FA066] text-[#6B4FA0] hover:border-[#6B4FA0] whitespace-nowrap">
+                      Send pulse
+                    </button>
+                  </>
+                )}
                 {full && campusId && (
                   <>
                     {(() => {
@@ -2340,15 +2891,16 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                           <ShieldCheck size={10} /> {linkedUser.email}
                         </span>
                       ) : (
-                        <button onClick={() => setLinkingId(linkingId === s.id ? null : s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#D8D5EC] text-[#8B889C] hover:border-[#B8862F] hover:text-[#B8862F] whitespace-nowrap">
+                        <button onClick={() => setLinkingId(linkingId === s.id ? null : s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#5E9E8A66] text-[#5E9E8A] hover:border-[#5E9E8A] whitespace-nowrap">
                           Link Login
                         </button>
                       );
                     })()}
                     <button onClick={() => setCalendarPickerId(calendarPickerId === s.id ? null : s.id)}
-                      className={`text-[9.5px] px-2 py-0.5 rounded-full border whitespace-nowrap ${s.calendarSynced ? "border-[#5E9E8A] text-[#5E9E8A]" : "border-[#D8D5EC] text-[#8B889C]"}`}>
+                      className={`text-[9.5px] px-2 py-0.5 rounded-full border whitespace-nowrap ${s.calendarSynced ? "border-[#5E9E8A] text-[#5E9E8A]" : "border-[#2B4C7E66] text-[#2B4C7E] hover:border-[#2B4C7E]"}`}>
                       {s.calendarSynced ? `${s.calendars?.length || 0} cal${s.calendars?.length === 1 ? "" : "s"} synced` : "Sync Calendar"}
                     </button>
+                    <button onClick={() => onLogCheckIn(campusId, s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#5E9E8A66] text-[#5E9E8A] hover:border-[#5E9E8A] whitespace-nowrap">Log check-in</button>
                     <button onClick={() => setEditingId(editingId === s.id ? null : s.id)} className="text-[10.5px] text-[#6B6980] hover:text-[#B8862F] whitespace-nowrap">Edit</button>
                     <button onClick={() => onRemove(campusId, s.id)} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><Trash2 size={13} /></button>
                   </>
@@ -2364,6 +2916,19 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
               <div className="mt-3 pt-3 border-t border-[#E3E1F0]">
                 <div className="text-[10.5px] text-[#6B6980] mb-1.5">Role(s) — up to 2</div>
                 <RolePicker selected={s.roles || []} onChange={(roles) => onUpdateRoles(campusId, s.id, roles)} roleOptions={roleOptions} onAddRoleOption={onAddRoleOption} />
+                <div className="text-[10.5px] text-[#6B6980] mb-1.5 mt-3">Team Health flag</div>
+                <div className="flex flex-wrap gap-1.5">
+                  <button onClick={() => onSetFlag(campusId, s.id, null)}
+                    className={`text-[10.5px] px-2 py-1 rounded-full border ${!s.flag ? "bg-[#8B889C] text-[#F7F6FB] border-[#8B889C]" : "border-[#D8D5EC] text-[#6B6980]"}`}>
+                    None
+                  </button>
+                  {TEAM_HEALTH_FLAG_OPTIONS.map((f) => (
+                    <button key={f} onClick={() => onSetFlag(campusId, s.id, f)}
+                      className={`text-[10.5px] px-2 py-1 rounded-full border ${s.flag === f ? "bg-[#C15B5B] text-[#F7F6FB] border-[#C15B5B]" : "border-[#D8D5EC] text-[#6B6980]"}`}>
+                      {f}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
             {full && calendarPickerId === s.id && (
@@ -2379,10 +2944,43 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                   onCancel={() => setLinkingId(null)} />
               </div>
             )}
+            {assessingId === s.id && (
+              <MarginSurveyModal staffPerson={s}
+                onSubmit={(answers) => { onSubmitMarginSurvey(s.id, campusId, answers); setAssessingId(null); }}
+                onClose={() => setAssessingId(null)} />
+            )}
           </div>
         ))}
         {staff.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No team members in view.</div>}
       </div>
+    </div>
+  );
+}
+
+// Shared by both "add a team member" flows below — shown once an email has been entered,
+// letting whoever's adding the person choose between sending a login invite (they set their
+// own password) or setting one directly. Doesn't render its own email field; the caller
+// already has one, this just reacts to it being filled in.
+function LoginSetupFields({ email, loginMode, setLoginMode, password, setPassword }) {
+  if (!email.trim()) return null;
+  return (
+    <div className="space-y-2">
+      <div className="flex gap-1.5">
+        <button type="button" onClick={() => setLoginMode("invite")}
+          className={`text-[11px] px-2.5 py-1 rounded-full border ${loginMode === "invite" ? "bg-[#B8862F] text-[#F7F6FB] border-[#B8862F]" : "border-[#D8D5EC] text-[#6B6980]"}`}>
+          Send login invite
+        </button>
+        <button type="button" onClick={() => setLoginMode("password")}
+          className={`text-[11px] px-2.5 py-1 rounded-full border ${loginMode === "password" ? "bg-[#B8862F] text-[#F7F6FB] border-[#B8862F]" : "border-[#D8D5EC] text-[#6B6980]"}`}>
+          Set a password now
+        </button>
+      </div>
+      {loginMode === "password" ? (
+        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password (min 8 characters)" minLength={8}
+          className="w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[12.5px] outline-none focus:border-[#B8862F]" />
+      ) : (
+        <p className="text-[10.5px] text-[#6B6980]">They'll get an email to set their own password.</p>
+      )}
     </div>
   );
 }
@@ -2395,6 +2993,8 @@ function AddTeamRoleModal({ lane, roleOptions, reportsToOptions, onClose, onCrea
   const [phone, setPhone] = useState("");
   const [role, setRole] = useState(roleOptions[0] || "");
   const [reportsTo, setReportsTo] = useState("");
+  const [loginMode, setLoginMode] = useState("invite");
+  const [password, setPassword] = useState("");
 
   const inputClass = "w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#2B4C7E]";
   const labelClass = "text-[11px] font-medium text-[#6B6980] mb-1 block";
@@ -2402,12 +3002,12 @@ function AddTeamRoleModal({ lane, roleOptions, reportsToOptions, onClose, onCrea
   const submit = (e) => {
     e.preventDefault();
     if (!firstName.trim() || !lastName.trim()) return;
-    onCreate({ firstName: firstName.trim(), lastName: lastName.trim(), email: email.trim(), phone: phone.trim(), role, reportsTo: reportsTo || null });
+    onCreate({ firstName: firstName.trim(), lastName: lastName.trim(), email: email.trim(), phone: phone.trim(), role, reportsTo: reportsTo || null, loginMode: email.trim() ? loginMode : "none", password });
   };
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
-      <div className="bg-[#FFFFFF] rounded-xl p-6 w-full max-w-[420px] max-h-[90vh] overflow-y-auto">
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[420px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-[15px] font-semibold">Add Team Role — {lane}</h2>
           <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
@@ -2418,6 +3018,7 @@ function AddTeamRoleModal({ lane, roleOptions, reportsToOptions, onClose, onCrea
             <div><label className={labelClass}>Last name</label><input required value={lastName} onChange={(e) => setLastName(e.target.value)} className={inputClass} /></div>
           </div>
           <div><label className={labelClass}>Email address</label><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} className={inputClass} /></div>
+          <LoginSetupFields email={email} loginMode={loginMode} setLoginMode={setLoginMode} password={password} setPassword={setPassword} />
           <div><label className={labelClass}>Phone number</label><input type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} className={inputClass} /></div>
           <div>
             <label className={labelClass}>Role / Title</label>
@@ -2504,6 +3105,96 @@ function CalendarSyncPicker({ staffer, onSave }) {
         ))}
       </div>
       <button onClick={() => onSave(selected)} className="text-[11.5px] bg-[#B8862F] text-[#F7F6FB] rounded-md px-3 py-1.5 font-medium">Save Selection</button>
+    </div>
+  );
+}
+
+// A single-select row of pill buttons — the answer-picker shared by the Margin survey and the
+// pulse-check form below, since both are fixed-choice questionnaires with the same shape.
+function MarginAnswerPicker({ value, onChange, options }) {
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {options.map(([key, label]) => (
+        <button key={key} type="button" onClick={() => onChange(key)}
+          className={`text-[11px] px-2.5 py-1 rounded-full border ${value === key ? "bg-[#B8862F] text-[#F7F6FB] border-[#B8862F]" : "border-[#D8D5EC] text-[#6B6980]"}`}>
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// The OD's 10-question Margin survey for one team member. Pure form — the score itself is
+// computed server-side once this is submitted (recompute_margin_score(), 0006_margin.sql), so
+// there's nothing to calculate here, only to collect.
+function MarginSurveyModal({ staffPerson, onSubmit, onClose }) {
+  useLockBodyScroll();
+  const [answers, setAnswers] = useState({});
+  const setAnswer = (key, value) => setAnswers((prev) => ({ ...prev, [key]: value }));
+  const complete = MARGIN_SURVEY_QUESTIONS.every((q) => answers[q.key]);
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[480px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-[15px] font-semibold">Margin check-in — {staffPerson.name}</h2>
+          <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
+        </div>
+        <p className="text-[11.5px] text-[#6B6980] mb-4">Central and you are the only ones who'll see the result. {staffPerson.name} won't see their own score.</p>
+        <div className="space-y-4">
+          {MARGIN_SURVEY_QUESTIONS.map((q, i) => (
+            <div key={q.key} className={i === 8 ? "pt-3 border-t border-[#E3E1F0]" : ""}>
+              {i === 8 && <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">Your own read</div>}
+              <div className="text-[12.5px] text-[#2A2A3A] mb-1.5">{q.text}</div>
+              <MarginAnswerPicker value={answers[q.key]} onChange={(v) => setAnswer(q.key, v)} options={q.options} />
+            </div>
+          ))}
+        </div>
+        <button onClick={() => complete && onSubmit(answers)} disabled={!complete}
+          className="w-full text-[13px] font-medium rounded-md px-3 py-2.5 mt-5 disabled:opacity-40"
+          style={{ background: "#2B4C7E", color: "#F7F6FB" }}>
+          Save assessment
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// The pulse a team member answers when their OD has pushed one — appears regardless of which
+// tab they're on, the same way other must-see prompts in this app do. Answering is the one
+// margin write a 'staff'-tier account is allowed to make at all (column-level grant on
+// margin_pulses, migrations/0006_margin.sql) — they never see the score it produces.
+function MarginPulseCheckPrompt({ pulse, onSubmit }) {
+  useLockBodyScroll();
+  const [answers, setAnswers] = useState({});
+  const [note, setNote] = useState("");
+  const setAnswer = (key, value) => setAnswers((prev) => ({ ...prev, [key]: value }));
+  const complete = MARGIN_PULSE_QUESTIONS.every((q) => answers[q.key]);
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[440px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+        <h2 className="text-[15px] font-semibold mb-1">Quick check-in</h2>
+        <p className="text-[11.5px] text-[#6B6980] mb-4">Your OD asked how things are going. Takes under a minute.</p>
+        <div className="space-y-4">
+          {MARGIN_PULSE_QUESTIONS.map((q) => (
+            <div key={q.key}>
+              <div className="text-[12.5px] text-[#2A2A3A] mb-1.5">{q.text}</div>
+              <MarginAnswerPicker value={answers[q.key]} onChange={(v) => setAnswer(q.key, v)} options={q.options} />
+            </div>
+          ))}
+          <div>
+            <div className="text-[12.5px] text-[#2A2A3A] mb-1.5">Anything else you want your OD to know right now? <span className="text-[#8B889C]">(optional)</span></div>
+            <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2}
+              className="w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[12.5px] outline-none focus:border-[#2B4C7E]" />
+          </div>
+        </div>
+        <button onClick={() => complete && onSubmit({ ...answers, p5: note.trim() })} disabled={!complete}
+          className="w-full text-[13px] font-medium rounded-md px-3 py-2.5 mt-5 disabled:opacity-40"
+          style={{ background: "#2B4C7E", color: "#F7F6FB" }}>
+          Send
+        </button>
+      </div>
     </div>
   );
 }
@@ -2600,6 +3291,70 @@ function calDatesInRange(startStr, endStr) {
   let guard = 0;
   while (cur <= end && guard < 366) { days.push(calFmtISO(cur)); cur.setDate(cur.getDate() + 1); guard++; }
   return days;
+}
+
+// Scaffolding for per-person Asana/Slack connections — see supabase/functions/asana-connect
+// and slack-connect. Buttons render disabled with an explanatory title until those functions
+// report `configured: true`, which only happens once real OAuth app credentials exist as
+// Supabase secrets — this is expected, not a bug, for as long as that's still true.
+function OtherConnectionsPanel() {
+  const [asana, setAsana] = useState(null);
+  const [slack, setSlack] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    apiAsanaStatus().then(setAsana).catch(() => {});
+    apiSlackStatus().then(setSlack).catch(() => {});
+  }, []);
+
+  const connect = async (provider) => {
+    setError("");
+    try {
+      const { url } = await (provider === "asana" ? apiAsanaAuthorizeUrl() : apiSlackAuthorizeUrl());
+      window.location.href = url;
+    } catch (err) {
+      setError(err?.message || String(err));
+    }
+  };
+  const disconnect = async (provider) => {
+    setError("");
+    try {
+      if (provider === "asana") { await apiAsanaDisconnect(); setAsana((s) => ({ ...s, connected: false })); }
+      else { await apiSlackDisconnect(); setSlack((s) => ({ ...s, connected: false })); }
+    } catch (err) {
+      setError(err?.message || String(err));
+    }
+  };
+
+  if (!asana && !slack) return null;
+
+  return (
+    <div className="rounded-lg p-4 mt-6" style={{ background: "#FFFFFF", border: "1px solid #E3E1F0" }}>
+      <div className="text-[12.5px] font-semibold mb-1">Other connections</div>
+      <p className="text-[11px] text-[#6B6980] mb-3">Optional, and just yours — connecting your own Asana or Slack doesn't change anything for anyone else.</p>
+      {error && <div className="text-[11px] mb-3 rounded-md px-3 py-2" style={{ background: "#C15B5B1A", color: "#C15B5B" }}>{error}</div>}
+      <div className="flex flex-wrap gap-2">
+        {[["asana", "Asana", asana], ["slack", "Slack", slack]].map(([provider, label, state]) => {
+          if (!state) return null;
+          if (state.connected) {
+            return (
+              <button key={provider} onClick={() => disconnect(provider)} className="text-[11.5px] rounded-md px-3 py-1.5 font-medium" style={{ background: "#E3E1F0", color: "#2A2A3A" }}>
+                Disconnect {label}{provider === "slack" && state.teamName ? ` (${state.teamName})` : ""}
+              </button>
+            );
+          }
+          return (
+            <button key={provider} onClick={() => connect(provider)} disabled={!state.configured}
+              className="text-[11.5px] rounded-md px-3 py-1.5 font-medium disabled:opacity-40"
+              style={{ background: "#2B4C7E", color: "#F7F6FB" }}
+              title={!state.configured ? `${label} isn't set up for this organization yet` : undefined}>
+              Connect {label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function CalendarPanel({ calDate, setCalDate, calView, setCalView, dayEvents, full, authUser, onSaveGoogleCalendars, onSetGoogleConnected }) {
@@ -2791,50 +3546,56 @@ function CalendarPanel({ calDate, setCalDate, calView, setCalView, dayEvents, fu
       )}
 
       {full && calView === "week" && (
-        <div className="grid grid-cols-7 gap-2 items-start">
-          {weekDates.map((d) => {
-            const evs = eventsForDate(d);
-            return (
-              <button key={d} onClick={() => setCalDate(d)} className={`text-left border rounded-md p-2 h-[280px] flex flex-col ${d === calDate ? "border-[#B8862F] bg-[#EFEEFA]" : "border-[#E3E1F0] bg-[#FFFFFF]"}`}>
-                <div className="text-[10.5px] font-medium text-[#6B6980] mb-1.5 shrink-0">{d.slice(5)}</div>
-                <div className="space-y-1 overflow-y-auto min-h-0">
-                  {evs.map((e, i) => (
-                    <div key={i} title={`${e.time} — ${e.title}`} className="text-[9.5px] bg-[#E3E1F0] rounded px-1.5 py-1">
-                      <div className="text-[8.5px] text-[#6B6980] font-medium leading-tight">{e.time}</div>
-                      <div className="truncate leading-tight">{e.title}</div>
-                    </div>
-                  ))}
-                  {evs.length === 0 && <div className="text-[9px] text-[#B8B5C9]">Nothing scheduled</div>}
-                </div>
-              </button>
-            );
-          })}
+        <div className="overflow-x-auto">
+          <div className="grid grid-cols-7 gap-2 items-start min-w-[560px]">
+            {weekDates.map((d) => {
+              const evs = eventsForDate(d);
+              return (
+                <button key={d} onClick={() => setCalDate(d)} className={`text-left border rounded-md p-2 h-[280px] flex flex-col ${d === calDate ? "border-[#B8862F] bg-[#EFEEFA]" : "border-[#E3E1F0] bg-[#FFFFFF]"}`}>
+                  <div className="text-[10.5px] font-medium text-[#6B6980] mb-1.5 shrink-0">{d.slice(5)}</div>
+                  <div className="space-y-1 overflow-y-auto min-h-0">
+                    {evs.map((e, i) => (
+                      <div key={i} title={`${e.time} — ${e.title}`} className="text-[9.5px] bg-[#E3E1F0] rounded px-1.5 py-1">
+                        <div className="text-[8.5px] text-[#6B6980] font-medium leading-tight">{e.time}</div>
+                        <div className="truncate leading-tight">{e.title}</div>
+                      </div>
+                    ))}
+                    {evs.length === 0 && <div className="text-[9px] text-[#B8B5C9]">Nothing scheduled</div>}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
         </div>
       )}
 
       {full && calView === "month" && (
         <div>
           <div className="text-[12.5px] font-medium mb-2">{monthGrid.monthLabel}</div>
-          <div className="grid grid-cols-7 gap-1.5 text-center text-[9.5px] text-[#8B889C] mb-1">
-            {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => <div key={d}>{d}</div>)}
-          </div>
-          <div className="grid grid-cols-7 gap-1.5 items-start">
-            {monthGrid.days.map((d) => {
-              const inMonth = calToDate(d).getMonth() === monthGrid.month;
-              const evs = eventsForDate(d);
-              return (
-                <button key={d} onClick={() => setCalDate(d)}
-                  className={`text-left border rounded-md p-1.5 h-[92px] flex flex-col ${d === calDate ? "border-[#B8862F] bg-[#EFEEFA]" : "border-[#E3E1F0] bg-[#FFFFFF]"} ${inMonth ? "" : "opacity-40"}`}>
-                  <div className="text-[9.5px] text-[#8B889C] shrink-0">{Number(d.slice(8, 10))}</div>
-                  <div className="overflow-y-auto min-h-0">
-                    {evs.slice(0, 3).map((e, i) => (
-                      <div key={i} title={`${e.time} — ${e.title}`} className="text-[8.5px] bg-[#E3E1F0] rounded px-1 py-0.5 mt-0.5 truncate">{e.title}</div>
-                    ))}
-                    {evs.length > 3 && <div className="text-[8px] text-[#8B889C] mt-0.5">+{evs.length - 3} more</div>}
-                  </div>
-                </button>
-              );
-            })}
+          <div className="overflow-x-auto">
+            <div className="min-w-[560px]">
+              <div className="grid grid-cols-7 gap-1.5 text-center text-[9.5px] text-[#8B889C] mb-1">
+                {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => <div key={d}>{d}</div>)}
+              </div>
+              <div className="grid grid-cols-7 gap-1.5 items-start">
+                {monthGrid.days.map((d) => {
+                  const inMonth = calToDate(d).getMonth() === monthGrid.month;
+                  const evs = eventsForDate(d);
+                  return (
+                    <button key={d} onClick={() => setCalDate(d)}
+                      className={`text-left border rounded-md p-1.5 h-[92px] flex flex-col ${d === calDate ? "border-[#B8862F] bg-[#EFEEFA]" : "border-[#E3E1F0] bg-[#FFFFFF]"} ${inMonth ? "" : "opacity-40"}`}>
+                      <div className="text-[9.5px] text-[#8B889C] shrink-0">{Number(d.slice(8, 10))}</div>
+                      <div className="overflow-y-auto min-h-0">
+                        {evs.slice(0, 3).map((e, i) => (
+                          <div key={i} title={`${e.time} — ${e.title}`} className="text-[8.5px] bg-[#E3E1F0] rounded px-1 py-0.5 mt-0.5 truncate">{e.title}</div>
+                        ))}
+                        {evs.length > 3 && <div className="text-[8px] text-[#8B889C] mt-0.5">+{evs.length - 3} more</div>}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -2863,6 +3624,7 @@ function CalendarPanel({ calDate, setCalDate, calView, setCalView, dayEvents, fu
           )}
         </div>
       )}
+      {full && <OtherConnectionsPanel />}
     </div>
   );
 }
@@ -3021,6 +3783,7 @@ function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectC
   const b = rollupBudget(projects);
   const pct = b.total ? Math.min(100, Math.round((b.spent / b.total) * 100)) : 0;
   const color = accentColor || "#B8862F";
+  const acc = estimateAccuracy(projects);
   return (
     <div>
       <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(18px,3.6vw,22px)] font-semibold tracking-tight mb-1">Budget — {campusLabel}</h1>
@@ -3031,6 +3794,36 @@ function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectC
         <div className="text-[26px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color }}>{fmtMoney(b.spent)} <span className="text-[15px] font-normal">of {fmtMoney(b.total)}</span></div>
         <div className="h-2 rounded-full bg-[#E3E1F0] overflow-hidden mt-2"><div className="h-full rounded-full" style={{ width: `${pct}%`, background: color }} /></div>
       </div>
+
+      {acc.count > 0 && (
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mb-6">
+          <h2 className="text-[13px] font-bold mb-1">Estimate Accuracy</h2>
+          <p className="text-[11px] text-[#6B6980] mb-3">How well {acc.count} completed project{acc.count === 1 ? "" : "s"} {acc.count === 1 ? "was" : "were"} estimated — not a budget forecast, just stewardship.</p>
+          <div className="flex items-center gap-6 mb-3">
+            <div>
+              <div className="text-[20px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color: (acc.atOrUnderPct ?? 0) >= 70 ? "#5E9E8A" : "#C15B5B" }}>{acc.atOrUnderPct}%</div>
+              <div className="text-[10px] text-[#6B6980]">landed at or under estimate</div>
+            </div>
+            <div>
+              <div className="text-[20px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color: acc.avgVariance <= 0 ? "#5E9E8A" : "#C15B5B" }}>{acc.avgVariance > 0 ? "+" : ""}{Math.round(acc.avgVariance)}%</div>
+              <div className="text-[10px] text-[#6B6980]">average variance from estimate</div>
+            </div>
+          </div>
+          {acc.worst.filter((s) => s.variance > 0).length > 0 && (
+            <div>
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] mb-1.5">Furthest over estimate</div>
+              <div className="space-y-1">
+                {acc.worst.filter((s) => s.variance > 0).map((s) => (
+                  <button key={s.project.id} onClick={() => onOpenProject(s.project.id)} className="w-full flex items-center justify-between gap-2 text-left hover:bg-[#EFEEFA] rounded-md px-2 py-1">
+                    <span className="text-[11.5px] truncate">{s.project.title}</span>
+                    <span className="text-[11px] shrink-0" style={{ color: "#C15B5B" }}>+{Math.round(s.variance)}%</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {onSelectCampus && (
         <>
@@ -3075,31 +3868,23 @@ function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectC
   );
 }
 
-function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, sections, onAddSection, onSetSection, onNewProject }) {
+function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, onNewProject }) {
   const [sortBy, setSortBy] = useState("due");
   const [filterStage, setFilterStage] = useState("All");
   const [filterSection, setFilterSection] = useState("All");
-  const [addingSection, setAddingSection] = useState(false);
-  const [newSectionName, setNewSectionName] = useState("");
   const [showCompleted, setShowCompleted] = useState(false);
-
-  const submitSection = () => {
-    if (!newSectionName.trim()) return;
-    onAddSection(newSectionName.trim());
-    setNewSectionName(""); setAddingSection(false);
-  };
 
   const completedCount = projects.filter((p) => p.stage === "Completed").length;
 
   let list = projects.filter(
-    (p) => (filterStage === "All" || p.stage === filterStage) && (filterSection === "All" || (p.section || "General") === filterSection) && (showCompleted || p.stage !== "Completed")
+    (p) => (filterStage === "All" || p.stage === filterStage) && (filterSection === "All" || (p.section || MINISTRY_AREA_OPTIONS[0]) === filterSection) && (showCompleted || p.stage !== "Completed")
   );
   list = [...list].sort(SORTERS[sortBy]);
 
   const grouped = {};
-  sections.forEach((s) => { grouped[s] = []; });
+  MINISTRY_AREA_OPTIONS.forEach((s) => { grouped[s] = []; });
   list.forEach((p) => {
-    const s = p.section || "General";
+    const s = p.section || MINISTRY_AREA_OPTIONS[0];
     if (!grouped[s]) grouped[s] = [];
     grouped[s].push(p);
   });
@@ -3128,31 +3913,19 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, sections, onAdd
           <option value="All">All Stages</option>
           {STAGES.map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
-        <span className="text-[10.5px] text-[#6B6980] ml-2">Section</span>
+        <span className="text-[10.5px] text-[#6B6980] ml-2">Ministry Area</span>
         <select value={filterSection} onChange={(e) => setFilterSection(e.target.value)} className="bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11.5px] outline-none">
-          <option value="All">All Sections</option>
-          {sections.map((s) => <option key={s} value={s}>{s}</option>)}
+          <option value="All">All Ministry Areas</option>
+          {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
         <label className="flex items-center gap-1.5 text-[11px] text-[#6B6980] ml-2 cursor-pointer">
           <input type="checkbox" checked={showCompleted} onChange={(e) => setShowCompleted(e.target.checked)} className="accent-[#B8862F]" />
           Show completed ({completedCount})
         </label>
-        <div className="ml-auto flex items-center gap-2">
-          {addingSection ? (
-            <>
-              <input value={newSectionName} onChange={(e) => setNewSectionName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && submitSection()}
-                placeholder="Section name" autoFocus className="bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11.5px] outline-none focus:border-[#B8862F]" />
-              <button onClick={submitSection} className="text-[11px] text-[#B8862F]">Add</button>
-              <button onClick={() => setAddingSection(false)} className="text-[11px] text-[#6B6980]">Cancel</button>
-            </>
-          ) : (
-            <button onClick={() => setAddingSection(true)} className="flex items-center gap-1 text-[11.5px] text-[#B8862F]"><Plus size={12} /> Add Section</button>
-          )}
-        </div>
       </div>
 
       <div className="space-y-6">
-        {sections.map((section) => (
+        {MINISTRY_AREA_OPTIONS.map((section) => (
           <div key={section}>
             <div className="text-[12px] font-medium text-[#2A2A3A] mb-2 flex items-center gap-2">
               {section} <span className="text-[10.5px] text-[#6B6980] font-normal">· {grouped[section]?.length || 0}</span>
@@ -3175,9 +3948,9 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, sections, onAdd
                   </button>
                   <div className="flex items-center justify-between">
                     <button onClick={() => onCycle(p.id)}><StageBadge stage={p.stage} /></button>
-                    <select value={p.section || "General"} onChange={(e) => onSetSection(p.id, e.target.value)}
+                    <select value={p.section || MINISTRY_AREA_OPTIONS[0]} onChange={(e) => onSetSection(p.id, e.target.value)}
                       className="bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-1.5 py-0.5 text-[9.5px] text-[#6B6980] outline-none">
-                      {sections.map((s) => <option key={s} value={s}>{s}</option>)}
+                      {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
                     </select>
                   </div>
                 </div>
@@ -3193,7 +3966,7 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, sections, onAdd
   );
 }
 
-function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetStage, onAddProjectNote, onAddSubtaskNote, onAddProjectPhoto, onAddSubtaskPhoto, onUpdateProjectBudget, onUpdateSubtaskBudget, onSetDue, onSetSubtaskDue, onAssignSubtask, onDeleteSubtask, onDeleteProject, roster }) {
+function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetStage, onAddProjectNote, onAddSubtaskNote, onAddProjectPhoto, onAddSubtaskPhoto, onUpdateProjectBudget, onUpdateSubtaskBudget, onSetDue, onSetSubtaskDue, onAssignSubtask, onDeleteSubtask, onDeleteProject, roster, seasons, onSetSeason }) {
   const [showAddSubtask, setShowAddSubtask] = useState(false);
   const [subtaskText, setSubtaskText] = useState("");
   const [subtaskCost, setSubtaskCost] = useState("");
@@ -3274,8 +4047,8 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
   };
 
   return (
-    <div className="fixed inset-0 z-30 overflow-y-auto p-4" style={{ background: "rgba(0,0,0,0.65)", WebkitOverflowScrolling: "touch" }} onClick={onClose}>
-      <div className="border rounded-xl max-w-[560px] w-full my-8 mx-auto p-5" style={{ background: "#FFFFFF", borderColor: "#D8D5EC", color: "#2A2A3A", fontFamily: "'Inter', sans-serif" }} onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-30 overflow-y-auto p-0 sm:p-4" style={{ background: "rgba(0,0,0,0.65)", WebkitOverflowScrolling: "touch" }} onClick={onClose}>
+      <div className="border rounded-none sm:rounded-xl max-w-[560px] w-full min-h-screen sm:min-h-0 my-0 sm:my-8 mx-auto p-5" style={{ background: "#FFFFFF", borderColor: "#D8D5EC", color: "#2A2A3A", fontFamily: "'Inter', sans-serif" }} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between mb-3 gap-2">
           <div className="flex items-center gap-1.5 min-w-0">{project.shared && <Link2 size={13} className="text-[#B8862F] shrink-0" />}<h2 className="text-[clamp(14px,3vw,16px)] font-medium truncate">{project.title}</h2></div>
           <div className="flex items-center gap-2 shrink-0">
@@ -3306,6 +4079,16 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
             </span>
           )}
           <StageBadge stage={project.stage} />
+          {seasons && onSetSeason && (
+            <span className="flex items-center gap-1">
+              <span>·</span>
+              <select value={project.seasonId || ""} onChange={(e) => onSetSeason(project.id, e.target.value || null)}
+                className="bg-transparent border-none text-[11px] text-[#6B6980] outline-none cursor-pointer">
+                <option value="">No season</option>
+                {seasons.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </span>
+          )}
           {project.stage === "Completed" && (
             <span className="text-[10.5px] px-2 py-0.5 rounded-full" style={{ background: `${BUDGET_STATUS_COLOR[budgetStatus(project)]}22`, color: BUDGET_STATUS_COLOR[budgetStatus(project)] }}>
               Ended {BUDGET_STATUS_LABEL[budgetStatus(project)].toLowerCase()}
@@ -3324,7 +4107,7 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
           </div>
         )}
 
-        <div className="grid grid-cols-2 gap-3 mb-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
           <div className="bg-[#EFEEFA] border border-[#E3E1F0] rounded-md p-3">
             <div className="flex items-center justify-between mb-1">
               <span className="text-[10.5px] text-[#6B6980]">Budget (incl. tasks)</span>
@@ -3682,9 +4465,9 @@ function EventsList({ campusId, campuses }) {
   );
 }
 
-function NewProjectModal({ onClose, onCreate, sections, campusRoster, fullRoster, campusLabel }) {
+function NewProjectModal({ onClose, onCreate, campusRoster, fullRoster, campusLabel }) {
   const [title, setTitle] = useState("");
-  const [section, setSection] = useState(sections[0] || "General");
+  const [section, setSection] = useState(MINISTRY_AREA_OPTIONS[0]);
   const [stage, setStage] = useState("Pending");
   const [due, setDue] = useState(TODAY_STR);
   const [dueTime, setDueTime] = useState("");
@@ -3710,8 +4493,8 @@ function NewProjectModal({ onClose, onCreate, sections, campusRoster, fullRoster
   };
 
   return (
-    <div className="fixed inset-0 z-30 overflow-y-auto p-4" style={{ background: "rgba(0,0,0,0.65)", WebkitOverflowScrolling: "touch" }} onClick={onClose}>
-      <div className="border rounded-xl max-w-[520px] w-full my-8 mx-auto p-5" style={{ background: "#FFFFFF", borderColor: "#D8D5EC", color: "#2A2A3A", fontFamily: "'Inter', sans-serif" }} onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-30 overflow-y-auto p-0 sm:p-4" style={{ background: "rgba(0,0,0,0.65)", WebkitOverflowScrolling: "touch" }} onClick={onClose}>
+      <div className="border rounded-none sm:rounded-xl max-w-[520px] w-full min-h-screen sm:min-h-0 my-0 sm:my-8 mx-auto p-5" style={{ background: "#FFFFFF", borderColor: "#D8D5EC", color: "#2A2A3A", fontFamily: "'Inter', sans-serif" }} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between mb-4">
           <h2 className="text-[16px] font-bold">New Project / Task</h2>
           <button onClick={onClose} className="text-[#6B6980] hover:text-[#2A2A3A]"><X size={18} /></button>
@@ -3724,11 +4507,11 @@ function NewProjectModal({ onClose, onCreate, sections, campusRoster, fullRoster
               className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#B8862F]" />
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="text-[10.5px] text-[#6B6980] block mb-1">Section</label>
+              <label className="text-[10.5px] text-[#6B6980] block mb-1">Ministry Area</label>
               <select value={section} onChange={(e) => setSection(e.target.value)} className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2 py-2 text-[12.5px] outline-none">
-                {sections.map((s) => <option key={s} value={s}>{s}</option>)}
+                {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
               </select>
             </div>
             <div>
@@ -3829,14 +4612,111 @@ function NewProjectModal({ onClose, onCreate, sections, campusRoster, fullRoster
   );
 }
 
+// Central-only management + cross-campus rollup for Seasons — a named window (Easter,
+// Christmas, VBS) any project across any campus can be tagged into. Two views in one modal
+// (list+create, and one season's rollup) rather than separate screens, since v1 doesn't need
+// more than that — see 0018_seasons.sql for what's deliberately deferred (auto-suggesting next
+// year's checklist from this year's).
+function SeasonsModal({ seasons, projects, campuses, onCreateSeason, onClose, onOpenProject }) {
+  useLockBodyScroll();
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState("");
+  const [startsOn, setStartsOn] = useState("");
+  const [endsOn, setEndsOn] = useState("");
+  const [openSeasonId, setOpenSeasonId] = useState(null);
+
+  const submit = () => {
+    if (!name.trim()) return;
+    onCreateSeason(name.trim(), startsOn, endsOn);
+    setName(""); setStartsOn(""); setEndsOn(""); setCreating(false);
+  };
+
+  const openSeason = seasons.find((s) => s.id === openSeasonId);
+  const seasonProjects = openSeason ? projects.filter((p) => p.seasonId === openSeason.id) : [];
+  const seasonBudget = openSeason ? rollupBudget(seasonProjects) : null;
+  const campusName = (id) => campuses.find((c) => c.id === id)?.name || id;
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[560px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-[15px] font-semibold">{openSeason ? openSeason.name : "Seasons"}</h2>
+          <button onClick={openSeason ? () => setOpenSeasonId(null) : onClose} className="text-[#8B889C] hover:text-[#2A2A3A]">
+            {openSeason ? <ChevronLeft size={16} /> : <X size={16} />}
+          </button>
+        </div>
+
+        {!openSeason && (
+          <>
+            <p className="text-[11.5px] text-[#6B6980] mb-4">A named window — Easter, Christmas, VBS — that projects across every campus can be tagged into, so you can see the whole thing in one place.</p>
+            {seasons.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-4 text-center">No seasons yet.</div>}
+            <div className="space-y-1.5 mb-4">
+              {seasons.map((s) => {
+                const count = projects.filter((p) => p.seasonId === s.id).length;
+                return (
+                  <button key={s.id} onClick={() => setOpenSeasonId(s.id)} className="w-full text-left bg-[#EFEEFA] border border-[#E3E1F0] rounded-md px-3 py-2.5 hover:border-[#C7C3E0]">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[12.5px] font-medium">{s.name}</span>
+                      <span className="text-[10.5px] text-[#6B6980]">{count} project{count === 1 ? "" : "s"}</span>
+                    </div>
+                    {(s.startsOn || s.endsOn) && <div className="text-[10.5px] text-[#8B889C] mt-0.5">{s.startsOn || "?"} – {s.endsOn || "?"}</div>}
+                  </button>
+                );
+              })}
+            </div>
+            {creating ? (
+              <div className="bg-[#F7F6FB] border border-[#D8D5EC] rounded-md p-3">
+                <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Season name — e.g. Easter 2027"
+                  className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-3 py-2 text-[12.5px] outline-none focus:border-[#B8862F] mb-2" />
+                <div className="flex gap-2 mb-2">
+                  <input type="date" value={startsOn} onChange={(e) => setStartsOn(e.target.value)} className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[12px] outline-none" />
+                  <input type="date" value={endsOn} onChange={(e) => setEndsOn(e.target.value)} className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[12px] outline-none" />
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={submit} className="text-[12px] bg-[#B8862F] text-[#F7F6FB] rounded-md px-3 py-1.5 font-medium">Create</button>
+                  <button onClick={() => setCreating(false)} className="text-[12px] text-[#6B6980] px-3 py-1.5">Cancel</button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={() => setCreating(true)} className="text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>+ New Season</button>
+            )}
+          </>
+        )}
+
+        {openSeason && (
+          <div>
+            <p className="text-[11.5px] text-[#6B6980] mb-4">{openSeason.startsOn || "?"} – {openSeason.endsOn || "?"} · every campus's projects tagged to this season</p>
+            <div className="rounded-lg p-3 mb-4" style={{ background: "#2B4C7E18", border: "1px solid #2B4C7E55" }}>
+              <div className="text-[11px] text-[#2B4C7E] mb-1">Combined budget</div>
+              <div className="text-[18px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color: "#2B4C7E" }}>{fmtMoney(seasonBudget.spent)} <span className="text-[13px] font-normal">of {fmtMoney(seasonBudget.total)}</span></div>
+            </div>
+            <div className="space-y-1.5">
+              {seasonProjects.map((p) => (
+                <button key={p.id} onClick={() => onOpenProject(p.id)} className="w-full text-left bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg px-3 py-2.5 hover:border-[#C7C3E0]">
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <span className="text-[12.5px] truncate">{p.title}</span>
+                    <StageBadge stage={p.stage} />
+                  </div>
+                  <div className="text-[10.5px] text-[#6B6980]">{campusName(p.campus)} · {p.owner}</div>
+                </button>
+              ))}
+              {seasonProjects.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No projects tagged to this season yet — tag one from its project detail.</div>}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SummaryDetailModal({ type, onClose, campuses, projects, sharedProjects, staffByCampus, orgBudgetUsed, orgBudgetTotal, onOpenProject, onSelectCampus }) {
   useLockBodyScroll();
   const titles = { projects: "Open Projects — Org-Wide", budget: "Budget Used — Org-Wide", campuses: "Campuses", shared: "Shared Projects — Cross-Campus" };
   const campusName = (id) => campuses.find((c) => c.id === id)?.name || id;
 
   return (
-    <div className="fixed inset-0 z-30 overflow-y-auto p-4" style={{ background: "rgba(0,0,0,0.65)", WebkitOverflowScrolling: "touch" }} onClick={onClose}>
-      <div className="border rounded-xl max-w-[560px] w-full my-8 mx-auto p-5" style={{ background: "#FFFFFF", borderColor: "#D8D5EC", color: "#2A2A3A", fontFamily: "'Inter', sans-serif" }} onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-30 overflow-y-auto p-0 sm:p-4" style={{ background: "rgba(0,0,0,0.65)", WebkitOverflowScrolling: "touch" }} onClick={onClose}>
+      <div className="border rounded-none sm:rounded-xl max-w-[560px] w-full min-h-screen sm:min-h-0 my-0 sm:my-8 mx-auto p-5" style={{ background: "#FFFFFF", borderColor: "#D8D5EC", color: "#2A2A3A", fontFamily: "'Inter', sans-serif" }} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between mb-4">
           <h2 className="text-[clamp(14px,3vw,16px)] font-bold">{titles[type]}</h2>
           <button onClick={onClose} className="text-[#6B6980] hover:text-[#2A2A3A]"><X size={18} /></button>
@@ -4160,7 +5040,7 @@ function ReportsPanel({ projects, campuses, staffByCampus, roster, isCentral, on
       </div>
 
       <div className="text-[11.5px] text-[#6B6980] mb-2">{results.length} result{results.length === 1 ? "" : "s"}</div>
-      <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg overflow-x-auto">
+      <div className="hidden md:block bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg overflow-x-auto">
         <table className="w-full text-[11.5px]">
           <thead>
             <tr className="border-b border-[#E3E1F0] text-left text-[#6B6980]">
@@ -4195,6 +5075,24 @@ function ReportsPanel({ projects, campuses, staffByCampus, roster, isCentral, on
             )}
           </tbody>
         </table>
+      </div>
+
+      <div className="md:hidden space-y-2">
+        {results.map((p) => {
+          const b = projectBudget(p);
+          return (
+            <div key={p.id} className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-[13px] font-medium truncate">{p.title}</div>
+                <StageBadge stage={p.stage} />
+              </div>
+              <div className="text-[11px] text-[#6B6980] mt-1">{campusName(p.campus)} · {p.owner}</div>
+              <div className="text-[11px] text-[#6B6980] mt-1">Budget: {fmtMoney(b.spent)} / {fmtMoney(b.total)}</div>
+              <div className="text-[10px] text-[#8B889C] mt-1">Added {p.createdAt || "—"} · Completed {p.completedOn || "—"} · Latest {latestActivity(p) || "—"}</div>
+            </div>
+          );
+        })}
+        {results.length === 0 && <div className="text-center text-[#8B889C] py-8 text-[11.5px] bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg">No projects match these filters.</div>}
       </div>
 
       {isCentral && (
@@ -4337,8 +5235,8 @@ function CreateAccountModal({ campuses, roleOptions, onClose, onCreate }) {
   };
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
-      <div className="bg-[#FFFFFF] rounded-xl p-6 w-full max-w-[420px] max-h-[90vh] overflow-y-auto">
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[420px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-[15px] font-semibold">New Account</h2>
           <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
@@ -4398,8 +5296,8 @@ function StaffProfileModal({ name, projects, onClose, onOpenProject }) {
   const needsAttention = current.filter((p) => p.stage === "Stalled" || (p.due && p.due < TODAY_STR) || (p.subtasks || []).some((s) => !s.done && s.due && s.due < TODAY_STR));
 
   return (
-    <div className="fixed inset-0 z-30 overflow-y-auto p-4" style={{ background: "rgba(0,0,0,0.65)", WebkitOverflowScrolling: "touch" }} onClick={onClose}>
-      <div className="border rounded-xl max-w-[560px] w-full my-8 mx-auto p-5" style={{ background: "#FFFFFF", borderColor: "#D8D5EC", color: "#2A2A3A", fontFamily: "'Inter', sans-serif" }} onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-30 overflow-y-auto p-0 sm:p-4" style={{ background: "rgba(0,0,0,0.65)", WebkitOverflowScrolling: "touch" }} onClick={onClose}>
+      <div className="border rounded-none sm:rounded-xl max-w-[560px] w-full min-h-screen sm:min-h-0 my-0 sm:my-8 mx-auto p-5" style={{ background: "#FFFFFF", borderColor: "#D8D5EC", color: "#2A2A3A", fontFamily: "'Inter', sans-serif" }} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between mb-4">
           <h2 className="text-[17px] font-bold">{name}</h2>
           <button onClick={onClose} className="text-[#6B6980] hover:text-[#2A2A3A]"><X size={18} /></button>

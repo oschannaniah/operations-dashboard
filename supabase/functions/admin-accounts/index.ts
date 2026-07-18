@@ -38,12 +38,20 @@ Deno.serve(async (req) => {
 
     if (action === "create") {
       const tier = tierForRole(data.campusId, data.role);
-      const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
-        email: data.email,
-        password: data.password,
-        email_confirm: true,
-        user_metadata: { organization_id: callerProfile.organization_id },
-      });
+      // A password means Central is setting the credential directly (unchanged path). No
+      // password means "send them a login invite" — Supabase's own admin API handles the
+      // email delivery, so this needs no new email infrastructure; the recipient sets their
+      // own password via the link it sends.
+      const { data: created, error: createErr } = data.password
+        ? await supabaseAdmin.auth.admin.createUser({
+            email: data.email,
+            password: data.password,
+            email_confirm: true,
+            user_metadata: { organization_id: callerProfile.organization_id },
+          })
+        : await supabaseAdmin.auth.admin.inviteUserByEmail(data.email, {
+            data: { organization_id: callerProfile.organization_id },
+          });
       if (createErr) return jsonOut({ error: createErr.message });
 
       // The auth.users insert trigger already created a bare profiles row (tier
