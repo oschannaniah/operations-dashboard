@@ -32,6 +32,13 @@ const DEFAULT_ROLE_OPTIONS = [
   "Production Coordinator", "Worship Director", "Reception", "Info Center", "Hospitality", "Cafe",
 ];
 
+// The admin tier at a campus was originally just one seat (Campus Operations Director). A
+// campus can now have several — Campus Support Director and Campus Admin Director carry the
+// same "od" permission level, each overseeing their own sub-branch of roles, per the tier-3
+// row in TIERS above. Everything else at a campus (coordinators, support roles) stays "staff"
+// tier. Mirrored server-side in admin-accounts/index.ts's tierForRole — keep both in sync.
+const ADMIN_TIER_ROLES = ["Campus Operations Director", "Campus Support Director", "Campus Admin Director"];
+
 // The four team lanes a phase-4 (fully staffed) campus org chart is organized into, each with
 // its own role/title list — sourced directly from the reference org chart. "Add Team Role"
 // builds a person straight into one of these, as a second, more structured way to build the
@@ -1794,7 +1801,7 @@ export default function OpsDashboard() {
   // Mirrors tierForRole_ in Code.gs — kept in sync locally purely so the Team Accounts panel
   // can show the resulting tier immediately, without waiting on a round trip. The backend
   // always recomputes this itself from campusId/role on write and is the actual source of truth.
-  const tierFromAccess = (campusId, role) => campusId === "central" ? "central" : (role === "Campus Operations Director" ? "od" : "staff");
+  const tierFromAccess = (campusId, role) => campusId === "central" ? "central" : (ADMIN_TIER_ROLES.includes(role) ? "od" : "staff");
 
   // campuses.id is a client-supplied text slug (not a surrogate key), so a new location needs
   // one derived from its name, checked against every campus already loaded — collisions get a
@@ -5506,7 +5513,7 @@ function AccountsPanel({ users, campuses, roleOptions, onCreate, onUpdateAccess,
             <Plus size={14} /> New Location
           </button>
           <button onClick={() => setShowCreate(true)} className="flex items-center gap-1.5 text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>
-            <Plus size={14} /> New Account
+            <Plus size={14} /> New User
           </button>
         </div>
       </div>
@@ -5616,7 +5623,7 @@ function AccountRow({ user, campuses, roleOptions, isSelf, onUpdateAccess, onRem
   const [confirmDelete, setConfirmDelete] = useState(false);
   const campusId = user.campusId || ""; // "" = not yet assigned
   const role = user.role || "";
-  const tierLabel = campusId === "central" ? "central" : !campusId ? "unassigned" : (role === "Campus Operations Director" ? "od" : "staff");
+  const tierLabel = campusId === "central" ? "central" : !campusId ? "unassigned" : (ADMIN_TIER_ROLES.includes(role) ? "od" : "staff");
 
   return (
     <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
@@ -5680,7 +5687,7 @@ function CreateAccountModal({ campuses, roleOptions, onClose, onCreate }) {
     <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
       <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[420px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-[15px] font-semibold">New Account</h2>
+          <h2 className="text-[15px] font-semibold">New User</h2>
           <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
         </div>
         <form onSubmit={submit} className="space-y-3">
@@ -5713,7 +5720,7 @@ function CreateAccountModal({ campuses, roleOptions, onClose, onCreate }) {
           </div>
           {error && <div className="text-[12px] rounded-md px-3 py-2" style={{ background: "#C15B5B1A", color: "#C15B5B" }}>{error}</div>}
           <div className="flex gap-2 pt-1">
-            <button type="submit" className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Create Account</button>
+            <button type="submit" className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Create User</button>
             <button type="button" onClick={onClose} className="text-[13px] text-[#6B6980] px-2">Cancel</button>
           </div>
         </form>

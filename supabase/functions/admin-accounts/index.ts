@@ -15,11 +15,16 @@ const supabaseAdmin = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
 );
 
-// Mirrors tierForRole_ in the old Code.gs.
+// A campus can have more than one admin-tier seat — Campus Operations Director, Campus Support
+// Director, and Campus Admin Director all carry "od"-level access (each overseeing their own
+// sub-branch of roles), everything else at a campus is "staff". Mirrored client-side in
+// campus-ops-dashboard.jsx's ADMIN_TIER_ROLES/tierFromAccess — keep both in sync.
+const ADMIN_TIER_ROLES = ["Campus Operations Director", "Campus Support Director", "Campus Admin Director"];
+
 function tierForRole(campusId: string | null, role: string | null): string {
   if (campusId === "central") return "central";
   if (!campusId) return "unassigned";
-  if (role === "Campus Operations Director") return "od";
+  if (role && ADMIN_TIER_ROLES.includes(role)) return "od";
   return "staff";
 }
 
