@@ -129,9 +129,9 @@ const FIELD_MAPS = {
   staff_flag_history: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", setBy: "set_by", setAt: "set_at" },
   staff_checkin_log: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", loggedBy: "logged_by", loggedAt: "logged_at" },
   playbook_templates: { organizationId: "organization_id", createdBy: "created_by", createdAt: "created_at" },
-  playbook_template_items: { templateId: "template_id" },
+  playbook_template_items: { templateId: "template_id", managedBy: "managed_by", dueOffsetDays: "due_offset_days" },
   playbook_runs: { organizationId: "organization_id", campusId: "campus_id", templateId: "template_id", templateName: "template_name", targetStaffId: "target_staff_id", targetProjectId: "target_project_id", startedBy: "started_by", startedAt: "started_at" },
-  playbook_run_items: { runId: "run_id", doneBy: "done_by", doneAt: "done_at", assignedTo: "assigned_to", managedBy: "managed_by" },
+  playbook_run_items: { runId: "run_id", doneBy: "done_by", doneAt: "done_at", assignedTo: "assigned_to", managedBy: "managed_by", dueDate: "due_date" },
 };
 
 function toSnakeRow(table, obj) {
@@ -1808,7 +1808,9 @@ export default function OpsDashboard() {
     try {
       const template = await apiCreate("PlaybookTemplates", { organizationId: OSC_ORG_ID, name, type, createdBy: currentViewerName });
       setPlaybookTemplates((prev) => [...prev, template]);
-      const createdItems = await Promise.all(itemsList.map((it, idx) => apiCreate("PlaybookTemplateItems", { templateId: template.id, position: idx, text: it.text })));
+      const createdItems = await Promise.all(itemsList.map((it, idx) => apiCreate("PlaybookTemplateItems", {
+        templateId: template.id, position: idx, text: it.text, category: it.category || null, managedBy: it.managedBy || null, dueOffsetDays: it.dueOffsetDays || null,
+      })));
       setPlaybookTemplateItems((prev) => [...prev, ...createdItems]);
       setBackendStatus("connected"); setBackendError("");
     } catch (err) {
@@ -1838,7 +1840,12 @@ export default function OpsDashboard() {
         targetStaffId: target?.staffId || null, targetProjectId: target?.projectId || null, startedBy: currentViewerName,
       });
       setPlaybookRuns((prev) => [...prev, run]);
-      const createdItems = await Promise.all(items.map((it, idx) => apiCreate("PlaybookRunItems", { runId: run.id, position: idx, text: it.text })));
+      // due_offset_days is relative to the template (reusable indefinitely); converting it to a
+      // real due_date happens once, right here, at the moment a run actually starts.
+      const createdItems = await Promise.all(items.map((it, idx) => {
+        const dueDate = it.dueOffsetDays != null ? new Date(Date.now() + it.dueOffsetDays * 86400000).toISOString().slice(0, 10) : null;
+        return apiCreate("PlaybookRunItems", { runId: run.id, position: idx, text: it.text, category: it.category || null, managedBy: it.managedBy || null, dueDate });
+      }));
       setPlaybookRunItems((prev) => [...prev, ...createdItems]);
       setBackendStatus("connected"); setBackendError("");
     } catch (err) {
@@ -1876,11 +1883,12 @@ export default function OpsDashboard() {
       const removed = existingItems.filter((i) => !keepIds.has(i.id));
       await Promise.all(removed.map((i) => apiDelete("PlaybookTemplateItems", i.id)));
 
-      const settled = await Promise.all(itemsList.map((it, idx) =>
-        it.id
-          ? apiUpdate("PlaybookTemplateItems", it.id, { position: idx, text: it.text }).then(() => ({ id: it.id, templateId, position: idx, text: it.text }))
-          : apiCreate("PlaybookTemplateItems", { templateId, position: idx, text: it.text })
-      ));
+      const settled = await Promise.all(itemsList.map((it, idx) => {
+        const fields = { position: idx, text: it.text, category: it.category || null, managedBy: it.managedBy || null, dueOffsetDays: it.dueOffsetDays || null };
+        return it.id
+          ? apiUpdate("PlaybookTemplateItems", it.id, fields).then(() => ({ id: it.id, templateId, ...fields }))
+          : apiCreate("PlaybookTemplateItems", { templateId, ...fields });
+      }));
       setPlaybookTemplateItems((prev) => [...prev.filter((i) => i.templateId !== templateId), ...settled]);
       setBackendStatus("connected"); setBackendError("");
     } catch (err) {
@@ -1892,11 +1900,11 @@ export default function OpsDashboard() {
 
   // A location-specific step added directly to an already-started run — never written back to
   // the shared template, so it only ever affects this one run.
-  const addPlaybookRunItem = async (runId, text, assignedTo) => {
+  const addPlaybookRunItem = async (runId, text, category) => {
     setSyncing(true);
     try {
       const position = playbookRunItems.filter((i) => i.runId === runId).length;
-      const item = await apiCreate("PlaybookRunItems", { runId, position, text, assignedTo: assignedTo || null });
+      const item = await apiCreate("PlaybookRunItems", { runId, position, text, category: category || null });
       setPlaybookRunItems((prev) => [...prev, item]);
       setBackendStatus("connected"); setBackendError("");
     } catch (err) {
@@ -1921,6 +1929,11 @@ export default function OpsDashboard() {
   const setPlaybookRunItemManager = (itemId, managedBy) => {
     setPlaybookRunItems((prev) => prev.map((i) => i.id === itemId ? { ...i, managedBy: managedBy || null } : i));
     syncToBackend(apiUpdate("PlaybookRunItems", itemId, { managedBy: managedBy || null }));
+  };
+
+  const setPlaybookRunItemDueDate = (itemId, dueDate) => {
+    setPlaybookRunItems((prev) => prev.map((i) => i.id === itemId ? { ...i, dueDate: dueDate || null } : i));
+    syncToBackend(apiUpdate("PlaybookRunItems", itemId, { dueDate: dueDate || null }));
   };
 
   // Persists a campus's Slides org-chart link to the CampusConfig sheet (id = campusId, so
@@ -2356,7 +2369,7 @@ export default function OpsDashboard() {
               onCreateTemplate={createPlaybookTemplate} onUpdateTemplate={updatePlaybookTemplate} onDeleteTemplate={deletePlaybookTemplate}
               onStartRun={startPlaybookRun} onToggleRunItem={togglePlaybookRunItem} onDeleteRun={deletePlaybookRun}
               onAddRunItem={addPlaybookRunItem} onRemoveRunItem={removePlaybookRunItem}
-              onSetRunItemAssignee={setPlaybookRunItemAssignee} onSetRunItemManager={setPlaybookRunItemManager}
+              onSetRunItemAssignee={setPlaybookRunItemAssignee} onSetRunItemManager={setPlaybookRunItemManager} onSetRunItemDueDate={setPlaybookRunItemDueDate}
             />
           )}
 
@@ -5165,13 +5178,14 @@ function LocationScorecardsPanel({ campuses, projects, staffByCampus, marginScor
 const PLAYBOOK_TYPE_LABEL = { onboarding: "Onboarding", project: "Project", standing: "Standing / Recurring" };
 const PLAYBOOK_TYPE_COLOR = { onboarding: "#2B4C7E", project: "#B8862F", standing: "#5E9E8A" };
 
-function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, campusLabel, tier, templates, templateItems, runs, runItems, onCreateTemplate, onUpdateTemplate, onDeleteTemplate, onStartRun, onToggleRunItem, onDeleteRun, onAddRunItem, onRemoveRunItem, onSetRunItemAssignee, onSetRunItemManager }) {
+function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, campusLabel, tier, templates, templateItems, runs, runItems, onCreateTemplate, onUpdateTemplate, onDeleteTemplate, onStartRun, onToggleRunItem, onDeleteRun, onAddRunItem, onRemoveRunItem, onSetRunItemAssignee, onSetRunItemManager, onSetRunItemDueDate }) {
   const [showNewTemplate, setShowNewTemplate] = useState(false);
   const [editingTemplateId, setEditingTemplateId] = useState(null);
   const [showStartRun, setShowStartRun] = useState(false);
   const [expandedRunId, setExpandedRunId] = useState(null);
   const [editingRoleFor, setEditingRoleFor] = useState(null); // { itemId, role: "assignee" | "manager" }
   const [newStepText, setNewStepText] = useState("");
+  const [newStepCategory, setNewStepCategory] = useState("");
   const [addingStep, setAddingStep] = useState(false);
   const isCentral = tier === "central";
 
@@ -5183,7 +5197,7 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
 
   const expandRun = (runId) => {
     setExpandedRunId(expandedRunId === runId ? null : runId);
-    setAddingStep(false); setNewStepText(""); setEditingRoleFor(null);
+    setAddingStep(false); setNewStepText(""); setNewStepCategory(""); setEditingRoleFor(null);
   };
 
   return (
@@ -5263,59 +5277,89 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
                   <span className="text-[10.5px] text-[#6B6980] shrink-0">{done}/{total}</span>
                 </div>
               </button>
-              {isExpanded && (
-                <div className="mt-3 pt-3 border-t border-[#E3E1F0] space-y-1.5">
-                  {items.map((item) => {
-                    const roleField = (role, label, value, onSet) => {
-                      const isEditingThis = editingRoleFor?.itemId === item.id && editingRoleFor?.role === role;
-                      return isEditingThis ? (
-                        <select autoFocus value={value || ""} onChange={(e) => { onSet(item.id, e.target.value); setEditingRoleFor(null); }}
-                          onBlur={() => setEditingRoleFor(null)}
-                          className="text-[10px] bg-[#F7F6FB] border border-[#D8D5EC] rounded px-1 py-0.5 outline-none">
-                          <option value="">None</option>
-                          {runCampusStaff.map((s) => <option key={s.id} value={s.name}>{s.name}</option>)}
-                        </select>
-                      ) : (
-                        <button onClick={() => setEditingRoleFor({ itemId: item.id, role })} className="text-[10px] text-[#8B889C] hover:text-[#2B4C7E]">
-                          {value ? `${label}: ${value}` : `Set ${label.toLowerCase()}…`}
-                        </button>
-                      );
-                    };
-                    return (
-                      <div key={item.id} className="flex items-start justify-between gap-2 text-[12px]">
-                        <label className="flex items-start gap-2 cursor-pointer min-w-0">
-                          <input type="checkbox" checked={item.done} onChange={(e) => onToggleRunItem(item.id, e.target.checked)} className="mt-0.5 shrink-0" />
-                          <span className="min-w-0">
-                            <span className={item.done ? "line-through text-[#8B889C]" : ""}>{item.text}</span>
-                            <span className="flex flex-wrap gap-x-3 gap-y-0.5 mt-0.5">
-                              {roleField("manager", "Managed by", item.managedBy, onSetRunItemManager)}
-                              {roleField("assignee", "Assigned to", item.assignedTo, onSetRunItemAssignee)}
+              {isExpanded && (() => {
+                // Group by category, preserving first-seen order; uncategorized items fall
+                // into a group only labeled when at least one real category exists alongside it.
+                const groups = [];
+                items.forEach((item) => {
+                  const key = item.category || "";
+                  let group = groups.find((g) => g.key === key);
+                  if (!group) { group = { key, items: [] }; groups.push(group); }
+                  group.items.push(item);
+                });
+                const showGroupLabels = groups.length > 1 || (groups.length === 1 && groups[0].key);
+                const today = TODAY_STR;
+
+                const renderItem = (item) => {
+                  const roleField = (role, label, value, onSet) => {
+                    const isEditingThis = editingRoleFor?.itemId === item.id && editingRoleFor?.role === role;
+                    return isEditingThis ? (
+                      <select autoFocus value={value || ""} onChange={(e) => { onSet(item.id, e.target.value); setEditingRoleFor(null); }}
+                        onBlur={() => setEditingRoleFor(null)}
+                        className="text-[10px] bg-[#F7F6FB] border border-[#D8D5EC] rounded px-1 py-0.5 outline-none">
+                        <option value="">None</option>
+                        {runCampusStaff.map((s) => <option key={s.id} value={s.name}>{s.name}</option>)}
+                      </select>
+                    ) : (
+                      <button onClick={() => setEditingRoleFor({ itemId: item.id, role })} className="text-[10px] text-[#8B889C] hover:text-[#2B4C7E]">
+                        {value ? `${label}: ${value}` : `Set ${label.toLowerCase()}…`}
+                      </button>
+                    );
+                  };
+                  const overdue = item.dueDate && !item.done && item.dueDate < today;
+                  return (
+                    <div key={item.id} className="flex items-start justify-between gap-2 text-[12px]">
+                      <label className="flex items-start gap-2 cursor-pointer min-w-0">
+                        <input type="checkbox" checked={item.done} onChange={(e) => onToggleRunItem(item.id, e.target.checked)} className="mt-0.5 shrink-0" />
+                        <span className="min-w-0">
+                          <span className={item.done ? "line-through text-[#8B889C]" : ""}>{item.text}</span>
+                          <span className="flex flex-wrap items-center gap-x-3 gap-y-0.5 mt-0.5">
+                            {roleField("manager", "Managed by", item.managedBy, onSetRunItemManager)}
+                            {roleField("assignee", "Assigned to", item.assignedTo, onSetRunItemAssignee)}
+                            <span className="flex items-center gap-1">
+                              <span className="text-[10px]" style={{ color: overdue ? "#C15B5B" : "#8B889C" }}>Due:</span>
+                              <input type="date" value={item.dueDate || ""} onChange={(e) => onSetRunItemDueDate(item.id, e.target.value)}
+                                className="text-[10px] bg-transparent border-0 outline-none p-0" style={{ color: overdue ? "#C15B5B" : "#8B889C", colorScheme: "light" }} />
                             </span>
                           </span>
-                        </label>
-                        <button onClick={() => onRemoveRunItem(item.id)} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><X size={13} /></button>
-                      </div>
-                    );
-                  })}
-
-                  {addingStep ? (
-                    <div className="flex gap-1.5 items-center pt-1">
-                      <input autoFocus value={newStepText} onChange={(e) => setNewStepText(e.target.value)} placeholder="New step for this run…"
-                        onKeyDown={(e) => { if (e.key === "Enter" && newStepText.trim()) { onAddRunItem(run.id, newStepText.trim()); setNewStepText(""); } }}
-                        className="flex-1 bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11.5px] outline-none" />
-                      <button onClick={() => { if (newStepText.trim()) { onAddRunItem(run.id, newStepText.trim()); setNewStepText(""); } }}
-                        className="text-[10.5px] rounded-md px-2 py-1 font-medium" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Add</button>
-                      <button onClick={() => { setAddingStep(false); setNewStepText(""); }} className="text-[10.5px] text-[#6B6980]">Done</button>
+                        </span>
+                      </label>
+                      <button onClick={() => onRemoveRunItem(item.id)} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><X size={13} /></button>
                     </div>
-                  ) : (
-                    <button onClick={() => setAddingStep(true)} className="flex items-center gap-1 text-[10.5px] mt-1" style={{ color: "#2B4C7E" }}>
-                      <Plus size={11} /> Add a location-specific step
-                    </button>
-                  )}
+                  );
+                };
 
-                  <button onClick={() => onDeleteRun(run.id)} className="block text-[10.5px] text-[#8B889C] hover:text-[#C15B5B] mt-2">Delete this run</button>
-                </div>
-              )}
+                return (
+                  <div className="mt-3 pt-3 border-t border-[#E3E1F0] space-y-3">
+                    {groups.map((group) => (
+                      <div key={group.key || "_uncategorized"} className="space-y-1.5">
+                        {showGroupLabels && (
+                          <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C]">{group.key || "General"}</div>
+                        )}
+                        {group.items.map(renderItem)}
+                      </div>
+                    ))}
+
+                    {addingStep ? (
+                      <div className="flex gap-1.5 items-center flex-wrap pt-1">
+                        <input autoFocus value={newStepText} onChange={(e) => setNewStepText(e.target.value)} placeholder="New step for this run…"
+                          className="flex-1 min-w-[140px] bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11.5px] outline-none" />
+                        <input value={newStepCategory} onChange={(e) => setNewStepCategory(e.target.value)} placeholder="Category (optional)"
+                          className="w-[130px] bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11.5px] outline-none" />
+                        <button onClick={() => { if (newStepText.trim()) { onAddRunItem(run.id, newStepText.trim(), newStepCategory.trim()); setNewStepText(""); setNewStepCategory(""); } }}
+                          className="text-[10.5px] rounded-md px-2 py-1 font-medium" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Add</button>
+                        <button onClick={() => { setAddingStep(false); setNewStepText(""); setNewStepCategory(""); }} className="text-[10.5px] text-[#6B6980]">Done</button>
+                      </div>
+                    ) : (
+                      <button onClick={() => setAddingStep(true)} className="flex items-center gap-1 text-[10.5px] mt-1" style={{ color: "#2B4C7E" }}>
+                        <Plus size={11} /> Add a location-specific step
+                      </button>
+                    )}
+
+                    <button onClick={() => onDeleteRun(run.id)} className="block text-[10.5px] text-[#8B889C] hover:text-[#C15B5B] mt-2">Delete this run</button>
+                  </div>
+                );
+              })()}
             </div>
           );
         })}
@@ -5349,26 +5393,31 @@ function PlaybookTemplateModal({ template, existingItems, onClose, onSave }) {
   const [name, setName] = useState(template?.name || "");
   const [type, setType] = useState(template?.type || "onboarding");
   const [items, setItems] = useState(
-    existingItems && existingItems.length > 0 ? existingItems.map((i) => ({ id: i.id, text: i.text })) : [{ text: "" }]
+    existingItems && existingItems.length > 0
+      ? existingItems.map((i) => ({ id: i.id, text: i.text, category: i.category || "", managedBy: i.managedBy || "", dueOffsetDays: i.dueOffsetDays ?? "" }))
+      : [{ text: "", category: "", managedBy: "", dueOffsetDays: "" }]
   );
 
-  const updateItem = (i, val) => setItems((prev) => prev.map((it, idx) => idx === i ? { ...it, text: val } : it));
-  const addItem = () => setItems((prev) => [...prev, { text: "" }]);
+  const updateItem = (i, field, val) => setItems((prev) => prev.map((it, idx) => idx === i ? { ...it, [field]: val } : it));
+  const addItem = () => setItems((prev) => [...prev, { text: "", category: "", managedBy: "", dueOffsetDays: "" }]);
   const removeItem = (i) => setItems((prev) => prev.filter((_, idx) => idx !== i));
 
   const submit = (e) => {
     e.preventDefault();
-    const clean = items.map((it) => ({ id: it.id, text: it.text.trim() })).filter((it) => it.text);
+    const clean = items
+      .map((it) => ({ id: it.id, text: it.text.trim(), category: it.category.trim(), managedBy: it.managedBy.trim(), dueOffsetDays: it.dueOffsetDays === "" ? null : Number(it.dueOffsetDays) }))
+      .filter((it) => it.text);
     if (!name.trim() || clean.length === 0) return;
     onSave(name.trim(), type, clean);
   };
 
   const labelClass = "text-[11px] font-medium text-[#6B6980] mb-1 block";
   const inputClass = "w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#2B4C7E]";
+  const miniInputClass = "w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11px] outline-none focus:border-[#2B4C7E]";
 
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
-      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[480px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[560px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-[15px] font-semibold">{isEditing ? "Edit Playbook Template" : "New Playbook Template"}</h2>
           <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
@@ -5389,14 +5438,30 @@ function PlaybookTemplateModal({ template, existingItems, onClose, onSave }) {
           </div>
           <div>
             <label className={labelClass}>Checklist items</label>
-            <div className="space-y-1.5">
+            <div className="space-y-2">
               {items.map((it, i) => (
-                <div key={it.id || i} className="flex gap-1.5">
-                  <input value={it.text} onChange={(e) => updateItem(i, e.target.value)} placeholder={`Item ${i + 1}`}
-                    className="flex-1 bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[12.5px] outline-none focus:border-[#2B4C7E]" />
-                  {items.length > 1 && (
-                    <button type="button" onClick={() => removeItem(i)} className="text-[#8B889C] hover:text-[#C15B5B] px-1"><Trash2 size={13} /></button>
-                  )}
+                <div key={it.id || i} className="bg-[#F7F6FB] border border-[#E3E1F0] rounded-md p-2">
+                  <div className="flex gap-1.5 mb-1.5">
+                    <input value={it.text} onChange={(e) => updateItem(i, "text", e.target.value)} placeholder={`Item ${i + 1}`}
+                      className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[12.5px] outline-none focus:border-[#2B4C7E]" />
+                    {items.length > 1 && (
+                      <button type="button" onClick={() => removeItem(i)} className="text-[#8B889C] hover:text-[#C15B5B] px-1"><Trash2 size={13} /></button>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <div>
+                      <label className="text-[9.5px] text-[#8B889C] block mb-0.5">Category</label>
+                      <input value={it.category} onChange={(e) => updateItem(i, "category", e.target.value)} placeholder="e.g. HR" className={miniInputClass} />
+                    </div>
+                    <div>
+                      <label className="text-[9.5px] text-[#8B889C] block mb-0.5">Managed by (role)</label>
+                      <input value={it.managedBy} onChange={(e) => updateItem(i, "managedBy", e.target.value)} placeholder="e.g. Campus OD" className={miniInputClass} />
+                    </div>
+                    <div>
+                      <label className="text-[9.5px] text-[#8B889C] block mb-0.5">Due within (days)</label>
+                      <input type="number" min={0} value={it.dueOffsetDays} onChange={(e) => updateItem(i, "dueOffsetDays", e.target.value)} placeholder="—" className={miniInputClass} />
+                    </div>
+                  </div>
                 </div>
               ))}
             </div>

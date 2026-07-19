@@ -654,6 +654,10 @@ video {
   margin-top: -0.75rem;
 }
 
+.mb-0\.5 {
+  margin-bottom: 0.125rem;
+}
+
 .mb-1 {
   margin-bottom: 0.25rem;
 }
@@ -884,6 +888,10 @@ video {
 
 .w-9 {
   width: 2.25rem;
+}
+
+.w-\[130px\] {
+  width: 130px;
 }
 
 .w-\[188px\] {
@@ -1252,6 +1260,10 @@ video {
 
 .border {
   border-width: 1px;
+}
+
+.border-0 {
+  border-width: 0px;
 }
 
 .border-b {
