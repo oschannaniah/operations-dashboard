@@ -5177,6 +5177,38 @@ function LocationScorecardsPanel({ campuses, projects, staffByCampus, marginScor
 
 const PLAYBOOK_TYPE_LABEL = { onboarding: "Onboarding", project: "Project", standing: "Standing / Recurring" };
 const PLAYBOOK_TYPE_COLOR = { onboarding: "#2B4C7E", project: "#B8862F", standing: "#5E9E8A" };
+const PLAYBOOK_CATEGORY_OPTIONS = ["Central", "Campus Operations", "Campus Ministry", "Campus Programming", "Campus Next Gen"];
+const CENTRAL_MANAGER_ROLES = ["Central Operations Director", "Central Finance Director", "Central HR Director"];
+
+// Orders a campus's staff the way its org chart reads — from whoever's at the top of the
+// reports-to chain (typically the Campus Pastor) down through their reports, depth-first —
+// instead of an arbitrary or alphabetical list. Built from staff.reportsTo (already populated
+// by the Slides org-chart import), not a new hierarchy concept. Anyone whose reportsTo doesn't
+// resolve to someone else on this same campus (empty, or pointing outside it) is treated as a
+// root; a cycle-guard keeps a bad reportsTo loop from ever infinite-looping this.
+function buildOrgHierarchy(staffList) {
+  const byName = new Map(staffList.map((s) => [s.name, s]));
+  const childrenOf = new Map();
+  staffList.forEach((s) => {
+    const parentName = s.reportsTo && byName.has(s.reportsTo) ? s.reportsTo : null;
+    if (!childrenOf.has(parentName)) childrenOf.set(parentName, []);
+    childrenOf.get(parentName).push(s);
+  });
+  const ordered = [];
+  const visited = new Set();
+  const visit = (parentName, depth) => {
+    const kids = (childrenOf.get(parentName) || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+    kids.forEach((s) => {
+      if (visited.has(s.id)) return;
+      visited.add(s.id);
+      ordered.push({ ...s, depth });
+      visit(s.name, depth + 1);
+    });
+  };
+  visit(null, 0);
+  staffList.forEach((s) => { if (!visited.has(s.id)) { visited.add(s.id); ordered.push({ ...s, depth: 0 }); } });
+  return ordered;
+}
 
 function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, campusLabel, tier, templates, templateItems, runs, runItems, onCreateTemplate, onUpdateTemplate, onDeleteTemplate, onStartRun, onToggleRunItem, onDeleteRun, onAddRunItem, onRemoveRunItem, onSetRunItemAssignee, onSetRunItemManager, onSetRunItemDueDate }) {
   const [showNewTemplate, setShowNewTemplate] = useState(false);
@@ -5289,16 +5321,24 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
                 });
                 const showGroupLabels = groups.length > 1 || (groups.length === 1 && groups[0].key);
                 const today = TODAY_STR;
+                const orderedRunStaff = buildOrgHierarchy(runCampusStaff);
 
                 const renderItem = (item) => {
-                  const roleField = (role, label, value, onSet) => {
+                  const roleField = (role, label, value, onSet, includeCentralRoles) => {
                     const isEditingThis = editingRoleFor?.itemId === item.id && editingRoleFor?.role === role;
                     return isEditingThis ? (
                       <select autoFocus value={value || ""} onChange={(e) => { onSet(item.id, e.target.value); setEditingRoleFor(null); }}
                         onBlur={() => setEditingRoleFor(null)}
                         className="text-[10px] bg-[#F7F6FB] border border-[#D8D5EC] rounded px-1 py-0.5 outline-none">
                         <option value="">None</option>
-                        {runCampusStaff.map((s) => <option key={s.id} value={s.name}>{s.name}</option>)}
+                        {includeCentralRoles && (
+                          <optgroup label="Central">
+                            {CENTRAL_MANAGER_ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+                          </optgroup>
+                        )}
+                        <optgroup label={campusName(run.campusId)}>
+                          {orderedRunStaff.map((s) => <option key={s.id} value={s.name}>{"— ".repeat(s.depth)}{s.name}</option>)}
+                        </optgroup>
                       </select>
                     ) : (
                       <button onClick={() => setEditingRoleFor({ itemId: item.id, role })} className="text-[10px] text-[#8B889C] hover:text-[#2B4C7E]">
@@ -5314,8 +5354,8 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
                         <span className="min-w-0">
                           <span className={item.done ? "line-through text-[#8B889C]" : ""}>{item.text}</span>
                           <span className="flex flex-wrap items-center gap-x-3 gap-y-0.5 mt-0.5">
-                            {roleField("manager", "Managed by", item.managedBy, onSetRunItemManager)}
-                            {roleField("assignee", "Assigned to", item.assignedTo, onSetRunItemAssignee)}
+                            {roleField("manager", "Managed by", item.managedBy, onSetRunItemManager, true)}
+                            {roleField("assignee", "Assigned to", item.assignedTo, onSetRunItemAssignee, false)}
                             <span className="flex items-center gap-1">
                               <span className="text-[10px]" style={{ color: overdue ? "#C15B5B" : "#8B889C" }}>Due:</span>
                               <input type="date" value={item.dueDate || ""} onChange={(e) => onSetRunItemDueDate(item.id, e.target.value)}
@@ -5344,8 +5384,11 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
                       <div className="flex gap-1.5 items-center flex-wrap pt-1">
                         <input autoFocus value={newStepText} onChange={(e) => setNewStepText(e.target.value)} placeholder="New step for this run…"
                           className="flex-1 min-w-[140px] bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11.5px] outline-none" />
-                        <input value={newStepCategory} onChange={(e) => setNewStepCategory(e.target.value)} placeholder="Category (optional)"
-                          className="w-[130px] bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11.5px] outline-none" />
+                        <select value={newStepCategory} onChange={(e) => setNewStepCategory(e.target.value)}
+                          className="w-[150px] bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11.5px] outline-none">
+                          <option value="">No category</option>
+                          {PLAYBOOK_CATEGORY_OPTIONS.map((c) => <option key={c} value={c}>{c}</option>)}
+                        </select>
                         <button onClick={() => { if (newStepText.trim()) { onAddRunItem(run.id, newStepText.trim(), newStepCategory.trim()); setNewStepText(""); setNewStepCategory(""); } }}
                           className="text-[10.5px] rounded-md px-2 py-1 font-medium" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Add</button>
                         <button onClick={() => { setAddingStep(false); setNewStepText(""); setNewStepCategory(""); }} className="text-[10.5px] text-[#6B6980]">Done</button>
@@ -5367,10 +5410,11 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
       </div>
 
       {showNewTemplate && (
-        <PlaybookTemplateModal onClose={() => setShowNewTemplate(false)} onSave={(name, type, items) => { onCreateTemplate(name, type, items); setShowNewTemplate(false); }} />
+        <PlaybookTemplateModal campuses={campuses} staffByCampus={staffByCampus}
+          onClose={() => setShowNewTemplate(false)} onSave={(name, type, items) => { onCreateTemplate(name, type, items); setShowNewTemplate(false); }} />
       )}
       {editingTemplate && (
-        <PlaybookTemplateModal
+        <PlaybookTemplateModal campuses={campuses} staffByCampus={staffByCampus}
           template={editingTemplate} existingItems={templateItems.filter((i) => i.templateId === editingTemplate.id).sort((a, b) => a.position - b.position)}
           onClose={() => setEditingTemplateId(null)}
           onSave={(name, type, items) => { onUpdateTemplate(editingTemplate.id, name, type, items); setEditingTemplateId(null); }} />
@@ -5387,7 +5431,7 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
 // Handles both create (no `template` prop) and edit (template + existingItems passed in).
 // Items carry their real id when editing so the save handler can diff updates/inserts/deletes
 // instead of recreating the whole list — see updatePlaybookTemplate.
-function PlaybookTemplateModal({ template, existingItems, onClose, onSave }) {
+function PlaybookTemplateModal({ template, existingItems, campuses, staffByCampus, onClose, onSave }) {
   useLockBodyScroll();
   const isEditing = !!template;
   const [name, setName] = useState(template?.name || "");
@@ -5448,19 +5492,36 @@ function PlaybookTemplateModal({ template, existingItems, onClose, onSave }) {
                       <button type="button" onClick={() => removeItem(i)} className="text-[#8B889C] hover:text-[#C15B5B] px-1"><Trash2 size={13} /></button>
                     )}
                   </div>
-                  <div className="grid grid-cols-3 gap-1.5">
+                  <div className="grid grid-cols-2 gap-1.5 mb-1.5">
                     <div>
-                      <label className="text-[9.5px] text-[#8B889C] block mb-0.5">Category</label>
-                      <input value={it.category} onChange={(e) => updateItem(i, "category", e.target.value)} placeholder="e.g. HR" className={miniInputClass} />
-                    </div>
-                    <div>
-                      <label className="text-[9.5px] text-[#8B889C] block mb-0.5">Managed by (role)</label>
-                      <input value={it.managedBy} onChange={(e) => updateItem(i, "managedBy", e.target.value)} placeholder="e.g. Campus OD" className={miniInputClass} />
+                      <label className="text-[9.5px] text-[#8B889C] block mb-0.5">Ministry Area</label>
+                      <select value={it.category} onChange={(e) => updateItem(i, "category", e.target.value)} className={miniInputClass}>
+                        <option value="">None</option>
+                        {PLAYBOOK_CATEGORY_OPTIONS.map((c) => <option key={c} value={c}>{c}</option>)}
+                      </select>
                     </div>
                     <div>
                       <label className="text-[9.5px] text-[#8B889C] block mb-0.5">Due within (days)</label>
                       <input type="number" min={0} value={it.dueOffsetDays} onChange={(e) => updateItem(i, "dueOffsetDays", e.target.value)} placeholder="—" className={miniInputClass} />
                     </div>
+                  </div>
+                  <div>
+                    <label className="text-[9.5px] text-[#8B889C] block mb-0.5">Managed by</label>
+                    <select value={it.managedBy} onChange={(e) => updateItem(i, "managedBy", e.target.value)} className={miniInputClass}>
+                      <option value="">None</option>
+                      <optgroup label="Central">
+                        {CENTRAL_MANAGER_ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+                      </optgroup>
+                      {campuses.map((c) => {
+                        const hierarchy = buildOrgHierarchy(staffByCampus[c.id] || []);
+                        if (hierarchy.length === 0) return null;
+                        return (
+                          <optgroup key={c.id} label={c.name}>
+                            {hierarchy.map((s) => <option key={s.id} value={s.name}>{"— ".repeat(s.depth)}{s.name}</option>)}
+                          </optgroup>
+                        );
+                      })}
+                    </select>
                   </div>
                 </div>
               ))}
