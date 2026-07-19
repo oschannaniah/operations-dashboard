@@ -131,7 +131,7 @@ const FIELD_MAPS = {
   playbook_templates: { organizationId: "organization_id", createdBy: "created_by", createdAt: "created_at" },
   playbook_template_items: { templateId: "template_id" },
   playbook_runs: { organizationId: "organization_id", campusId: "campus_id", templateId: "template_id", templateName: "template_name", targetStaffId: "target_staff_id", targetProjectId: "target_project_id", startedBy: "started_by", startedAt: "started_at" },
-  playbook_run_items: { runId: "run_id", doneBy: "done_by", doneAt: "done_at", assignedTo: "assigned_to" },
+  playbook_run_items: { runId: "run_id", doneBy: "done_by", doneAt: "done_at", assignedTo: "assigned_to", managedBy: "managed_by" },
 };
 
 function toSnakeRow(table, obj) {
@@ -1865,11 +1865,11 @@ export default function OpsDashboard() {
   // already exist and get updated in place (position/text), items without one are new and get
   // created, anything dropped from the list gets deleted. Editing a template never touches runs
   // already started from it — those hold their own snapshot copy (see 0022_playbooks.sql).
-  const updatePlaybookTemplate = async (templateId, name, itemsList) => {
+  const updatePlaybookTemplate = async (templateId, name, type, itemsList) => {
     setSyncing(true);
     try {
-      await apiUpdate("PlaybookTemplates", templateId, { name });
-      setPlaybookTemplates((prev) => prev.map((t) => t.id === templateId ? { ...t, name } : t));
+      await apiUpdate("PlaybookTemplates", templateId, { name, type });
+      setPlaybookTemplates((prev) => prev.map((t) => t.id === templateId ? { ...t, name, type } : t));
 
       const existingItems = playbookTemplateItems.filter((i) => i.templateId === templateId);
       const keepIds = new Set(itemsList.filter((i) => i.id).map((i) => i.id));
@@ -1911,9 +1911,16 @@ export default function OpsDashboard() {
     syncToBackend(apiDelete("PlaybookRunItems", itemId));
   };
 
+  // assignedTo = who's scheduled to actually do the step; managedBy = who's overseeing that it
+  // gets done — often two different people, tracked independently.
   const setPlaybookRunItemAssignee = (itemId, assignedTo) => {
     setPlaybookRunItems((prev) => prev.map((i) => i.id === itemId ? { ...i, assignedTo: assignedTo || null } : i));
     syncToBackend(apiUpdate("PlaybookRunItems", itemId, { assignedTo: assignedTo || null }));
+  };
+
+  const setPlaybookRunItemManager = (itemId, managedBy) => {
+    setPlaybookRunItems((prev) => prev.map((i) => i.id === itemId ? { ...i, managedBy: managedBy || null } : i));
+    syncToBackend(apiUpdate("PlaybookRunItems", itemId, { managedBy: managedBy || null }));
   };
 
   // Persists a campus's Slides org-chart link to the CampusConfig sheet (id = campusId, so
@@ -2348,7 +2355,8 @@ export default function OpsDashboard() {
               runs={playbookRuns} runItems={playbookRunItems}
               onCreateTemplate={createPlaybookTemplate} onUpdateTemplate={updatePlaybookTemplate} onDeleteTemplate={deletePlaybookTemplate}
               onStartRun={startPlaybookRun} onToggleRunItem={togglePlaybookRunItem} onDeleteRun={deletePlaybookRun}
-              onAddRunItem={addPlaybookRunItem} onRemoveRunItem={removePlaybookRunItem} onSetRunItemAssignee={setPlaybookRunItemAssignee}
+              onAddRunItem={addPlaybookRunItem} onRemoveRunItem={removePlaybookRunItem}
+              onSetRunItemAssignee={setPlaybookRunItemAssignee} onSetRunItemManager={setPlaybookRunItemManager}
             />
           )}
 
@@ -5157,12 +5165,12 @@ function LocationScorecardsPanel({ campuses, projects, staffByCampus, marginScor
 const PLAYBOOK_TYPE_LABEL = { onboarding: "Onboarding", project: "Project", standing: "Standing / Recurring" };
 const PLAYBOOK_TYPE_COLOR = { onboarding: "#2B4C7E", project: "#B8862F", standing: "#5E9E8A" };
 
-function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, campusLabel, tier, templates, templateItems, runs, runItems, onCreateTemplate, onUpdateTemplate, onDeleteTemplate, onStartRun, onToggleRunItem, onDeleteRun, onAddRunItem, onRemoveRunItem, onSetRunItemAssignee }) {
+function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, campusLabel, tier, templates, templateItems, runs, runItems, onCreateTemplate, onUpdateTemplate, onDeleteTemplate, onStartRun, onToggleRunItem, onDeleteRun, onAddRunItem, onRemoveRunItem, onSetRunItemAssignee, onSetRunItemManager }) {
   const [showNewTemplate, setShowNewTemplate] = useState(false);
   const [editingTemplateId, setEditingTemplateId] = useState(null);
   const [showStartRun, setShowStartRun] = useState(false);
   const [expandedRunId, setExpandedRunId] = useState(null);
-  const [editingAssigneeItemId, setEditingAssigneeItemId] = useState(null);
+  const [editingRoleFor, setEditingRoleFor] = useState(null); // { itemId, role: "assignee" | "manager" }
   const [newStepText, setNewStepText] = useState("");
   const [addingStep, setAddingStep] = useState(false);
   const isCentral = tier === "central";
@@ -5175,7 +5183,7 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
 
   const expandRun = (runId) => {
     setExpandedRunId(expandedRunId === runId ? null : runId);
-    setAddingStep(false); setNewStepText(""); setEditingAssigneeItemId(null);
+    setAddingStep(false); setNewStepText(""); setEditingRoleFor(null);
   };
 
   return (
@@ -5257,31 +5265,38 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
               </button>
               {isExpanded && (
                 <div className="mt-3 pt-3 border-t border-[#E3E1F0] space-y-1.5">
-                  {items.map((item) => (
-                    <div key={item.id} className="flex items-start justify-between gap-2 text-[12px]">
-                      <label className="flex items-start gap-2 cursor-pointer min-w-0">
-                        <input type="checkbox" checked={item.done} onChange={(e) => onToggleRunItem(item.id, e.target.checked)} className="mt-0.5 shrink-0" />
-                        <span className="min-w-0">
-                          <span className={item.done ? "line-through text-[#8B889C]" : ""}>{item.text}</span>
-                          <span className="block">
-                            {editingAssigneeItemId === item.id ? (
-                              <select autoFocus value={item.assignedTo || ""} onChange={(e) => { onSetRunItemAssignee(item.id, e.target.value); setEditingAssigneeItemId(null); }}
-                                onBlur={() => setEditingAssigneeItemId(null)}
-                                className="text-[10px] bg-[#F7F6FB] border border-[#D8D5EC] rounded px-1 py-0.5 outline-none mt-0.5">
-                                <option value="">Unassigned</option>
-                                {runCampusStaff.map((s) => <option key={s.id} value={s.name}>{s.name}</option>)}
-                              </select>
-                            ) : (
-                              <button onClick={() => setEditingAssigneeItemId(item.id)} className="text-[10px] text-[#8B889C] hover:text-[#2B4C7E]">
-                                {item.assignedTo ? `Responsible: ${item.assignedTo}` : "Assign responsible person…"}
-                              </button>
-                            )}
+                  {items.map((item) => {
+                    const roleField = (role, label, value, onSet) => {
+                      const isEditingThis = editingRoleFor?.itemId === item.id && editingRoleFor?.role === role;
+                      return isEditingThis ? (
+                        <select autoFocus value={value || ""} onChange={(e) => { onSet(item.id, e.target.value); setEditingRoleFor(null); }}
+                          onBlur={() => setEditingRoleFor(null)}
+                          className="text-[10px] bg-[#F7F6FB] border border-[#D8D5EC] rounded px-1 py-0.5 outline-none">
+                          <option value="">None</option>
+                          {runCampusStaff.map((s) => <option key={s.id} value={s.name}>{s.name}</option>)}
+                        </select>
+                      ) : (
+                        <button onClick={() => setEditingRoleFor({ itemId: item.id, role })} className="text-[10px] text-[#8B889C] hover:text-[#2B4C7E]">
+                          {value ? `${label}: ${value}` : `Set ${label.toLowerCase()}…`}
+                        </button>
+                      );
+                    };
+                    return (
+                      <div key={item.id} className="flex items-start justify-between gap-2 text-[12px]">
+                        <label className="flex items-start gap-2 cursor-pointer min-w-0">
+                          <input type="checkbox" checked={item.done} onChange={(e) => onToggleRunItem(item.id, e.target.checked)} className="mt-0.5 shrink-0" />
+                          <span className="min-w-0">
+                            <span className={item.done ? "line-through text-[#8B889C]" : ""}>{item.text}</span>
+                            <span className="flex flex-wrap gap-x-3 gap-y-0.5 mt-0.5">
+                              {roleField("manager", "Managed by", item.managedBy, onSetRunItemManager)}
+                              {roleField("assignee", "Assigned to", item.assignedTo, onSetRunItemAssignee)}
+                            </span>
                           </span>
-                        </span>
-                      </label>
-                      <button onClick={() => onRemoveRunItem(item.id)} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><X size={13} /></button>
-                    </div>
-                  ))}
+                        </label>
+                        <button onClick={() => onRemoveRunItem(item.id)} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><X size={13} /></button>
+                      </div>
+                    );
+                  })}
 
                   {addingStep ? (
                     <div className="flex gap-1.5 items-center pt-1">
@@ -5314,7 +5329,7 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
         <PlaybookTemplateModal
           template={editingTemplate} existingItems={templateItems.filter((i) => i.templateId === editingTemplate.id).sort((a, b) => a.position - b.position)}
           onClose={() => setEditingTemplateId(null)}
-          onSave={(name, type, items) => { onUpdateTemplate(editingTemplate.id, name, items); setEditingTemplateId(null); }} />
+          onSave={(name, type, items) => { onUpdateTemplate(editingTemplate.id, name, type, items); setEditingTemplateId(null); }} />
       )}
       {showStartRun && (
         <StartPlaybookRunModal templates={templates} campuses={campuses} staffByCampus={staffByCampus} projects={projects}
@@ -5364,12 +5379,13 @@ function PlaybookTemplateModal({ template, existingItems, onClose, onSave }) {
             <input required value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. New Hire Onboarding" className={inputClass} />
           </div>
           <div>
-            <label className={labelClass}>Applies to{isEditing ? " (locked after creation)" : ""}</label>
-            <select value={type} disabled={isEditing} onChange={(e) => setType(e.target.value)} className={`${inputClass} disabled:opacity-60`}>
+            <label className={labelClass}>Applies to</label>
+            <select value={type} onChange={(e) => setType(e.target.value)} className={inputClass}>
               <option value="onboarding">A person (onboarding)</option>
               <option value="project">A project</option>
               <option value="standing">Standing / recurring (no specific target)</option>
             </select>
+            {isEditing && <p className="text-[10.5px] text-[#8B889C] mt-1">Changing this only affects runs started after you save — it won't touch runs already in progress.</p>}
           </div>
           <div>
             <label className={labelClass}>Checklist items</label>
