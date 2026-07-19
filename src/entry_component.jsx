@@ -4,7 +4,7 @@ import {
   ChevronLeft, ChevronRight, Plus, Circle, CheckCircle2, AlertTriangle,
   Link2, Building2, ShieldCheck, X, StickyNote, Activity as ActivityIcon,
   MessageSquare, Mic, Image as ImageIcon, Trash2, Clock, Bell, Camera, FileText,
-  MoreHorizontal
+  MoreHorizontal, Settings
 } from "lucide-react";
 import { Document, Packer, Paragraph, Table, TableRow, TableCell, HeadingLevel, TextRun, WidthType } from "docx";
 import jsPDF from "jspdf";
@@ -905,8 +905,6 @@ export default function OpsDashboard() {
   const [teamMembers, setTeamMembers] = useState([]);
   const [flagHistory, setFlagHistory] = useState([]);
   const [checkinLog, setCheckinLog] = useState([]);
-  const [showSeasons, setShowSeasons] = useState(false);
-  const [showScorecards, setShowScorecards] = useState(false);
   const [pendingMarginPulse, setPendingMarginPulse] = useState(null);
   const [campuses, setCampuses] = useState([]);
   const [users, setUsers] = useState([]);
@@ -2012,6 +2010,7 @@ export default function OpsDashboard() {
     { id: "activity", label: "Activity", icon: ActivityIcon, section: "Work" },
     { id: "staff", label: "Staff & Team", icon: Users, section: "People" },
     { id: "events", label: "Cross-Campus Events", icon: Link2, section: "People" },
+    ...(auth?.user?.tier === "central" ? [{ id: "centralmgmt", label: "Central Management", icon: Settings, section: "Admin" }] : []),
     ...(auth?.user?.tier === "central" ? [{ id: "accounts", label: "User Management", icon: ShieldCheck, section: "Admin" }] : []),
     { id: "reports", label: "Reports", icon: FileText, section: "Admin" },
   ];
@@ -2130,11 +2129,17 @@ export default function OpsDashboard() {
           {tab === "overview" && role === "central" && !selectedCampus && (
             <CentralOverview campuses={campuses} orgBudgetUsed={orgBudgetUsed} orgBudgetTotal={orgBudgetTotal}
               projects={displayProjects} staffByCampus={staffByCampus} onSelectCampus={(id) => { setSelectedCampus(id); setTab("overview"); }}
+              onOpenProject={setOpenProject}
+              detail={detail} setDetail={setDetail} onGoTab={setTab} />
+          )}
+
+          {tab === "centralmgmt" && auth.user.tier === "central" && (
+            <CentralManagementPanel
+              projects={displayProjects} campuses={campuses} staffByCampus={staffByCampus} marginScores={marginScores}
               centralThreads={centralThreads} onAddTag={addCentralTag} onRemoveTag={removeCentralTag} onAddMessage={addCentralMessage}
-              currentViewerName={currentViewerName} onOpenProject={setOpenProject}
-              detail={detail} setDetail={setDetail} onGoTab={setTab}
-              seasons={seasons} onOpenSeasons={() => setShowSeasons(true)}
-              marginScores={marginScores} onOpenScorecards={() => setShowScorecards(true)} />
+              currentViewerName={currentViewerName}
+              seasons={seasons} onCreateSeason={createSeason}
+              onOpenProject={setOpenProject} onSelectCampus={(id) => { setSelectedCampus(id); setTab("overview"); }} />
           )}
 
           {tab === "overview" && (role !== "central" || selectedCampus) && activeCampus && (
@@ -2235,18 +2240,6 @@ export default function OpsDashboard() {
       {pendingMarginPulse && (
         <MarginPulseCheckPrompt pulse={pendingMarginPulse}
           onSubmit={(answers) => respondToMarginPulse(pendingMarginPulse.id, answers)} />
-      )}
-
-      {showSeasons && (
-        <SeasonsModal seasons={seasons} projects={displayProjects} campuses={campuses}
-          onCreateSeason={createSeason} onClose={() => setShowSeasons(false)}
-          onOpenProject={(id) => { setShowSeasons(false); setOpenProject(id); }} />
-      )}
-
-      {showScorecards && (
-        <LocationScorecardsModal campuses={campuses} projects={displayProjects} staffByCampus={staffByCampus} marginScores={marginScores}
-          onClose={() => setShowScorecards(false)}
-          onSelectCampus={(id) => { setShowScorecards(false); setSelectedCampus(id); setTab("overview"); }} />
       )}
 
       {openProject && (
@@ -2421,9 +2414,16 @@ function CentralTeamWindow({ projects, campuses, centralThreads, onAddTag, onRem
   );
 }
 
-function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, onOpenProject, detail, setDetail, onGoTab, seasons, onOpenSeasons, marginScores, onOpenScorecards }) {
+function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, onOpenProject, detail, setDetail, onGoTab }) {
   const sharedProjects = projects.filter((p) => p.shared);
   const allStaff = Object.values(staffByCampus).flat();
+
+  const campusRows = campuses.map((c) => {
+    const campusProjects = projects.filter((p) => p.stage !== "Completed" && (p.campus === c.id || (p.shared && (p.sharedWith?.includes(c.id) || p.sharedWith?.includes("all")))));
+    const cb = rollupBudget(projects.filter((p) => p.campus === c.id));
+    return { campus: c, open: campusProjects.length, overdue: campusProjects.filter((p) => p.due < TODAY_STR).length, spent: cb.spent, total: cb.total, staffCount: (staffByCampus[c.id] || []).length };
+  }).sort((a, b) => b.open - a.open);
+
   return (
     <div>
       <div className="mb-6">
@@ -2433,7 +2433,7 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
 
       <TeamAttentionBanner staff={allStaff} onGoTab={onGoTab} accentColor="#C15B5B" />
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-7">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
         <SummaryCard onClick={() => setDetail("projects")} icon={ListChecks} label="Open Projects" value={projects.filter((p) => p.stage !== "Completed").length} sub="org-wide" color="#2B4C7E" />
         <SummaryCard onClick={() => setDetail("budget")} icon={DollarSign} label="Budget Used" value={fmtMoney(orgBudgetUsed)} sub={`of ${fmtMoney(orgBudgetTotal)} forecasted`} color="#B8862F" />
         <SummaryCard onClick={() => setDetail("campuses")} icon={Building2} label="Campuses" value={campuses.length} sub="active sites" color="#5E9E8A" />
@@ -2450,85 +2450,41 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
         />
       )}
 
-      <button onClick={() => onGoTab("staff")}
-        className="w-full flex items-center justify-between gap-3 bg-[#FFFFFF] rounded-lg p-4 mb-6 text-left transition"
-        style={{ border: "1.5px solid #2B4C7E55" }}
-        onMouseEnter={(e) => e.currentTarget.style.borderColor = "#2B4C7E"}
-        onMouseLeave={(e) => e.currentTarget.style.borderColor = "#2B4C7E55"}>
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-md flex items-center justify-center shrink-0" style={{ background: "#2B4C7E" }}><Users size={16} color="#F7F6FB" /></div>
+      <div className="grid lg:grid-cols-[1.15fr_1fr] gap-3 mb-7 items-start">
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4">
+          <div className="text-[13px] font-semibold mb-3">Project Load by Week</div>
+          <ProjectLoadChart projects={projects} />
+        </div>
+
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-[13px] font-semibold">Campuses</div>
+            <div className="text-[10.5px] text-[#8B889C]">sorted by open projects</div>
+          </div>
+          <div className="grid grid-cols-[1fr_50px_82px_16px] gap-2 text-[9.5px] text-[#8B889C] uppercase tracking-wide pb-1.5 mb-1 border-b border-[#E3E1F0]">
+            <span>Campus</span><span className="text-right">Open</span><span className="text-right">Budget</span><span></span>
+          </div>
           <div>
-            <div className="text-[13.5px] font-medium">Central Team</div>
-            <div className="text-[11.5px] text-[#6B6980]">Build and manage the roster of people working directly under Central — same tools as every campus.</div>
+            {campusRows.map((row) => (
+              <button key={row.campus.id} onClick={() => onSelectCampus(row.campus.id)}
+                className="w-full grid grid-cols-[1fr_50px_82px_16px] gap-2 items-center text-left py-2 rounded-md hover:bg-[#F7F6FB] px-1">
+                <span className="flex items-center gap-2 min-w-0">
+                  <span className="w-2 h-2 rounded-full shrink-0" style={{ background: row.campus.color }} />
+                  <span className="min-w-0">
+                    <span className="block text-[12px] font-medium truncate">{row.campus.name} <span className="font-normal text-[#8B889C]">({row.campus.abbr})</span></span>
+                    <span className="block text-[10px] text-[#8B889C] truncate">OD: {row.campus.lead || "Unassigned"}</span>
+                  </span>
+                </span>
+                <span className="text-[11.5px] text-right" style={{ fontFamily: "'JetBrains Mono', monospace" }}>{row.open}</span>
+                <span className="text-[10.5px] text-right text-[#6B6980] truncate" style={{ fontFamily: "'JetBrains Mono', monospace" }}>{fmtMoney(row.spent)}/{fmtMoney(row.total)}</span>
+                <ChevronRight size={13} className="text-[#8B889C] justify-self-end" />
+              </button>
+            ))}
+            {campusRows.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No campuses yet.</div>}
           </div>
         </div>
-        <ChevronRight size={16} className="text-[#8B889C] shrink-0" />
-      </button>
-
-      <button onClick={onOpenSeasons}
-        className="w-full flex items-center justify-between gap-3 bg-[#FFFFFF] rounded-lg p-4 mb-6 text-left transition"
-        style={{ border: "1.5px solid #6B4FA055" }}
-        onMouseEnter={(e) => e.currentTarget.style.borderColor = "#6B4FA0"}
-        onMouseLeave={(e) => e.currentTarget.style.borderColor = "#6B4FA055"}>
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-md flex items-center justify-center shrink-0" style={{ background: "#6B4FA0" }}><CalendarDays size={16} color="#F7F6FB" /></div>
-          <div>
-            <div className="text-[13.5px] font-medium">Seasons</div>
-            <div className="text-[11.5px] text-[#6B6980]">{seasons.length > 0 ? `${seasons.length} season${seasons.length === 1 ? "" : "s"} tracked` : "Easter, Christmas, VBS"} — see every campus's plan for a season in one place.</div>
-          </div>
-        </div>
-        <ChevronRight size={16} className="text-[#8B889C] shrink-0" />
-      </button>
-
-      <button onClick={onOpenScorecards}
-        className="w-full flex items-center justify-between gap-3 bg-[#FFFFFF] rounded-lg p-4 mb-6 text-left transition"
-        style={{ border: "1.5px solid #5E9E8A55" }}
-        onMouseEnter={(e) => e.currentTarget.style.borderColor = "#5E9E8A"}
-        onMouseLeave={(e) => e.currentTarget.style.borderColor = "#5E9E8A55"}>
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-md flex items-center justify-center shrink-0" style={{ background: "#5E9E8A" }}><ListChecks size={16} color="#F7F6FB" /></div>
-          <div>
-            <div className="text-[13.5px] font-medium">Location Scorecards</div>
-            <div className="text-[11.5px] text-[#6B6980]">Margin, budget adherence, and on-time delivery — every campus, side by side.</div>
-          </div>
-        </div>
-        <ChevronRight size={16} className="text-[#8B889C] shrink-0" />
-      </button>
-
-      <CentralTeamWindow projects={projects} campuses={campuses} centralThreads={centralThreads} onAddTag={onAddTag} onRemoveTag={onRemoveTag}
-        onAddMessage={onAddMessage} currentViewerName={currentViewerName} />
-
-      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3 mb-8 mt-7">
-        {campuses.map((c) => {
-          const campusProjects = projects.filter((p) => p.stage !== "Completed" && (p.campus === c.id || (p.shared && (p.sharedWith?.includes(c.id) || p.sharedWith?.includes("all")))));
-          const overdue = campusProjects.filter((p) => p.due < TODAY_STR).length;
-          const cb = rollupBudget(projects.filter((p) => p.campus === c.id));
-          const cbPct = cb.total ? Math.round((cb.spent / cb.total) * 100) : 0;
-          const staffCount = (staffByCampus[c.id] || []).length;
-          return (
-            <button key={c.id} onClick={() => onSelectCampus(c.id)} className="text-left bg-[#FFFFFF] rounded-lg p-4 transition group"
-              style={{ border: `1.5px solid ${c.color}55` }}
-              onMouseEnter={(e) => e.currentTarget.style.borderColor = c.color}
-              onMouseLeave={(e) => e.currentTarget.style.borderColor = `${c.color}55`}>
-              <div className="flex items-center justify-between mb-3">
-                <div className="min-w-0">
-                  <div className="text-[15px] font-medium truncate flex items-center gap-1.5" style={{ color: c.color }}>{c.name} <span className="text-[10px] font-normal px-1.5 py-0.5 rounded" style={{ background: `${c.color}22` }}>{c.abbr}</span></div>
-                  <div className="text-[11.5px] text-[#6B6980] truncate">OD: {c.lead} · Phase {c.phase}</div>
-                </div>
-                <div className="text-right shrink-0 pl-2">
-                  <div className="text-[16px] font-medium" style={{ fontFamily: "'JetBrains Mono', monospace" }}>{campusProjects.length}</div>
-                  <div className="text-[9.5px] text-[#6B6980]">open{overdue > 0 ? ` · ${overdue} overdue` : ""}</div>
-                </div>
-              </div>
-              <div className="mb-1.5">
-                <div className="flex justify-between text-[11px] text-[#6B6980] mb-1"><span>Budget</span><span>{cbPct}%</span></div>
-                <div className="h-1.5 rounded-full bg-[#E3E1F0] overflow-hidden"><div className="h-full rounded-full" style={{ width: `${cbPct}%`, background: c.color }} /></div>
-              </div>
-              <div className="flex gap-3 text-[11px] text-[#6B6980] mt-2.5"><span>{staffCount} staff</span></div>
-            </button>
-          );
-        })}
       </div>
+
       <h2 className="text-[14px] font-medium mb-3 flex items-center gap-1.5"><Link2 size={14} /> Cross-Campus & Central Projects</h2>
       <div className="space-y-2">
         {sharedProjects.map((p) => (
@@ -2540,7 +2496,89 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
             <StageBadge stage={p.stage} />
           </div>
         ))}
+        {sharedProjects.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-4 text-center">No cross-campus or central projects yet.</div>}
       </div>
+    </div>
+  );
+}
+
+// Project Load by Week — how many projects were created org-wide each of the last 9 weeks.
+// There's no historical snapshot of "how many were open" on any past date, only current state,
+// so a true backlog-over-time trend can't be reconstructed — creation date is the one real,
+// derivable weekly signal already sitting on every project record.
+function projectLoadByWeek(projects, weeks = 9) {
+  const startOfThisWeek = calStartOfWeek(TODAY_STR);
+  const buckets = Array.from({ length: weeks }, (_, i) => {
+    const start = new Date(startOfThisWeek);
+    start.setDate(start.getDate() - 7 * (weeks - 1 - i));
+    const end = new Date(start);
+    end.setDate(end.getDate() + 7);
+    return { start: calFmtISO(start), end: calFmtISO(end), count: 0 };
+  });
+  projects.forEach((p) => {
+    const created = (p.createdAt || "").slice(0, 10);
+    if (!created) return;
+    const bucket = buckets.find((b) => created >= b.start && created < b.end);
+    if (bucket) bucket.count += 1;
+  });
+  return buckets;
+}
+
+function ProjectLoadChart({ projects }) {
+  const buckets = projectLoadByWeek(projects, 9);
+  const values = buckets.map((b) => b.count);
+  const max = Math.max(...values, 1) * 1.15;
+  const w = 600, h = 170, padL = 4, padR = 4, padT = 8, padB = 20;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+  const x = (i) => padL + (plotW * i) / (values.length - 1);
+  const y = (v) => padT + plotH - (plotH * v) / max;
+  const pts = values.map((v, i) => [x(i), y(v)]);
+
+  let linePath = `M ${pts[0][0]},${pts[0][1]}`;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const mx = (pts[i][0] + pts[i + 1][0]) / 2, my = (pts[i][1] + pts[i + 1][1]) / 2;
+    linePath += ` Q ${pts[i][0]},${pts[i][1]} ${mx},${my}`;
+  }
+  linePath += ` L ${pts[pts.length - 1][0]},${pts[pts.length - 1][1]}`;
+  const areaPath = `${linePath} L ${pts[pts.length - 1][0]},${padT + plotH} L ${pts[0][0]},${padT + plotH} Z`;
+
+  const thisWeek = values[values.length - 1];
+  const lastWeek = values[values.length - 2] || 0;
+  const trendPct = lastWeek ? Math.round(((thisWeek - lastWeek) / lastWeek) * 100) : null;
+
+  return (
+    <div>
+      <div className="flex items-baseline gap-2 mb-2 flex-wrap">
+        <span className="text-[21px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace" }}>{thisWeek}</span>
+        <span className="text-[12px] text-[#6B6980]">new project{thisWeek === 1 ? "" : "s"} this week</span>
+        {trendPct !== null && (
+          <span className="text-[11px] font-bold px-1.5 py-0.5 rounded-full" style={{ background: trendPct >= 0 ? "#5E9E8A1c" : "#C15B5B1c", color: trendPct >= 0 ? "#5E9E8A" : "#C15B5B" }}>
+            {trendPct >= 0 ? "▲" : "▼"} {Math.abs(trendPct)}%
+          </span>
+        )}
+      </div>
+      <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: 170 }}>
+        <defs>
+          <linearGradient id="loadFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#2B4C7E" stopOpacity="0.22" />
+            <stop offset="100%" stopColor="#2B4C7E" stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        {[0, 1, 2].map((g) => (
+          <line key={g} x1={padL} x2={w - padR} y1={padT + (plotH * g) / 2} y2={padT + (plotH * g) / 2} stroke="#E3E1F0" strokeWidth="1" />
+        ))}
+        <path d={areaPath} fill="url(#loadFill)" />
+        <path d={linePath} fill="none" stroke="#2B4C7E" strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" />
+        {pts.map(([px, py], i) => (
+          <circle key={i} cx={px} cy={py} r={i === pts.length - 1 ? 4 : 2.75} fill="#FFFFFF" stroke="#2B4C7E" strokeWidth="2" />
+        ))}
+        {buckets.map((b, i) => i % 2 === 0 && (
+          <text key={i} x={x(i)} y={h - 4} fontSize="9.5" fill="#8B889C" textAnchor="middle">
+            {new Date(b.start + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+          </text>
+        ))}
+      </svg>
+      <div className="text-[10.5px] text-[#8B889C] mt-1">New projects created, org-wide, by week</div>
     </div>
   );
 }
@@ -4903,9 +4941,7 @@ function NewProjectModal({ onClose, onCreate, campusRoster, fullRoster, campusLa
 // across every campus, so coaching starts from the same numbers instead of a director's read
 // of their own site. Pure rollup over data already in memory (estimateAccuracy, marginScores,
 // due/completedOn) — no new schema.
-function LocationScorecardsModal({ campuses, projects, staffByCampus, marginScores, onClose, onSelectCampus }) {
-  useLockBodyScroll();
-
+function LocationScorecardsPanel({ campuses, projects, staffByCampus, marginScores, onSelectCampus }) {
   const pctColor = (pct) => pct == null ? "#8B889C" : pct >= 80 ? "#5E9E8A" : pct >= 60 ? "#B8862F" : "#C15B5B";
 
   const rows = campuses.map((c) => {
@@ -4926,61 +4962,55 @@ function LocationScorecardsModal({ campuses, projects, staffByCampus, marginScor
   });
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
-      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[860px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
-        <div className="flex items-center justify-between mb-1">
-          <h2 className="text-[15px] font-semibold">Location Scorecards</h2>
-          <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
-        </div>
-        <p className="text-[11.5px] text-[#6B6980] mb-4">Margin health, budget adherence, and on-time delivery — side by side. Tap a row to open that campus.</p>
+    <div>
+      <div className="text-[13px] font-semibold mb-1">Location Scorecards</div>
+      <p className="text-[11.5px] text-[#6B6980] mb-4">Margin health, budget adherence, and on-time delivery — side by side. Tap a row to open that campus.</p>
 
-        {rows.length === 0 ? (
-          <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No campuses yet.</div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-[12px] border-collapse">
-              <thead>
-                <tr className="text-left text-[10px] text-[#8B889C] uppercase tracking-wide">
-                  <th className="pb-2 pr-3 font-medium">Campus</th>
-                  <th className="pb-2 pr-3 font-medium">Margin</th>
-                  <th className="pb-2 pr-3 font-medium">Budget adherence</th>
-                  <th className="pb-2 pr-3 font-medium">On-time delivery</th>
-                  <th className="pb-2 pr-3 font-medium">Open</th>
-                  <th className="pb-2 font-medium">Staff</th>
+      {rows.length === 0 ? (
+        <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No campuses yet.</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-[12px] border-collapse">
+            <thead>
+              <tr className="text-left text-[10px] text-[#8B889C] uppercase tracking-wide">
+                <th className="pb-2 pr-3 font-medium">Campus</th>
+                <th className="pb-2 pr-3 font-medium">Margin</th>
+                <th className="pb-2 pr-3 font-medium">Budget adherence</th>
+                <th className="pb-2 pr-3 font-medium">On-time delivery</th>
+                <th className="pb-2 pr-3 font-medium">Open</th>
+                <th className="pb-2 font-medium">Staff</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.campus.id} className="border-t border-[#E3E1F0] cursor-pointer hover:bg-[#F7F6FB]" onClick={() => onSelectCampus(row.campus.id)}>
+                  <td className="py-2.5 pr-3 font-medium whitespace-nowrap" style={{ color: row.campus.color }}>{row.campus.name}</td>
+                  <td className="py-2.5 pr-3">
+                    <span className="px-2 py-0.5 rounded-full text-[10.5px] whitespace-nowrap" style={{ background: `${row.marginColor}22`, color: row.marginColor }}>{row.marginLabel}</span>
+                  </td>
+                  <td className="py-2.5 pr-3">
+                    <span className="px-2 py-0.5 rounded-full text-[10.5px] whitespace-nowrap" style={{ background: `${pctColor(row.accuracy.atOrUnderPct)}22`, color: pctColor(row.accuracy.atOrUnderPct) }}>
+                      {row.accuracy.atOrUnderPct == null ? "No data" : `${row.accuracy.atOrUnderPct}% at/under`}
+                    </span>
+                  </td>
+                  <td className="py-2.5 pr-3">
+                    <span className="px-2 py-0.5 rounded-full text-[10.5px] whitespace-nowrap" style={{ background: `${pctColor(row.onTimePct)}22`, color: pctColor(row.onTimePct) }}>
+                      {row.onTimePct == null ? "No data" : `${row.onTimePct}% on time`}
+                    </span>
+                  </td>
+                  <td className="py-2.5 pr-3 text-[#6B6980] whitespace-nowrap">{row.openCount}{row.overdue > 0 ? ` (${row.overdue} overdue)` : ""}</td>
+                  <td className="py-2.5 text-[#6B6980]">{row.staffCount}</td>
                 </tr>
-              </thead>
-              <tbody>
-                {rows.map((row) => (
-                  <tr key={row.campus.id} className="border-t border-[#E3E1F0] cursor-pointer hover:bg-[#F7F6FB]" onClick={() => onSelectCampus(row.campus.id)}>
-                    <td className="py-2.5 pr-3 font-medium whitespace-nowrap" style={{ color: row.campus.color }}>{row.campus.name}</td>
-                    <td className="py-2.5 pr-3">
-                      <span className="px-2 py-0.5 rounded-full text-[10.5px] whitespace-nowrap" style={{ background: `${row.marginColor}22`, color: row.marginColor }}>{row.marginLabel}</span>
-                    </td>
-                    <td className="py-2.5 pr-3">
-                      <span className="px-2 py-0.5 rounded-full text-[10.5px] whitespace-nowrap" style={{ background: `${pctColor(row.accuracy.atOrUnderPct)}22`, color: pctColor(row.accuracy.atOrUnderPct) }}>
-                        {row.accuracy.atOrUnderPct == null ? "No data" : `${row.accuracy.atOrUnderPct}% at/under`}
-                      </span>
-                    </td>
-                    <td className="py-2.5 pr-3">
-                      <span className="px-2 py-0.5 rounded-full text-[10.5px] whitespace-nowrap" style={{ background: `${pctColor(row.onTimePct)}22`, color: pctColor(row.onTimePct) }}>
-                        {row.onTimePct == null ? "No data" : `${row.onTimePct}% on time`}
-                      </span>
-                    </td>
-                    <td className="py-2.5 pr-3 text-[#6B6980] whitespace-nowrap">{row.openCount}{row.overdue > 0 ? ` (${row.overdue} overdue)` : ""}</td>
-                    <td className="py-2.5 text-[#6B6980]">{row.staffCount}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
 
-function SeasonsModal({ seasons, projects, campuses, onCreateSeason, onClose, onOpenProject }) {
-  useLockBodyScroll();
+function SeasonsPanel({ seasons, projects, campuses, onCreateSeason, onOpenProject }) {
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
   const [startsOn, setStartsOn] = useState("");
@@ -4999,74 +5029,132 @@ function SeasonsModal({ seasons, projects, campuses, onCreateSeason, onClose, on
   const campusName = (id) => campuses.find((c) => c.id === id)?.name || id;
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
-      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[560px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
-        <div className="flex items-center justify-between mb-1">
-          <h2 className="text-[15px] font-semibold">{openSeason ? openSeason.name : "Seasons"}</h2>
-          <button onClick={openSeason ? () => setOpenSeasonId(null) : onClose} className="text-[#8B889C] hover:text-[#2A2A3A]">
-            {openSeason ? <ChevronLeft size={16} /> : <X size={16} />}
-          </button>
-        </div>
-
-        {!openSeason && (
-          <>
-            <p className="text-[11.5px] text-[#6B6980] mb-4">A named window — Easter, Christmas, VBS — that projects across every campus can be tagged into, so you can see the whole thing in one place.</p>
-            {seasons.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-4 text-center">No seasons yet.</div>}
-            <div className="space-y-1.5 mb-4">
-              {seasons.map((s) => {
-                const count = projects.filter((p) => p.seasonId === s.id).length;
-                return (
-                  <button key={s.id} onClick={() => setOpenSeasonId(s.id)} className="w-full text-left bg-[#EFEEFA] border border-[#E3E1F0] rounded-md px-3 py-2.5 hover:border-[#C7C3E0]">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[12.5px] font-medium">{s.name}</span>
-                      <span className="text-[10.5px] text-[#6B6980]">{count} project{count === 1 ? "" : "s"}</span>
-                    </div>
-                    {(s.startsOn || s.endsOn) && <div className="text-[10.5px] text-[#8B889C] mt-0.5">{s.startsOn || "?"} – {s.endsOn || "?"}</div>}
-                  </button>
-                );
-              })}
-            </div>
-            {creating ? (
-              <div className="bg-[#F7F6FB] border border-[#D8D5EC] rounded-md p-3">
-                <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Season name — e.g. Easter 2027"
-                  className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-3 py-2 text-[12.5px] outline-none focus:border-[#B8862F] mb-2" />
-                <div className="flex gap-2 mb-2">
-                  <input type="date" value={startsOn} onChange={(e) => setStartsOn(e.target.value)} className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[12px] outline-none" />
-                  <input type="date" value={endsOn} onChange={(e) => setEndsOn(e.target.value)} className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[12px] outline-none" />
-                </div>
-                <div className="flex gap-2">
-                  <button onClick={submit} className="text-[12px] bg-[#B8862F] text-[#F7F6FB] rounded-md px-3 py-1.5 font-medium">Create</button>
-                  <button onClick={() => setCreating(false)} className="text-[12px] text-[#6B6980] px-3 py-1.5">Cancel</button>
-                </div>
-              </div>
-            ) : (
-              <button onClick={() => setCreating(true)} className="text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>+ New Season</button>
-            )}
-          </>
-        )}
-
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <div className="text-[13px] font-semibold">{openSeason ? openSeason.name : "Seasons"}</div>
         {openSeason && (
-          <div>
-            <p className="text-[11.5px] text-[#6B6980] mb-4">{openSeason.startsOn || "?"} – {openSeason.endsOn || "?"} · every campus's projects tagged to this season</p>
-            <div className="rounded-lg p-3 mb-4" style={{ background: "#2B4C7E18", border: "1px solid #2B4C7E55" }}>
-              <div className="text-[11px] text-[#2B4C7E] mb-1">Combined budget</div>
-              <div className="text-[18px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color: "#2B4C7E" }}>{fmtMoney(seasonBudget.spent)} <span className="text-[13px] font-normal">of {fmtMoney(seasonBudget.total)}</span></div>
-            </div>
-            <div className="space-y-1.5">
-              {seasonProjects.map((p) => (
-                <button key={p.id} onClick={() => onOpenProject(p.id)} className="w-full text-left bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg px-3 py-2.5 hover:border-[#C7C3E0]">
-                  <div className="flex items-center justify-between gap-2 mb-1">
-                    <span className="text-[12.5px] truncate">{p.title}</span>
-                    <StageBadge stage={p.stage} />
-                  </div>
-                  <div className="text-[10.5px] text-[#6B6980]">{campusName(p.campus)} · {p.owner}</div>
-                </button>
-              ))}
-              {seasonProjects.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No projects tagged to this season yet — tag one from its project detail.</div>}
-            </div>
-          </div>
+          <button onClick={() => setOpenSeasonId(null)} className="flex items-center gap-1 text-[11px] text-[#6B6980] hover:text-[#2A2A3A]">
+            <ChevronLeft size={14} /> Back to all seasons
+          </button>
         )}
       </div>
+
+      {!openSeason && (
+        <>
+          <p className="text-[11.5px] text-[#6B6980] mb-4">A named window — Easter, Christmas, VBS — that projects across every campus can be tagged into, so you can see the whole thing in one place.</p>
+          {seasons.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-4 text-center">No seasons yet.</div>}
+          <div className="space-y-1.5 mb-4">
+            {seasons.map((s) => {
+              const count = projects.filter((p) => p.seasonId === s.id).length;
+              return (
+                <button key={s.id} onClick={() => setOpenSeasonId(s.id)} className="w-full text-left bg-[#EFEEFA] border border-[#E3E1F0] rounded-md px-3 py-2.5 hover:border-[#C7C3E0]">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12.5px] font-medium">{s.name}</span>
+                    <span className="text-[10.5px] text-[#6B6980]">{count} project{count === 1 ? "" : "s"}</span>
+                  </div>
+                  {(s.startsOn || s.endsOn) && <div className="text-[10.5px] text-[#8B889C] mt-0.5">{s.startsOn || "?"} – {s.endsOn || "?"}</div>}
+                </button>
+              );
+            })}
+          </div>
+          {creating ? (
+            <div className="bg-[#F7F6FB] border border-[#D8D5EC] rounded-md p-3">
+              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Season name — e.g. Easter 2027"
+                className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-3 py-2 text-[12.5px] outline-none focus:border-[#B8862F] mb-2" />
+              <div className="flex gap-2 mb-2">
+                <input type="date" value={startsOn} onChange={(e) => setStartsOn(e.target.value)} className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[12px] outline-none" />
+                <input type="date" value={endsOn} onChange={(e) => setEndsOn(e.target.value)} className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[12px] outline-none" />
+              </div>
+              <div className="flex gap-2">
+                <button onClick={submit} className="text-[12px] bg-[#B8862F] text-[#F7F6FB] rounded-md px-3 py-1.5 font-medium">Create</button>
+                <button onClick={() => setCreating(false)} className="text-[12px] text-[#6B6980] px-3 py-1.5">Cancel</button>
+              </div>
+            </div>
+          ) : (
+            <button onClick={() => setCreating(true)} className="text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>+ New Season</button>
+          )}
+        </>
+      )}
+
+      {openSeason && (
+        <div>
+          <p className="text-[11.5px] text-[#6B6980] mb-4">{openSeason.startsOn || "?"} – {openSeason.endsOn || "?"} · every campus's projects tagged to this season</p>
+          <div className="rounded-lg p-3 mb-4" style={{ background: "#2B4C7E18", border: "1px solid #2B4C7E55" }}>
+            <div className="text-[11px] text-[#2B4C7E] mb-1">Combined budget</div>
+            <div className="text-[18px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color: "#2B4C7E" }}>{fmtMoney(seasonBudget.spent)} <span className="text-[13px] font-normal">of {fmtMoney(seasonBudget.total)}</span></div>
+          </div>
+          <div className="space-y-1.5">
+            {seasonProjects.map((p) => (
+              <button key={p.id} onClick={() => onOpenProject(p.id)} className="w-full text-left bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg px-3 py-2.5 hover:border-[#C7C3E0]">
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <span className="text-[12.5px] truncate">{p.title}</span>
+                  <StageBadge stage={p.stage} />
+                </div>
+                <div className="text-[10.5px] text-[#6B6980]">{campusName(p.campus)} · {p.owner}</div>
+              </button>
+            ))}
+            {seasonProjects.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No projects tagged to this season yet — tag one from its project detail.</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Central Management — the three org-wide tools (Central Team, Seasons, Location Scorecards)
+// that used to live as full-width buttons on All Campuses. Same accordion pattern throughout:
+// click a button, its panel expands in place below the row; only one open at a time.
+function CentralManagementPanel({ projects, campuses, staffByCampus, marginScores, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, seasons, onCreateSeason, onOpenProject, onSelectCampus }) {
+  const [open, setOpen] = useState(null); // "team" | "seasons" | "scorecards" | null
+
+  const tools = [
+    { key: "team", label: "Central Team", color: "#2B4C7E", icon: Users, desc: "Browse any project or task by campus, leave a private note, optionally assign it. Campus teams never see this." },
+    { key: "seasons", label: "Seasons", color: "#6B4FA0", icon: CalendarDays, desc: "Easter, Christmas, VBS — see every campus's plan for a named window in one place." },
+    { key: "scorecards", label: "Location Scorecards", color: "#5E9E8A", icon: ListChecks, desc: "Margin, budget adherence, and on-time delivery — every campus, side by side." },
+  ];
+
+  return (
+    <div>
+      <div className="mb-6">
+        <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(20px,4vw,26px)] font-semibold tracking-tight">Central Management</h1>
+        <p className="text-[13px] text-[#6B6980] mt-1">The org-wide tools that used to live as buttons on All Campuses — now their own home, each opening in place.</p>
+      </div>
+
+      <div className="grid sm:grid-cols-3 gap-3 mb-1">
+        {tools.map((t) => {
+          const Icon = t.icon;
+          const isOpen = open === t.key;
+          return (
+            <button key={t.key} onClick={() => setOpen(isOpen ? null : t.key)}
+              className="text-left bg-[#FFFFFF] rounded-lg p-4 transition"
+              style={{ border: `1.5px solid ${isOpen ? t.color : `${t.color}55`}` }}>
+              <div className="flex items-start justify-between mb-3">
+                <div className="w-9 h-9 rounded-md flex items-center justify-center shrink-0" style={{ background: t.color }}><Icon size={16} color="#F7F6FB" /></div>
+                <ChevronRight size={15} className="shrink-0 transition-transform" style={{ color: isOpen ? t.color : "#8B889C", transform: isOpen ? "rotate(90deg)" : "none" }} />
+              </div>
+              <div className="text-[13.5px] font-medium mb-1">{t.label}</div>
+              <div className="text-[11.5px] text-[#6B6980]">{t.desc}</div>
+            </button>
+          );
+        })}
+      </div>
+
+      {open === "team" && (
+        <div className="mt-3 mb-8">
+          <CentralTeamWindow projects={projects} campuses={campuses} centralThreads={centralThreads} onAddTag={onAddTag} onRemoveTag={onRemoveTag}
+            onAddMessage={onAddMessage} currentViewerName={currentViewerName} />
+        </div>
+      )}
+      {open === "seasons" && (
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mt-3 mb-8">
+          <SeasonsPanel seasons={seasons} projects={projects} campuses={campuses} onCreateSeason={onCreateSeason} onOpenProject={onOpenProject} />
+        </div>
+      )}
+      {open === "scorecards" && (
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mt-3 mb-8">
+          <LocationScorecardsPanel campuses={campuses} projects={projects} staffByCampus={staffByCampus} marginScores={marginScores} onSelectCampus={onSelectCampus} />
+        </div>
+      )}
     </div>
   );
 }
