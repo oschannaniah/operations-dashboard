@@ -1999,6 +1999,11 @@ video {
   border-color: rgb(184 134 47 / var(--tw-border-opacity, 1));
 }
 
+.focus\:border-\[\#C15B5B\]:focus {
+  --tw-border-opacity: 1;
+  border-color: rgb(193 91 91 / var(--tw-border-opacity, 1));
+}
+
 .active\:scale-\[0\.98\]:active {
   --tw-scale-x: 0.98;
   --tw-scale-y: 0.98;
@@ -2061,6 +2066,10 @@ video {
 
   .sm\:grid-cols-4 {
     grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .sm\:grid-cols-\[180px_1fr\] {
+    grid-template-columns: 180px 1fr;
   }
 
   .sm\:rounded-xl {

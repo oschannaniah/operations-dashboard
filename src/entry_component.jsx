@@ -121,7 +121,7 @@ let handleUnauthorized = () => {};
 // vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
 // the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
 // snake_case columns — so every existing call site keeps working unchanged.
-const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings" };
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses" };
 
 // Every table's primary key is "id" except campus_config (natural key campus_id) and
 // margin_scores (natural key staff_id, one row per staff member) — neither has a separate
@@ -150,6 +150,9 @@ const FIELD_MAPS = {
   playbook_runs: { organizationId: "organization_id", campusId: "campus_id", templateId: "template_id", templateName: "template_name", targetStaffId: "target_staff_id", targetProjectId: "target_project_id", startedBy: "started_by", startedAt: "started_at" },
   playbook_run_items: { runId: "run_id", doneBy: "done_by", doneAt: "done_at", assignedTo: "assigned_to", managedBy: "managed_by", dueDate: "due_date" },
   capacity_weight_settings: { organizationId: "organization_id", typeWeights: "type_weights", costBrackets: "cost_brackets", urgencyBrackets: "urgency_brackets", heavyLoadThreshold: "heavy_load_threshold", overCapacityThreshold: "over_capacity_threshold", updatedAt: "updated_at", updatedBy: "updated_by" },
+  pulse_waves: { organizationId: "organization_id", opensAt: "opens_at", closesAt: "closes_at", createdBy: "created_by", createdAt: "created_at" },
+  pulse_wave_participants: { waveId: "wave_id", profileId: "profile_id", respondedAt: "responded_at" },
+  pulse_responses: { waveId: "wave_id", campusId: "campus_id", submittedAt: "submitted_at" },
 };
 
 function toSnakeRow(table, obj) {
@@ -188,6 +191,16 @@ async function apiCreate(sheet, data) {
   const { data: inserted, error } = await supabase.from(table).insert(toSnakeRow(table, data)).select().single();
   throwOrHandle(error);
   return toCamelRow(table, inserted);
+}
+
+// For tables with genuinely no SELECT policy for the inserting user by design (pulse_responses
+// — anonymity means there's nothing to read back). apiCreate's insert-then-select-single would
+// fail here even though the insert itself succeeds, because Postgres requires a RETURNING row
+// to also satisfy a SELECT policy.
+async function apiCreateNoReturn(sheet, data) {
+  const table = TABLE_MAP[sheet] || sheet;
+  const { error } = await supabase.from(table).insert(toSnakeRow(table, data));
+  throwOrHandle(error);
 }
 
 async function apiUpdate(sheet, id, data) {
@@ -773,6 +786,19 @@ const MARGIN_PULSE_QUESTIONS = [
     options: [["no", "No"], ["yes", "Yes"]] },
 ];
 
+// Org-wide Pulse — deliberately a fixed set, not a builder. Keeping the same four questions
+// across every wave is what makes a quarter-over-quarter trend line mean anything; a
+// customizable survey would just break that comparability. Anonymous by design (see
+// 0027_org_pulse.sql) — completely separate from the Margin pulse above, which is intentionally
+// NOT anonymous since an OD needs to know who to follow up with.
+const ORG_PULSE_LIKERT = [["1", "Strongly disagree"], ["2", "Disagree"], ["3", "Neutral"], ["4", "Agree"], ["5", "Strongly agree"]];
+const ORG_PULSE_QUESTIONS = [
+  { key: "q1", text: "I feel supported by my campus leadership.", options: ORG_PULSE_LIKERT },
+  { key: "q2", text: "My workload has felt healthy and sustainable lately.", options: ORG_PULSE_LIKERT },
+  { key: "q3", text: "I'm proud to be part of this organization.", options: ORG_PULSE_LIKERT },
+  { key: "q4", text: "I'd recommend working here to a friend.", options: ORG_PULSE_LIKERT },
+];
+
 function tierForRole(roleId) { return roleId === "central" ? TIERS[0] : TIERS[1]; }
 
 // Shown whenever there's no valid auth in state — either a returning user logging back in,
@@ -977,6 +1003,9 @@ export default function OpsDashboard() {
   const [playbookRuns, setPlaybookRuns] = useState([]);
   const [playbookRunItems, setPlaybookRunItems] = useState([]);
   const [capacityWeightSettings, setCapacityWeightSettings] = useState(null);
+  const [pulseWaves, setPulseWaves] = useState([]);
+  const [pulseParticipants, setPulseParticipants] = useState([]); // central sees everyone; od/staff see only their own row — RLS, 0027_org_pulse.sql
+  const [pulseResponses, setPulseResponses] = useState([]); // central-only per RLS; empty for everyone else
   const [pendingMarginPulse, setPendingMarginPulse] = useState(null);
   const [campuses, setCampuses] = useState([]);
   const [users, setUsers] = useState([]);
@@ -1068,6 +1097,13 @@ export default function OpsDashboard() {
   const currentViewerName = auth?.user
     ? (`${auth.user.firstName || ""} ${auth.user.lastName || ""}`.trim() || auth.user.email)
     : "—";
+
+  // An open wave this person hasn't responded to yet — checked against pulse_wave_participants
+  // (proof of response, never the answers themselves). Unassigned-tier accounts don't have a
+  // real role yet, so they're not prompted.
+  const pendingOrgPulseWave = auth?.user && auth.user.tier !== "unassigned"
+    ? pulseWaves.find((w) => w.opensAt <= TODAY_STR && w.closesAt >= TODAY_STR && !pulseParticipants.some((p) => p.waveId === w.id && p.profileId === auth.user.id))
+    : null;
 
   // A logged-in campus OD/staff account is permanently scoped to its own campus — the role
   // switcher in the header is Central-only. This just keeps local `role` state in sync with
@@ -1165,8 +1201,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"),
       ]);
       if (cancelled) return;
 
@@ -1303,6 +1339,13 @@ export default function OpsDashboard() {
       // One row per org (0026_capacity_weights.sql) — falls back to DEFAULT_CAPACITY_WEIGHTS
       // wherever it's read if this hasn't loaded yet or the row somehow doesn't exist.
       if (capacityWeightSettingsResult.status === "fulfilled" && capacityWeightSettingsResult.value[0]) setCapacityWeightSettings(capacityWeightSettingsResult.value[0]);
+
+      // See 0027_org_pulse.sql — pulse_responses carries no identifying column at all, and
+      // RLS only ever lets central read it; pulse_wave_participants proves who responded
+      // without ever exposing what they said.
+      if (pulseWavesResult.status === "fulfilled") setPulseWaves(pulseWavesResult.value);
+      if (pulseParticipantsResult.status === "fulfilled") setPulseParticipants(pulseParticipantsResult.value);
+      if (pulseResponsesResult.status === "fulfilled") setPulseResponses(pulseResponsesResult.value);
 
       if (failures.length > 0) {
         setBackendStatus("offline");
@@ -2031,6 +2074,46 @@ export default function OpsDashboard() {
     }
   };
 
+  const createPulseWave = async (name, opensAt, closesAt) => {
+    setSyncing(true);
+    try {
+      const wave = await apiCreate("PulseWaves", { organizationId: OSC_ORG_ID, name, opensAt, closesAt, createdBy: currentViewerName });
+      setPulseWaves((prev) => [...prev, wave]);
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const deletePulseWave = (waveId) => {
+    setPulseWaves((prev) => prev.filter((w) => w.id !== waveId));
+    setPulseParticipants((prev) => prev.filter((p) => p.waveId !== waveId));
+    setPulseResponses((prev) => prev.filter((r) => r.waveId !== waveId));
+    syncToBackend(apiDelete("PulseWaves", waveId));
+  };
+
+  // Two separate, uncorrelated writes: the participant marker (proves this person responded,
+  // never what they said) and the response itself (the answers, never who gave them). Neither
+  // table can be joined to the other — that separation is the whole anonymity guarantee, see
+  // 0027_org_pulse.sql. campusId is the submitter's own campus (context for breakdowns only);
+  // RLS independently double-checks it matches my_campus() so it can't be spoofed.
+  const submitPulseResponse = async (waveId, answers, note) => {
+    setSyncing(true);
+    try {
+      const campusId = auth.user.tier === "central" ? "central" : auth.user.campusId;
+      await apiCreateNoReturn("PulseResponses", { waveId, campusId, answers, note: note || null });
+      const participant = await apiCreate("PulseWaveParticipants", { waveId, profileId: auth.user.id, respondedAt: new Date().toISOString() });
+      setPulseParticipants((prev) => [...prev, participant]);
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   // Persists a campus's Slides org-chart link to the CampusConfig sheet (id = campusId, so
   // this is a plain generic-CRUD upsert: create the row the first time, update it after that).
   const setCampusSlidesLink = (campusId, url) => {
@@ -2386,7 +2469,9 @@ export default function OpsDashboard() {
               currentViewerName={currentViewerName}
               seasons={seasons} onCreateSeason={createSeason}
               onOpenProject={setOpenProject} onSelectCampus={(id) => { setSelectedCampus(id); setTab("overview"); }}
-              capacityWeightSettings={capacityWeightSettings} onUpdateCapacityWeightSettings={updateCapacityWeightSettings} />
+              capacityWeightSettings={capacityWeightSettings} onUpdateCapacityWeightSettings={updateCapacityWeightSettings}
+              users={users} pulseWaves={pulseWaves} pulseParticipants={pulseParticipants} pulseResponses={pulseResponses}
+              onCreatePulseWave={createPulseWave} onDeletePulseWave={deletePulseWave} />
           )}
 
           {tab === "overview" && (role !== "central" || selectedCampus) && activeCampus && (
@@ -2501,6 +2586,11 @@ export default function OpsDashboard() {
       {pendingMarginPulse && (
         <MarginPulseCheckPrompt pulse={pendingMarginPulse}
           onSubmit={(answers) => respondToMarginPulse(pendingMarginPulse.id, answers)} />
+      )}
+
+      {pendingOrgPulseWave && (
+        <OrgPulsePrompt wave={pendingOrgPulseWave}
+          onSubmit={(answers, note) => submitPulseResponse(pendingOrgPulseWave.id, answers, note)} />
       )}
 
       {openProject && (
@@ -3702,6 +3792,44 @@ function MarginPulseCheckPrompt({ pulse, onSubmit }) {
           className="w-full text-[13px] font-medium rounded-md px-3 py-2.5 mt-5 disabled:opacity-40"
           style={{ background: "#2B4C7E", color: "#F7F6FB" }}>
           Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Deliberately no dismiss/skip — same posture as the Margin check-in above. Answers are
+// genuinely anonymous (see submitPulseResponse) so there's no "who hasn't responded yet"
+// awkwardness the way there might be with something identified.
+function OrgPulsePrompt({ wave, onSubmit }) {
+  useLockBodyScroll();
+  const [answers, setAnswers] = useState({});
+  const [note, setNote] = useState("");
+  const setAnswer = (key, value) => setAnswers((prev) => ({ ...prev, [key]: value }));
+  const complete = ORG_PULSE_QUESTIONS.every((q) => answers[q.key]);
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[440px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+        <h2 className="text-[15px] font-semibold mb-1">{wave.name}</h2>
+        <p className="text-[11.5px] text-[#6B6980] mb-4">A quick, anonymous pulse — your answers can't be traced back to you. Takes under a minute.</p>
+        <div className="space-y-4">
+          {ORG_PULSE_QUESTIONS.map((q) => (
+            <div key={q.key}>
+              <div className="text-[12.5px] text-[#2A2A3A] mb-1.5">{q.text}</div>
+              <MarginAnswerPicker value={answers[q.key]} onChange={(v) => setAnswer(q.key, v)} options={q.options} />
+            </div>
+          ))}
+          <div>
+            <div className="text-[12.5px] text-[#2A2A3A] mb-1.5">Anything you want leadership to know? <span className="text-[#8B889C]">(optional, still anonymous)</span></div>
+            <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2}
+              className="w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[12.5px] outline-none focus:border-[#2B4C7E]" />
+          </div>
+        </div>
+        <button onClick={() => complete && onSubmit(answers, note.trim())} disabled={!complete}
+          className="w-full text-[13px] font-medium rounded-md px-3 py-2.5 mt-5 disabled:opacity-40"
+          style={{ background: "#6B4FA0", color: "#F7F6FB" }}>
+          Submit anonymously
         </button>
       </div>
     </div>
@@ -5842,14 +5970,15 @@ function SeasonsPanel({ seasons, projects, campuses, onCreateSeason, onOpenProje
 // Central Management — the three org-wide tools (Central Team, Seasons, Location Scorecards)
 // that used to live as full-width buttons on All Campuses. Same accordion pattern throughout:
 // click a button, its panel expands in place below the row; only one open at a time.
-function CentralManagementPanel({ projects, campuses, staffByCampus, marginScores, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, seasons, onCreateSeason, onOpenProject, onSelectCampus, capacityWeightSettings, onUpdateCapacityWeightSettings }) {
-  const [open, setOpen] = useState(null); // "team" | "seasons" | "scorecards" | "weights" | null
+function CentralManagementPanel({ projects, campuses, staffByCampus, marginScores, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, seasons, onCreateSeason, onOpenProject, onSelectCampus, capacityWeightSettings, onUpdateCapacityWeightSettings, users, pulseWaves, pulseParticipants, pulseResponses, onCreatePulseWave, onDeletePulseWave }) {
+  const [open, setOpen] = useState(null); // "team" | "seasons" | "scorecards" | "weights" | "pulse" | null
 
   const tools = [
     { key: "team", label: "Central Team", color: "#2B4C7E", icon: Users, desc: "Browse any project or task by campus, leave a private note, optionally assign it. Campus teams never see this." },
     { key: "seasons", label: "Seasons", color: "#6B4FA0", icon: CalendarDays, desc: "Easter, Christmas, VBS — see every campus's plan for a named window in one place." },
     { key: "scorecards", label: "Location Scorecards", color: "#5E9E8A", icon: ListChecks, desc: "Margin, budget adherence, and on-time delivery — every campus, side by side." },
     { key: "weights", label: "Capacity Weights", color: "#B8862F", icon: Settings, desc: "Tune how project type, cost, deadline, and team size combine into the capacity forecast." },
+    { key: "pulse", label: "Org Pulse", color: "#C15B5B", icon: MessageSquare, desc: "A quarterly, anonymous org-wide sentiment read — separate from each person's Margin pulse." },
   ];
 
   return (
@@ -5897,6 +6026,12 @@ function CentralManagementPanel({ projects, campuses, staffByCampus, marginScore
       {open === "weights" && (
         <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mt-3 mb-8">
           <CapacityWeightsPanel settings={capacityWeightSettings || DEFAULT_CAPACITY_WEIGHTS} onSave={onUpdateCapacityWeightSettings} />
+        </div>
+      )}
+      {open === "pulse" && (
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mt-3 mb-8">
+          <OrgPulsePanel campuses={campuses} users={users} waves={pulseWaves} participants={pulseParticipants} responses={pulseResponses}
+            onCreateWave={onCreatePulseWave} onDeleteWave={onDeletePulseWave} />
         </div>
       )}
     </div>
@@ -5992,6 +6127,169 @@ function CapacityWeightsPanel({ settings, onSave }) {
         <button onClick={save} className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#B8862F", color: "#F7F6FB" }}>Save Weights</button>
         {saved && <span className="text-[11.5px]" style={{ color: "#5E9E8A" }}>Saved</span>}
       </div>
+    </div>
+  );
+}
+
+// Anonymity floor for per-campus breakdowns — even though pulse_responses carries no identity
+// at all, a campus with only 1-2 respondents effectively de-anonymizes itself (everyone there
+// knows there were only two people to answer). Below this count, a campus's numbers are folded
+// into "not enough responses" instead of shown.
+const PULSE_CAMPUS_ANONYMITY_FLOOR = 3;
+
+function OrgPulsePanel({ campuses, users, waves, participants, responses, onCreateWave, onDeleteWave }) {
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState("");
+  const [opensAt, setOpensAt] = useState(TODAY_STR);
+  const [closesAt, setClosesAt] = useState("");
+  const [selectedWaveId, setSelectedWaveId] = useState(null);
+
+  const sortedWaves = [...waves].sort((a, b) => b.opensAt.localeCompare(a.opensAt));
+  const selectedWave = sortedWaves.find((w) => w.id === selectedWaveId) || sortedWaves[0] || null;
+  const eligibleCount = users.filter((u) => u.tier && u.tier !== "unassigned").length;
+
+  const submit = () => {
+    if (!name.trim() || !closesAt) return;
+    onCreateWave(name.trim(), opensAt, closesAt);
+    setName(""); setClosesAt(""); setCreating(false);
+  };
+
+  const campusName = (id) => id === "central" ? "Central" : campuses.find((c) => c.id === id)?.name || id;
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <div className="text-[13px] font-semibold">Org Pulse</div>
+        <button onClick={() => setCreating((v) => !v)} className="flex items-center gap-1 text-[11.5px] font-medium" style={{ color: "#C15B5B" }}>
+          <Plus size={12} /> New Wave
+        </button>
+      </div>
+      <p className="text-[11.5px] text-[#6B6980] mb-4">A quarterly, anonymous read on org health — the same four questions every wave, so the trend over time means something.</p>
+
+      {creating && (
+        <div className="bg-[#F7F6FB] border border-[#D8D5EC] rounded-md p-3 mb-4 space-y-2">
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Wave name — e.g. Q3 2026 Pulse"
+            className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-3 py-2 text-[12.5px] outline-none focus:border-[#C15B5B]" />
+          <div className="flex gap-2">
+            <div className="flex-1">
+              <label className="text-[10px] text-[#8B889C] block mb-0.5">Opens</label>
+              <input type="date" value={opensAt} onChange={(e) => setOpensAt(e.target.value)} className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[12px] outline-none" />
+            </div>
+            <div className="flex-1">
+              <label className="text-[10px] text-[#8B889C] block mb-0.5">Closes</label>
+              <input type="date" value={closesAt} onChange={(e) => setClosesAt(e.target.value)} className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5 text-[12px] outline-none" />
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={submit} className="text-[12px] rounded-md px-3 py-1.5 font-medium" style={{ background: "#C15B5B", color: "#F7F6FB" }}>Create</button>
+            <button onClick={() => setCreating(false)} className="text-[12px] text-[#6B6980] px-2">Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {sortedWaves.length === 0 ? (
+        <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No waves yet — create one to open the org's first pulse.</div>
+      ) : (
+        <div className="grid sm:grid-cols-[180px_1fr] gap-4">
+          <div className="space-y-1.5">
+            {sortedWaves.map((w) => {
+              const isOpen = w.opensAt <= TODAY_STR && w.closesAt >= TODAY_STR;
+              return (
+                <button key={w.id} onClick={() => setSelectedWaveId(w.id)}
+                  className="w-full text-left rounded-md px-3 py-2 text-[12px]"
+                  style={{ background: selectedWave?.id === w.id ? "#C15B5B18" : "#F7F6FB", border: `1px solid ${selectedWave?.id === w.id ? "#C15B5B55" : "#E3E1F0"}` }}>
+                  <div className="font-medium truncate">{w.name}</div>
+                  <div className="text-[10px] text-[#8B889C]">{w.opensAt} – {w.closesAt}{isOpen ? " · open" : ""}</div>
+                </button>
+              );
+            })}
+          </div>
+
+          {selectedWave && (() => {
+            const waveParticipants = participants.filter((p) => p.waveId === selectedWave.id);
+            const waveResponses = responses.filter((r) => r.waveId === selectedWave.id);
+            const responseRate = eligibleCount ? Math.round((waveParticipants.length / eligibleCount) * 100) : 0;
+
+            const questionAvg = (key) => {
+              const vals = waveResponses.map((r) => Number(r.answers?.[key])).filter((n) => !isNaN(n));
+              return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+            };
+
+            const byCampus = {};
+            waveResponses.forEach((r) => {
+              const key = r.campusId || "unknown";
+              if (!byCampus[key]) byCampus[key] = [];
+              byCampus[key].push(r);
+            });
+
+            const notes = waveResponses.map((r) => r.note).filter(Boolean);
+
+            return (
+              <div>
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <div className="text-[12.5px] font-medium">{selectedWave.name}</div>
+                    <div className="text-[10.5px] text-[#8B889C]">{waveParticipants.length} of {eligibleCount} responded ({responseRate}%)</div>
+                  </div>
+                  <button onClick={() => onDeleteWave(selectedWave.id)} className="text-[#8B889C] hover:text-[#C15B5B]"><Trash2 size={13} /></button>
+                </div>
+
+                {waveResponses.length === 0 ? (
+                  <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No responses yet.</div>
+                ) : (
+                  <>
+                    <div className="grid sm:grid-cols-2 gap-2 mb-4">
+                      {ORG_PULSE_QUESTIONS.map((q) => {
+                        const avg = questionAvg(q.key);
+                        return (
+                          <div key={q.key} className="bg-[#F7F6FB] border border-[#E3E1F0] rounded-md p-3">
+                            <div className="text-[11px] text-[#6B6980] mb-1">{q.text}</div>
+                            <div className="text-[18px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color: "#C15B5B" }}>
+                              {avg == null ? "—" : avg.toFixed(1)} <span className="text-[11px] font-normal text-[#8B889C]">/ 5</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className="mb-4">
+                      <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">By Campus</div>
+                      <div className="space-y-1.5">
+                        {Object.keys(byCampus).sort().map((campusId) => {
+                          const rows = byCampus[campusId];
+                          const enough = rows.length >= PULSE_CAMPUS_ANONYMITY_FLOOR;
+                          const overallAvg = enough
+                            ? ORG_PULSE_QUESTIONS.reduce((sum, q) => sum + (rows.map((r) => Number(r.answers?.[q.key])).filter((n) => !isNaN(n)).reduce((a, b) => a + b, 0) / rows.length), 0) / ORG_PULSE_QUESTIONS.length
+                            : null;
+                          return (
+                            <div key={campusId} className="flex items-center justify-between text-[12px] bg-[#F7F6FB] border border-[#E3E1F0] rounded-md px-3 py-2">
+                              <span>{campusName(campusId)}</span>
+                              <span className="text-[#6B6980]">
+                                {enough ? `avg ${overallAvg.toFixed(1)} / 5 · ${rows.length} responses` : `${rows.length} response${rows.length === 1 ? "" : "s"} — too few to show a breakdown`}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {notes.length > 0 && (
+                      <div>
+                        <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">Anonymous notes</div>
+                        <div className="space-y-1.5">
+                          {notes.map((n, i) => (
+                            <div key={i} className="text-[12px] bg-[#F7F6FB] border border-[#E3E1F0] rounded-md px-3 py-2">{n}</div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            );
+          })()}
+        </div>
+      )}
     </div>
   );
 }
