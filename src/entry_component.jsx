@@ -68,6 +68,23 @@ const DEFAULT_CAPACITY_WEIGHTS = {
   overCapacityThreshold: 6,
 };
 
+// Approval workflows — deliberately single-step (submit, one approver decides, done), no
+// multi-level chains. Who the approver actually is gets resolved at submit time, not stored as
+// a fixed field: an od/staff request goes to that campus's other admin-tier person(s) if one
+// exists, else escalates to Central; a request from an od (or central) always goes to Central,
+// since 0028_approval_requests.sql's RLS won't let anyone decide their own request anyway.
+const APPROVAL_TYPE_LABEL = { budget: "Budget", purchase: "Purchase", pto: "Time Off" };
+const APPROVAL_TYPE_COLOR = { budget: "#B8862F", purchase: "#2B4C7E", pto: "#5E9E8A" };
+const APPROVAL_STATUS_COLOR = { pending: "#B8862F", approved: "#5E9E8A", denied: "#C15B5B" };
+
+function resolveApprovalApprovers(campusId, requesterProfileId, requesterTier, users) {
+  const displayName = (u) => `${u.firstName || ""} ${u.lastName || ""}`.trim() || u.email;
+  const centralNames = () => users.filter((u) => u.tier === "central").map(displayName);
+  if (requesterTier !== "staff") return centralNames();
+  const campusODs = users.filter((u) => u.campusId === campusId && u.tier === "od" && u.id !== requesterProfileId);
+  return campusODs.length > 0 ? campusODs.map(displayName) : centralNames();
+}
+
 const LANE_ROLE_OPTIONS = {
   "Operations": [
     "Operations Director", "Campus Support Director", "Facilities Coordinator", "Safety Coordinator",
@@ -121,7 +138,7 @@ let handleUnauthorized = () => {};
 // vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
 // the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
 // snake_case columns — so every existing call site keeps working unchanged.
-const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses" };
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses", ApprovalRequests: "approval_requests" };
 
 // Every table's primary key is "id" except campus_config (natural key campus_id) and
 // margin_scores (natural key staff_id, one row per staff member) — neither has a separate
@@ -153,6 +170,7 @@ const FIELD_MAPS = {
   pulse_waves: { organizationId: "organization_id", opensAt: "opens_at", closesAt: "closes_at", createdBy: "created_by", createdAt: "created_at" },
   pulse_wave_participants: { waveId: "wave_id", profileId: "profile_id", respondedAt: "responded_at" },
   pulse_responses: { waveId: "wave_id", campusId: "campus_id", submittedAt: "submitted_at" },
+  approval_requests: { organizationId: "organization_id", campusId: "campus_id", startsOn: "starts_on", endsOn: "ends_on", requestedBy: "requested_by", requestedByProfileId: "requested_by_profile_id", decidedBy: "decided_by", decidedAt: "decided_at", decisionNote: "decision_note", createdAt: "created_at" },
 };
 
 function toSnakeRow(table, obj) {
@@ -1006,6 +1024,7 @@ export default function OpsDashboard() {
   const [pulseWaves, setPulseWaves] = useState([]);
   const [pulseParticipants, setPulseParticipants] = useState([]); // central sees everyone; od/staff see only their own row — RLS, 0027_org_pulse.sql
   const [pulseResponses, setPulseResponses] = useState([]); // central-only per RLS; empty for everyone else
+  const [approvalRequests, setApprovalRequests] = useState([]);
   const [pendingMarginPulse, setPendingMarginPulse] = useState(null);
   const [campuses, setCampuses] = useState([]);
   const [users, setUsers] = useState([]);
@@ -1201,8 +1220,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult, approvalRequestsResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"), apiGet("ApprovalRequests"),
       ]);
       if (cancelled) return;
 
@@ -1346,6 +1365,8 @@ export default function OpsDashboard() {
       if (pulseWavesResult.status === "fulfilled") setPulseWaves(pulseWavesResult.value);
       if (pulseParticipantsResult.status === "fulfilled") setPulseParticipants(pulseParticipantsResult.value);
       if (pulseResponsesResult.status === "fulfilled") setPulseResponses(pulseResponsesResult.value);
+
+      if (approvalRequestsResult.status === "fulfilled") setApprovalRequests(approvalRequestsResult.value);
 
       if (failures.length > 0) {
         setBackendStatus("offline");
@@ -2114,6 +2135,53 @@ export default function OpsDashboard() {
     }
   };
 
+  // Notifies whoever resolveApprovalApprovers says should decide this request — same
+  // notifications table every other feature already uses, just with no projectId to attach.
+  const notifyApprovalApprovers = (request) => {
+    const names = new Set(resolveApprovalApprovers(request.campusId, request.requestedByProfileId, request.requesterTier, users));
+    names.delete(currentViewerName);
+    if (names.size === 0) return;
+    const summary = `submitted a ${APPROVAL_TYPE_LABEL[request.type].toLowerCase()} request: "${request.reason}"`;
+    const rows = Array.from(names).map((forUser) => ({ forUser, actor: currentViewerName, summary, ts: TODAY_STR, read: false }));
+    setNotifications((prev) => [...rows.map((r) => ({ ...r, id: `${Date.now()}-${Math.random()}` })), ...prev]);
+    syncToBackend(Promise.all(rows.map((r) => apiCreate("Notifications", { ...r, organizationId: OSC_ORG_ID }))));
+  };
+
+  const submitApprovalRequest = async (campusId, type, { amount, startsOn, endsOn, reason }) => {
+    setSyncing(true);
+    try {
+      const created = await apiCreate("ApprovalRequests", {
+        organizationId: OSC_ORG_ID, campusId, type, amount: amount || null, startsOn: startsOn || null, endsOn: endsOn || null,
+        reason, requestedBy: currentViewerName, requestedByProfileId: auth.user.id, status: "pending",
+      });
+      setApprovalRequests((prev) => [...prev, created]);
+      notifyApprovalApprovers({ ...created, requesterTier: auth.user.tier });
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const decideApprovalRequest = (requestId, status, decisionNote) => {
+    const request = approvalRequests.find((r) => r.id === requestId);
+    const decidedAt = new Date().toISOString();
+    setApprovalRequests((prev) => prev.map((r) => r.id === requestId ? { ...r, status, decidedBy: currentViewerName, decidedAt, decisionNote: decisionNote || null } : r));
+    syncToBackend(apiUpdate("ApprovalRequests", requestId, { status, decidedBy: currentViewerName, decidedAt, decisionNote: decisionNote || null }));
+    if (request && request.requestedBy !== currentViewerName) {
+      const summary = `${status} your ${APPROVAL_TYPE_LABEL[request.type].toLowerCase()} request: "${request.reason}"${decisionNote ? ` — "${decisionNote}"` : ""}`;
+      const row = { forUser: request.requestedBy, actor: currentViewerName, summary, ts: TODAY_STR, read: false };
+      setNotifications((prev) => [{ ...row, id: `${Date.now()}-${Math.random()}` }, ...prev]);
+      syncToBackend(apiCreate("Notifications", { ...row, organizationId: OSC_ORG_ID }));
+    }
+  };
+
+  const withdrawApprovalRequest = (requestId) => {
+    setApprovalRequests((prev) => prev.filter((r) => r.id !== requestId));
+    syncToBackend(apiDelete("ApprovalRequests", requestId));
+  };
+
   // Persists a campus's Slides org-chart link to the CampusConfig sheet (id = campusId, so
   // this is a plain generic-CRUD upsert: create the row the first time, update it after that).
   const setCampusSlidesLink = (campusId, url) => {
@@ -2337,6 +2405,7 @@ export default function OpsDashboard() {
     { id: "notes", label: "Notes", icon: StickyNote, section: "Work" },
     { id: "activity", label: "Activity", icon: ActivityIcon, section: "Work" },
     { id: "playbooks", label: "Playbooks", icon: CheckCircle2, section: "Work" },
+    { id: "requests", label: "Requests", icon: FileText, section: "Work" },
     { id: "staff", label: "Staff & Team", icon: Users, section: "People" },
     { id: "events", label: "Cross-Campus Events", icon: Link2, section: "People" },
     ...(auth?.user?.tier === "central" ? [{ id: "centralmgmt", label: "Central Management", icon: Settings, section: "Admin" }] : []),
@@ -2551,6 +2620,15 @@ export default function OpsDashboard() {
               onStartRun={startPlaybookRun} onToggleRunItem={togglePlaybookRunItem} onDeleteRun={deletePlaybookRun}
               onAddRunItem={addPlaybookRunItem} onRemoveRunItem={removePlaybookRunItem}
               onSetRunItemAssignee={setPlaybookRunItemAssignee} onSetRunItemManager={setPlaybookRunItemManager} onSetRunItemDueDate={setPlaybookRunItemDueDate}
+            />
+          )}
+
+          {tab === "requests" && (
+            <ApprovalRequestsPanel
+              requests={approvalRequests} campuses={campuses}
+              activeCampusId={activeCampusId} campusLabel={activeCampus ? activeCampus.name : "All Campuses"}
+              currentViewerName={currentViewerName} viewerTier={auth.user.tier}
+              onSubmit={submitApprovalRequest} onDecide={decideApprovalRequest} onWithdraw={withdrawApprovalRequest}
             />
           )}
 
@@ -5876,9 +5954,139 @@ function StartPlaybookRunModal({ templates, campuses, staffByCampus, projects, d
   );
 }
 
+function ApprovalRequestsPanel({ requests, campuses, activeCampusId, campusLabel, currentViewerName, viewerTier, onSubmit, onDecide, onWithdraw }) {
+  const [showNew, setShowNew] = useState(false);
+  const [newType, setNewType] = useState("budget");
+  const [newAmount, setNewAmount] = useState("");
+  const [newStartsOn, setNewStartsOn] = useState("");
+  const [newEndsOn, setNewEndsOn] = useState("");
+  const [newReason, setNewReason] = useState("");
+  const [decidingId, setDecidingId] = useState(null);
+  const [denyNote, setDenyNote] = useState("");
+
+  const scopedRequests = activeCampusId ? requests.filter((r) => r.campusId === activeCampusId) : requests;
+  const sorted = [...scopedRequests].sort((a, b) => {
+    if (a.status === "pending" && b.status !== "pending") return -1;
+    if (b.status === "pending" && a.status !== "pending") return 1;
+    return new Date(b.createdAt) - new Date(a.createdAt);
+  });
+
+  const canDecide = (r) => r.status === "pending" && r.requestedBy !== currentViewerName && (viewerTier === "central" || (viewerTier === "od" && r.campusId === activeCampusId));
+  const canWithdraw = (r) => r.status === "pending" && r.requestedBy === currentViewerName;
+
+  const submit = () => {
+    if (!newReason.trim()) return;
+    onSubmit(activeCampusId || "central", newType, { amount: newAmount ? Number(newAmount) : null, startsOn: newStartsOn || null, endsOn: newEndsOn || null, reason: newReason.trim() });
+    setNewType("budget"); setNewAmount(""); setNewStartsOn(""); setNewEndsOn(""); setNewReason(""); setShowNew(false);
+  };
+
+  const approve = (id) => onDecide(id, "approved", "");
+  const deny = (id) => { onDecide(id, "denied", denyNote.trim()); setDecidingId(null); setDenyNote(""); };
+
+  const inputClass = "w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[12.5px] outline-none focus:border-[#2B4C7E]";
+  const labelClass = "text-[10.5px] text-[#6B6980] block mb-1";
+
+  return (
+    <div>
+      <div className="flex items-start justify-between mb-6 gap-3 flex-wrap">
+        <div>
+          <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(18px,3.6vw,22px)] font-semibold tracking-tight">Requests — {campusLabel}</h1>
+          <p className="text-[12.5px] text-[#6B6980] mt-1">Budget, purchase, and time-off requests — submitted, routed, decided.</p>
+        </div>
+        <button onClick={() => setShowNew((v) => !v)} className="flex items-center gap-1.5 text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>
+          <Plus size={14} /> New Request
+        </button>
+      </div>
+
+      {showNew && (
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mb-6 max-w-[440px]">
+          <div className="grid sm:grid-cols-2 gap-3 mb-3">
+            <div>
+              <label className={labelClass}>Type</label>
+              <select value={newType} onChange={(e) => setNewType(e.target.value)} className={inputClass}>
+                <option value="budget">Budget</option>
+                <option value="purchase">Purchase</option>
+                <option value="pto">Time Off</option>
+              </select>
+            </div>
+            {newType !== "pto" ? (
+              <div>
+                <label className={labelClass}>Amount</label>
+                <input type="number" min="0" step="0.01" value={newAmount} onChange={(e) => setNewAmount(e.target.value)} placeholder="$0.00" className={inputClass} />
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className={labelClass}>From</label>
+                  <input type="date" value={newStartsOn} onChange={(e) => setNewStartsOn(e.target.value)} className={inputClass} />
+                </div>
+                <div>
+                  <label className={labelClass}>To</label>
+                  <input type="date" value={newEndsOn} onChange={(e) => setNewEndsOn(e.target.value)} className={inputClass} />
+                </div>
+              </div>
+            )}
+          </div>
+          <label className={labelClass}>Reason</label>
+          <textarea value={newReason} onChange={(e) => setNewReason(e.target.value)} rows={2} placeholder="What's this for?" className={`${inputClass} mb-3`} />
+          <div className="flex gap-2">
+            <button onClick={submit} className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Submit Request</button>
+            <button onClick={() => setShowNew(false)} className="text-[13px] text-[#6B6980] px-2">Cancel</button>
+          </div>
+        </div>
+      )}
+
+      <div className="space-y-2">
+        {sorted.map((r) => (
+          <div key={r.id} className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-3">
+            <div className="flex items-start justify-between gap-2 mb-1.5">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap mb-1">
+                  <span className="text-[10px] px-2 py-0.5 rounded-full font-medium" style={{ background: `${APPROVAL_TYPE_COLOR[r.type]}22`, color: APPROVAL_TYPE_COLOR[r.type] }}>{APPROVAL_TYPE_LABEL[r.type]}</span>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full font-medium capitalize" style={{ background: `${APPROVAL_STATUS_COLOR[r.status]}22`, color: APPROVAL_STATUS_COLOR[r.status] }}>{r.status}</span>
+                  {!activeCampusId && <span className="text-[10px] text-[#8B889C]">{campuses.find((c) => c.id === r.campusId)?.name || (r.campusId === "central" ? "Central" : r.campusId)}</span>}
+                </div>
+                <div className="text-[12.5px]">{r.reason}</div>
+                <div className="text-[10.5px] text-[#6B6980] mt-1">
+                  {r.requestedBy} · {r.createdAt?.slice(0, 10)}
+                  {r.amount != null && ` · ${fmtMoney(r.amount)}`}
+                  {r.startsOn && ` · ${r.startsOn} – ${r.endsOn || "?"}`}
+                </div>
+                {r.status !== "pending" && (
+                  <div className="text-[10.5px] text-[#8B889C] mt-1">
+                    {r.status === "approved" ? "Approved" : "Denied"} by {r.decidedBy}{r.decisionNote ? ` — "${r.decisionNote}"` : ""}
+                  </div>
+                )}
+              </div>
+            </div>
+            {canDecide(r) && (
+              decidingId === r.id ? (
+                <div className="flex gap-1.5 items-center mt-2 flex-wrap">
+                  <input value={denyNote} onChange={(e) => setDenyNote(e.target.value)} placeholder="Reason for denying (optional)"
+                    className="flex-1 min-w-[160px] bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11.5px] outline-none" />
+                  <button onClick={() => deny(r.id)} className="text-[11px] rounded-md px-2.5 py-1 font-medium" style={{ background: "#C15B5B", color: "#FFFFFF" }}>Confirm Deny</button>
+                  <button onClick={() => { setDecidingId(null); setDenyNote(""); }} className="text-[11px] text-[#6B6980]">Cancel</button>
+                </div>
+              ) : (
+                <div className="flex gap-2 mt-2">
+                  <button onClick={() => approve(r.id)} className="text-[11px] rounded-md px-3 py-1.5 font-medium" style={{ background: "#5E9E8A", color: "#FFFFFF" }}>Approve</button>
+                  <button onClick={() => setDecidingId(r.id)} className="text-[11px] rounded-md px-3 py-1.5 font-medium border border-[#C15B5B66] text-[#C15B5B]">Deny</button>
+                </div>
+              )
+            )}
+            {canWithdraw(r) && decidingId !== r.id && (
+              <button onClick={() => onWithdraw(r.id)} className="text-[10.5px] text-[#8B889C] hover:text-[#C15B5B] mt-2">Withdraw</button>
+            )}
+          </div>
+        ))}
+        {sorted.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-8 text-center">No requests yet.</div>}
+      </div>
+    </div>
+  );
+}
+
 function SeasonsPanel({ seasons, projects, campuses, onCreateSeason, onOpenProject }) {
   const [creating, setCreating] = useState(false);
-  const [name, setName] = useState("");
   const [startsOn, setStartsOn] = useState("");
   const [endsOn, setEndsOn] = useState("");
   const [openSeasonId, setOpenSeasonId] = useState(null);

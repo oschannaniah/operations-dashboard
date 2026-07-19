@@ -958,6 +958,10 @@ video {
   min-width: 140px;
 }
 
+.min-w-\[160px\] {
+  min-width: 160px;
+}
+
 .min-w-\[180px\] {
   min-width: 180px;
 }
@@ -1327,6 +1331,10 @@ video {
 .border-\[\#B8862F\] {
   --tw-border-opacity: 1;
   border-color: rgb(184 134 47 / var(--tw-border-opacity, 1));
+}
+
+.border-\[\#C15B5B66\] {
+  border-color: #C15B5B66;
 }
 
 .border-\[\#C15B5B\] {
@@ -1763,6 +1771,10 @@ video {
 
 .uppercase {
   text-transform: uppercase;
+}
+
+.capitalize {
+  text-transform: capitalize;
 }
 
 .italic {
