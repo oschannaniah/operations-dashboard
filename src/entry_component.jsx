@@ -104,7 +104,7 @@ let handleUnauthorized = () => {};
 // vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
 // the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
 // snake_case columns — so every existing call site keeps working unchanged.
-const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log" };
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items" };
 
 // Every table's primary key is "id" except campus_config (natural key campus_id) and
 // margin_scores (natural key staff_id, one row per staff member) — neither has a separate
@@ -128,6 +128,10 @@ const FIELD_MAPS = {
   team_members: { teamId: "team_id", staffId: "staff_id", roleInTeam: "role_in_team", addedAt: "added_at" },
   staff_flag_history: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", setBy: "set_by", setAt: "set_at" },
   staff_checkin_log: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", loggedBy: "logged_by", loggedAt: "logged_at" },
+  playbook_templates: { organizationId: "organization_id", createdBy: "created_by", createdAt: "created_at" },
+  playbook_template_items: { templateId: "template_id" },
+  playbook_runs: { organizationId: "organization_id", campusId: "campus_id", templateId: "template_id", templateName: "template_name", targetStaffId: "target_staff_id", targetProjectId: "target_project_id", startedBy: "started_by", startedAt: "started_at" },
+  playbook_run_items: { runId: "run_id", doneBy: "done_by", doneAt: "done_at" },
 };
 
 function toSnakeRow(table, obj) {
@@ -905,6 +909,10 @@ export default function OpsDashboard() {
   const [teamMembers, setTeamMembers] = useState([]);
   const [flagHistory, setFlagHistory] = useState([]);
   const [checkinLog, setCheckinLog] = useState([]);
+  const [playbookTemplates, setPlaybookTemplates] = useState([]);
+  const [playbookTemplateItems, setPlaybookTemplateItems] = useState([]);
+  const [playbookRuns, setPlaybookRuns] = useState([]);
+  const [playbookRunItems, setPlaybookRunItems] = useState([]);
   const [pendingMarginPulse, setPendingMarginPulse] = useState(null);
   const [campuses, setCampuses] = useState([]);
   const [users, setUsers] = useState([]);
@@ -1093,8 +1101,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"),
       ]);
       if (cancelled) return;
 
@@ -1220,6 +1228,13 @@ export default function OpsDashboard() {
       // Append-only logs behind Health Trends — see 0021_health_trends.sql.
       if (flagHistoryResult.status === "fulfilled") setFlagHistory(flagHistoryResult.value);
       if (checkinLogResult.status === "fulfilled") setCheckinLog(checkinLogResult.value);
+
+      // Templates are org-wide read for od/staff, full CRUD for central; runs/items are
+      // campus-scoped the same way staff/teams are — see 0022_playbooks.sql.
+      if (playbookTemplatesResult.status === "fulfilled") setPlaybookTemplates(playbookTemplatesResult.value);
+      if (playbookTemplateItemsResult.status === "fulfilled") setPlaybookTemplateItems(playbookTemplateItemsResult.value);
+      if (playbookRunsResult.status === "fulfilled") setPlaybookRuns(playbookRunsResult.value);
+      if (playbookRunItemsResult.status === "fulfilled") setPlaybookRunItems(playbookRunItemsResult.value);
 
       if (failures.length > 0) {
         setBackendStatus("offline");
@@ -1786,6 +1801,66 @@ export default function OpsDashboard() {
     syncToBackend(apiUpdate("TeamMembers", memberRowId, { roleInTeam }));
   };
 
+  // Central-curated checklist library. od/staff can read (to apply a template) but RLS blocks
+  // them from ever reaching create/delete, so no client-side tier gate is needed here either.
+  const createPlaybookTemplate = async (name, type, itemTexts) => {
+    setSyncing(true);
+    try {
+      const template = await apiCreate("PlaybookTemplates", { organizationId: OSC_ORG_ID, name, type, createdBy: currentViewerName });
+      setPlaybookTemplates((prev) => [...prev, template]);
+      const createdItems = await Promise.all(itemTexts.map((text, idx) => apiCreate("PlaybookTemplateItems", { templateId: template.id, position: idx, text })));
+      setPlaybookTemplateItems((prev) => [...prev, ...createdItems]);
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const deletePlaybookTemplate = (templateId) => {
+    setPlaybookTemplates((prev) => prev.filter((t) => t.id !== templateId));
+    setPlaybookTemplateItems((prev) => prev.filter((i) => i.templateId !== templateId));
+    syncToBackend(apiDelete("PlaybookTemplates", templateId));
+  };
+
+  // Copies the template's current items into their own rows on the run — see the migration
+  // comment for why (a later template edit shouldn't rewrite history on a run already in
+  // progress).
+  const startPlaybookRun = async (campusId, templateId, target) => {
+    const template = playbookTemplates.find((t) => t.id === templateId);
+    if (!template) return;
+    const items = playbookTemplateItems.filter((i) => i.templateId === templateId).sort((a, b) => a.position - b.position);
+    setSyncing(true);
+    try {
+      const run = await apiCreate("PlaybookRuns", {
+        organizationId: OSC_ORG_ID, campusId, templateId, templateName: template.name, type: template.type,
+        targetStaffId: target?.staffId || null, targetProjectId: target?.projectId || null, startedBy: currentViewerName,
+      });
+      setPlaybookRuns((prev) => [...prev, run]);
+      const createdItems = await Promise.all(items.map((it, idx) => apiCreate("PlaybookRunItems", { runId: run.id, position: idx, text: it.text })));
+      setPlaybookRunItems((prev) => [...prev, ...createdItems]);
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const togglePlaybookRunItem = (itemId, done) => {
+    const doneAt = done ? new Date().toISOString() : null;
+    const doneBy = done ? currentViewerName : null;
+    setPlaybookRunItems((prev) => prev.map((it) => it.id === itemId ? { ...it, done, doneBy, doneAt } : it));
+    syncToBackend(apiUpdate("PlaybookRunItems", itemId, { done, doneBy, doneAt }));
+  };
+
+  const deletePlaybookRun = (runId) => {
+    setPlaybookRuns((prev) => prev.filter((r) => r.id !== runId));
+    setPlaybookRunItems((prev) => prev.filter((i) => i.runId !== runId));
+    syncToBackend(apiDelete("PlaybookRuns", runId));
+  };
+
   // Persists a campus's Slides org-chart link to the CampusConfig sheet (id = campusId, so
   // this is a plain generic-CRUD upsert: create the row the first time, update it after that).
   const setCampusSlidesLink = (campusId, url) => {
@@ -2008,6 +2083,7 @@ export default function OpsDashboard() {
     { id: "calendar", label: "Calendar", icon: CalendarDays, section: "Work" },
     { id: "notes", label: "Notes", icon: StickyNote, section: "Work" },
     { id: "activity", label: "Activity", icon: ActivityIcon, section: "Work" },
+    { id: "playbooks", label: "Playbooks", icon: CheckCircle2, section: "Work" },
     { id: "staff", label: "Staff & Team", icon: Users, section: "People" },
     { id: "events", label: "Cross-Campus Events", icon: Link2, section: "People" },
     ...(auth?.user?.tier === "central" ? [{ id: "centralmgmt", label: "Central Management", icon: Settings, section: "Admin" }] : []),
@@ -2205,6 +2281,18 @@ export default function OpsDashboard() {
             <ActivityPanel
               activity={activeCampusId ? activityLog.filter((a) => a.campus === activeCampusId) : activityLog}
               full projects={displayProjects} currentViewerName={currentViewerName}
+            />
+          )}
+
+          {tab === "playbooks" && (
+            <PlaybooksPanel
+              projects={displayProjects} campuses={campuses} staffByCampus={staffByCampus}
+              activeCampusId={activeCampusId} campusLabel={activeCampus ? activeCampus.name : "All Campuses"}
+              tier={auth.user.tier}
+              templates={playbookTemplates} templateItems={playbookTemplateItems}
+              runs={playbookRuns} runItems={playbookRunItems}
+              onCreateTemplate={createPlaybookTemplate} onDeleteTemplate={deletePlaybookTemplate}
+              onStartRun={startPlaybookRun} onToggleRunItem={togglePlaybookRunItem} onDeleteRun={deletePlaybookRun}
             />
           )}
 
@@ -5006,6 +5094,278 @@ function LocationScorecardsPanel({ campuses, projects, staffByCampus, marginScor
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+const PLAYBOOK_TYPE_LABEL = { onboarding: "Onboarding", project: "Project", standing: "Standing / Recurring" };
+const PLAYBOOK_TYPE_COLOR = { onboarding: "#2B4C7E", project: "#B8862F", standing: "#5E9E8A" };
+
+function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, campusLabel, tier, templates, templateItems, runs, runItems, onCreateTemplate, onDeleteTemplate, onStartRun, onToggleRunItem, onDeleteRun }) {
+  const [showNewTemplate, setShowNewTemplate] = useState(false);
+  const [showStartRun, setShowStartRun] = useState(false);
+  const [expandedRunId, setExpandedRunId] = useState(null);
+  const isCentral = tier === "central";
+
+  const scopedRuns = activeCampusId ? runs.filter((r) => r.campusId === activeCampusId) : runs;
+  const sortedRuns = [...scopedRuns].sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
+  const itemsForRun = (runId) => runItems.filter((i) => i.runId === runId).sort((a, b) => a.position - b.position);
+  const campusName = (id) => campuses.find((c) => c.id === id)?.name || (id === "central" ? "Central" : id);
+
+  return (
+    <div>
+      <div className="flex items-start justify-between mb-6 gap-3 flex-wrap">
+        <div>
+          <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(18px,3.6vw,22px)] font-semibold tracking-tight">Playbooks — {campusLabel}</h1>
+          <p className="text-[12.5px] text-[#6B6980] mt-1">Reusable checklists — onboarding, opening procedures, season launches — applied and tracked to completion.</p>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={() => setShowStartRun(true)} className="flex items-center gap-1.5 text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>
+            <Plus size={14} /> Start a Run
+          </button>
+          {isCentral && (
+            <button onClick={() => setShowNewTemplate(true)} className="flex items-center gap-1.5 text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#B8862F", color: "#F7F6FB" }}>
+              <Plus size={14} /> New Template
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="mb-7">
+        <div className="text-[11.5px] font-medium text-[#2A2A3A] mb-2">Template Library</div>
+        {templates.length === 0 ? (
+          <div className="text-[11.5px] text-[#8B889C] py-3">No templates yet.{isCentral ? " Create one to get started." : " Ask Central to create one."}</div>
+        ) : (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+            {templates.map((t) => {
+              const items = templateItems.filter((i) => i.templateId === t.id);
+              return (
+                <div key={t.id} className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-3">
+                  <div className="flex items-start justify-between gap-2 mb-1.5">
+                    <span className="text-[12.5px] font-medium">{t.name}</span>
+                    {isCentral && (
+                      <button onClick={() => onDeleteTemplate(t.id)} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><Trash2 size={13} /></button>
+                    )}
+                  </div>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full" style={{ background: `${PLAYBOOK_TYPE_COLOR[t.type]}22`, color: PLAYBOOK_TYPE_COLOR[t.type] }}>{PLAYBOOK_TYPE_LABEL[t.type] || t.type}</span>
+                  <div className="text-[10.5px] text-[#8B889C] mt-1.5">{items.length} item{items.length === 1 ? "" : "s"}</div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="text-[11.5px] font-medium text-[#2A2A3A] mb-2">Active & Recent Runs</div>
+      <div className="space-y-2">
+        {sortedRuns.map((run) => {
+          const items = itemsForRun(run.id);
+          const done = items.filter((i) => i.done).length;
+          const total = items.length;
+          const pct = total ? Math.round((done / total) * 100) : 0;
+          const complete = total > 0 && done === total;
+          const isExpanded = expandedRunId === run.id;
+          const targetLabel = run.type === "onboarding"
+            ? (staffByCampus[run.campusId] || []).find((s) => s.id === run.targetStaffId)?.name || "Unknown person"
+            : run.type === "project"
+              ? projects.find((p) => p.id === run.targetProjectId)?.title || "Unknown project"
+              : "Standing checklist";
+          return (
+            <div key={run.id} className="bg-[#FFFFFF] border rounded-lg p-3" style={{ borderColor: complete ? "#5E9E8A88" : "#E3E1F0" }}>
+              <button onClick={() => setExpandedRunId(isExpanded ? null : run.id)} className="w-full text-left">
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <span className="text-[12.5px] font-medium truncate">{run.templateName}{complete && <span className="ml-1.5 text-[10px] font-normal" style={{ color: "#5E9E8A" }}>Complete</span>}</span>
+                  <ChevronRight size={14} className="text-[#8B889C] shrink-0 transition-transform" style={{ transform: isExpanded ? "rotate(90deg)" : "none" }} />
+                </div>
+                <div className="text-[10.5px] text-[#6B6980] mb-2 truncate">
+                  {!activeCampusId && `${campusName(run.campusId)} · `}{targetLabel} · started by {run.startedBy || "—"}
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="h-1.5 flex-1 rounded-full bg-[#E3E1F0] overflow-hidden"><div className="h-full rounded-full" style={{ width: `${pct}%`, background: complete ? "#5E9E8A" : "#2B4C7E" }} /></div>
+                  <span className="text-[10.5px] text-[#6B6980] shrink-0">{done}/{total}</span>
+                </div>
+              </button>
+              {isExpanded && (
+                <div className="mt-3 pt-3 border-t border-[#E3E1F0] space-y-1.5">
+                  {items.map((item) => (
+                    <label key={item.id} className="flex items-start gap-2 text-[12px] cursor-pointer">
+                      <input type="checkbox" checked={item.done} onChange={(e) => onToggleRunItem(item.id, e.target.checked)} className="mt-0.5" />
+                      <span className={item.done ? "line-through text-[#8B889C]" : ""}>{item.text}</span>
+                    </label>
+                  ))}
+                  <button onClick={() => onDeleteRun(run.id)} className="text-[10.5px] text-[#8B889C] hover:text-[#C15B5B] mt-2">Delete this run</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {sortedRuns.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No runs yet — start one from a template above.</div>}
+      </div>
+
+      {showNewTemplate && (
+        <NewPlaybookTemplateModal onClose={() => setShowNewTemplate(false)} onCreate={(name, type, items) => { onCreateTemplate(name, type, items); setShowNewTemplate(false); }} />
+      )}
+      {showStartRun && (
+        <StartPlaybookRunModal templates={templates} campuses={campuses} staffByCampus={staffByCampus} projects={projects}
+          defaultCampusId={activeCampusId} isCentral={isCentral}
+          onClose={() => setShowStartRun(false)} onStart={(campusId, templateId, target) => { onStartRun(campusId, templateId, target); setShowStartRun(false); }} />
+      )}
+    </div>
+  );
+}
+
+function NewPlaybookTemplateModal({ onClose, onCreate }) {
+  useLockBodyScroll();
+  const [name, setName] = useState("");
+  const [type, setType] = useState("onboarding");
+  const [items, setItems] = useState([""]);
+
+  const updateItem = (i, val) => setItems((prev) => prev.map((it, idx) => idx === i ? val : it));
+  const addItem = () => setItems((prev) => [...prev, ""]);
+  const removeItem = (i) => setItems((prev) => prev.filter((_, idx) => idx !== i));
+
+  const submit = (e) => {
+    e.preventDefault();
+    const clean = items.map((i) => i.trim()).filter(Boolean);
+    if (!name.trim() || clean.length === 0) return;
+    onCreate(name.trim(), type, clean);
+  };
+
+  const labelClass = "text-[11px] font-medium text-[#6B6980] mb-1 block";
+  const inputClass = "w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#2B4C7E]";
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[480px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-[15px] font-semibold">New Playbook Template</h2>
+          <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
+        </div>
+        <form onSubmit={submit} className="space-y-3">
+          <div>
+            <label className={labelClass}>Name</label>
+            <input required value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. New Hire Onboarding" className={inputClass} />
+          </div>
+          <div>
+            <label className={labelClass}>Applies to</label>
+            <select value={type} onChange={(e) => setType(e.target.value)} className={inputClass}>
+              <option value="onboarding">A person (onboarding)</option>
+              <option value="project">A project</option>
+              <option value="standing">Standing / recurring (no specific target)</option>
+            </select>
+          </div>
+          <div>
+            <label className={labelClass}>Checklist items</label>
+            <div className="space-y-1.5">
+              {items.map((it, i) => (
+                <div key={i} className="flex gap-1.5">
+                  <input value={it} onChange={(e) => updateItem(i, e.target.value)} placeholder={`Item ${i + 1}`}
+                    className="flex-1 bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[12.5px] outline-none focus:border-[#2B4C7E]" />
+                  {items.length > 1 && (
+                    <button type="button" onClick={() => removeItem(i)} className="text-[#8B889C] hover:text-[#C15B5B] px-1"><Trash2 size={13} /></button>
+                  )}
+                </div>
+              ))}
+            </div>
+            <button type="button" onClick={addItem} className="flex items-center gap-1 text-[11px] mt-2" style={{ color: "#2B4C7E" }}>
+              <Plus size={11} /> Add item
+            </button>
+          </div>
+          <div className="flex gap-2 pt-1">
+            <button type="submit" className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Create Template</button>
+            <button type="button" onClick={onClose} className="text-[13px] text-[#6B6980] px-2">Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function StartPlaybookRunModal({ templates, campuses, staffByCampus, projects, defaultCampusId, isCentral, onClose, onStart }) {
+  useLockBodyScroll();
+  const [campusId, setCampusId] = useState(defaultCampusId || "");
+  const [templateId, setTemplateId] = useState("");
+  const [targetStaffId, setTargetStaffId] = useState("");
+  const [targetProjectId, setTargetProjectId] = useState("");
+  const [error, setError] = useState("");
+
+  const template = templates.find((t) => t.id === templateId);
+  const campusStaff = staffByCampus[campusId] || [];
+  const campusProjects = projects.filter((p) => p.campus === campusId && p.stage !== "Completed");
+
+  const submit = (e) => {
+    e.preventDefault();
+    setError("");
+    if (!campusId || !templateId) { setError("Pick a campus and a template."); return; }
+    if (template?.type === "onboarding" && !targetStaffId) { setError("Pick who this onboarding is for."); return; }
+    if (template?.type === "project" && !targetProjectId) { setError("Pick which project this applies to."); return; }
+    onStart(campusId, templateId,
+      template?.type === "onboarding" ? { staffId: Number(targetStaffId) } :
+      template?.type === "project" ? { projectId: Number(targetProjectId) } : null
+    );
+  };
+
+  const labelClass = "text-[11px] font-medium text-[#6B6980] mb-1 block";
+  const inputClass = "w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#2B4C7E]";
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[440px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-[15px] font-semibold">Start a Playbook Run</h2>
+          <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
+        </div>
+        {templates.length === 0 ? (
+          <p className="text-[12.5px] text-[#6B6980]">No templates exist yet — ask Central to create one first.</p>
+        ) : (
+          <form onSubmit={submit} className="space-y-3">
+            {isCentral ? (
+              <div>
+                <label className={labelClass}>Campus</label>
+                <select value={campusId} onChange={(e) => { setCampusId(e.target.value); setTargetStaffId(""); setTargetProjectId(""); }} className={inputClass}>
+                  <option value="">Select campus…</option>
+                  <option value="central">Central</option>
+                  {campuses.map((c) => <option key={c.id} value={c.id}>{c.name} ({c.abbr})</option>)}
+                </select>
+              </div>
+            ) : (
+              <div className="text-[12px] text-[#6B6980]">For: <span className="font-medium text-[#2A2A3A]">{campuses.find((c) => c.id === campusId)?.name || campusId}</span></div>
+            )}
+            <div>
+              <label className={labelClass}>Template</label>
+              <select value={templateId} onChange={(e) => { setTemplateId(e.target.value); setTargetStaffId(""); setTargetProjectId(""); }} className={inputClass}>
+                <option value="">Select template…</option>
+                {templates.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            </div>
+            {template?.type === "onboarding" && (
+              <div>
+                <label className={labelClass}>Who's this for?</label>
+                <select value={targetStaffId} onChange={(e) => setTargetStaffId(e.target.value)} className={inputClass}>
+                  <option value="">Select person…</option>
+                  {campusStaff.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </select>
+                {campusStaff.length === 0 && <p className="text-[10.5px] text-[#8B889C] mt-1">No one on this campus's roster yet.</p>}
+              </div>
+            )}
+            {template?.type === "project" && (
+              <div>
+                <label className={labelClass}>Which project?</label>
+                <select value={targetProjectId} onChange={(e) => setTargetProjectId(e.target.value)} className={inputClass}>
+                  <option value="">Select project…</option>
+                  {campusProjects.map((p) => <option key={p.id} value={p.id}>{p.title}</option>)}
+                </select>
+                {campusProjects.length === 0 && <p className="text-[10.5px] text-[#8B889C] mt-1">No open projects on this campus yet.</p>}
+              </div>
+            )}
+            {error && <div className="text-[12px] rounded-md px-3 py-2" style={{ background: "#C15B5B1A", color: "#C15B5B" }}>{error}</div>}
+            <div className="flex gap-2 pt-1">
+              <button type="submit" className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Start Run</button>
+              <button type="button" onClick={onClose} className="text-[13px] text-[#6B6980] px-2">Cancel</button>
+            </div>
+          </form>
+        )}
+      </div>
     </div>
   );
 }
