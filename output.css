@@ -894,6 +894,10 @@ video {
   width: 74px;
 }
 
+.w-\[76px\] {
+  width: 76px;
+}
+
 .w-\[calc\(100vw-32px\)\] {
   width: calc(100vw - 32px);
 }

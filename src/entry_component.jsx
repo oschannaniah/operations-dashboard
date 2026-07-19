@@ -97,7 +97,7 @@ let handleUnauthorized = () => {};
 // vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
 // the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
 // snake_case columns — so every existing call site keeps working unchanged.
-const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members" };
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log" };
 
 // Every table's primary key is "id" except campus_config (natural key campus_id) and
 // margin_scores (natural key staff_id, one row per staff member) — neither has a separate
@@ -119,6 +119,8 @@ const FIELD_MAPS = {
   seasons: { organizationId: "organization_id", startsOn: "starts_on", endsOn: "ends_on", createdBy: "created_by", createdAt: "created_at" },
   teams: { organizationId: "organization_id", campusId: "campus_id", createdAt: "created_at" },
   team_members: { teamId: "team_id", staffId: "staff_id", roleInTeam: "role_in_team", addedAt: "added_at" },
+  staff_flag_history: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", setBy: "set_by", setAt: "set_at" },
+  staff_checkin_log: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", loggedBy: "logged_by", loggedAt: "logged_at" },
 };
 
 function toSnakeRow(table, obj) {
@@ -594,6 +596,17 @@ function needsCheckIn(lastContact) {
   return (Date.now() - parsed.getTime()) / (1000 * 60 * 60 * 24) > 30;
 }
 
+// Health Trends v1 — merges the two append-only logs (0021_health_trends.sql) into one
+// chronological read per person, newest first, capped so the Edit panel stays scannable
+// instead of turning into an unbounded audit log.
+function buildHealthTimeline(staffId, flagHistory, checkinLog, limit = 6) {
+  const flags = (flagHistory || []).filter((f) => String(f.staffId) === String(staffId))
+    .map((f) => ({ kind: "flag", at: f.setAt, flag: f.flag, by: f.setBy }));
+  const checkins = (checkinLog || []).filter((c) => String(c.staffId) === String(staffId))
+    .map((c) => ({ kind: "checkin", at: c.loggedAt, by: c.loggedBy }));
+  return [...flags, ...checkins].sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, limit);
+}
+
 // The OD's 10-question survey — sets the Margin benchmark for one team member. Q9/Q10 are the
 // OD's own calibration read, compared against the computed score server-side rather than
 // blended into it (see recompute_margin_score() in migrations/0006_margin.sql).
@@ -830,6 +843,8 @@ export default function OpsDashboard() {
   const [seasons, setSeasons] = useState([]);
   const [teams, setTeams] = useState([]);
   const [teamMembers, setTeamMembers] = useState([]);
+  const [flagHistory, setFlagHistory] = useState([]);
+  const [checkinLog, setCheckinLog] = useState([]);
   const [showSeasons, setShowSeasons] = useState(false);
   const [pendingMarginPulse, setPendingMarginPulse] = useState(null);
   const [campuses, setCampuses] = useState([]);
@@ -1019,8 +1034,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"),
       ]);
       if (cancelled) return;
 
@@ -1142,6 +1157,10 @@ export default function OpsDashboard() {
       // RLS already scopes both to campuses the viewer can manage — see 0020_teams.sql.
       if (teamsResult.status === "fulfilled") setTeams(teamsResult.value);
       if (teamMembersResult.status === "fulfilled") setTeamMembers(teamMembersResult.value);
+
+      // Append-only logs behind Health Trends — see 0021_health_trends.sql.
+      if (flagHistoryResult.status === "fulfilled") setFlagHistory(flagHistoryResult.value);
+      if (checkinLogResult.status === "fulfilled") setCheckinLog(checkinLogResult.value);
 
       if (failures.length > 0) {
         setBackendStatus("offline");
@@ -1578,12 +1597,18 @@ export default function OpsDashboard() {
   const setStaffFlag = (campusId, id, flag) => {
     setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, flag } : s) }));
     syncToBackend(apiUpdate("Staff", id, { flag }));
+    const setAt = new Date().toISOString();
+    setFlagHistory((prev) => [{ id: `${Date.now()}-${Math.random()}`, staffId: id, campusId, flag, setBy: currentViewerName, setAt }, ...prev]);
+    syncToBackend(apiCreate("StaffFlagHistory", { organizationId: OSC_ORG_ID, campusId, staffId: id, flag, setBy: currentViewerName }));
   };
   // A pastoral prompt, not a performance record — just marks "someone actually checked in with
   // this person today," reusing the same date-string convention as due/completedOn elsewhere.
   const logStaffCheckIn = (campusId, id) => {
     setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, lastContact: TODAY_STR } : s) }));
     syncToBackend(apiUpdate("Staff", id, { lastContact: TODAY_STR }));
+    const loggedAt = new Date().toISOString();
+    setCheckinLog((prev) => [{ id: `${Date.now()}-${Math.random()}`, staffId: id, campusId, loggedBy: currentViewerName, loggedAt }, ...prev]);
+    syncToBackend(apiCreate("StaffCheckinLog", { organizationId: OSC_ORG_ID, campusId, staffId: id, loggedBy: currentViewerName }));
   };
   const setStaffCalendars = (campusId, id, calendars) => {
     setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, calendars, calendarSynced: calendars.length > 0 } : s) }));
@@ -2056,6 +2081,7 @@ export default function OpsDashboard() {
               teams={teams} teamMembers={teamMembers}
               onCreateTeam={createTeam} onDeleteTeam={deleteTeam}
               onAddTeamMember={addTeamMember} onRemoveTeamMember={removeTeamMember} onSetTeamMemberRole={setTeamMemberRole}
+              flagHistory={flagHistory} checkinLog={checkinLog}
             />
           )}
 
@@ -2289,12 +2315,16 @@ function CentralTeamWindow({ projects, campuses, centralThreads, onAddTag, onRem
 
 function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, onOpenProject, detail, setDetail, onGoTab, seasons, onOpenSeasons }) {
   const sharedProjects = projects.filter((p) => p.shared);
+  const allStaff = Object.values(staffByCampus).flat();
   return (
     <div>
       <div className="mb-6">
         <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(20px,4vw,26px)] font-semibold tracking-tight">All Campuses</h1>
         <p className="text-[13px] text-[#6B6980] mt-1">Organization-wide standing, at a glance.</p>
       </div>
+
+      <TeamAttentionBanner staff={allStaff} onGoTab={onGoTab} accentColor="#C15B5B" />
+
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-7">
         <SummaryCard onClick={() => setDetail("projects")} icon={ListChecks} label="Open Projects" value={projects.filter((p) => p.stage !== "Completed").length} sub="org-wide" color="#2B4C7E" />
         <SummaryCard onClick={() => setDetail("budget")} icon={DollarSign} label="Budget Used" value={`${Math.round((orgBudgetUsed / orgBudgetTotal) * 100)}%`} sub={`${fmtMoney(orgBudgetUsed)} of ${fmtMoney(orgBudgetTotal)}`} color="#B8862F" />
@@ -2404,6 +2434,35 @@ function SummaryCard({ icon: Icon, label, value, sub, color, onClick }) {
   );
 }
 
+// Manager Nudges v1 — a proactive summary instead of relying on someone to notice the
+// per-row "Needs check-in" badge buried in Staff & Team. Renders nothing when there's nothing
+// to act on, so it doesn't become permanent noise once a team is caught up.
+function TeamAttentionBanner({ staff, onGoTab, accentColor }) {
+  const needingCheckIn = staff.filter((s) => needsCheckIn(s.lastContact));
+  const flagged = staff.filter((s) => s.flag);
+  if (needingCheckIn.length === 0 && flagged.length === 0) return null;
+  const color = accentColor || "#C15B5B";
+  const parts = [];
+  if (needingCheckIn.length > 0) parts.push(`${needingCheckIn.length} need${needingCheckIn.length === 1 ? "s" : ""} a check-in`);
+  if (flagged.length > 0) parts.push(`${flagged.length} flagged`);
+  return (
+    <button onClick={() => onGoTab("staff")}
+      className="w-full flex items-center justify-between gap-3 bg-[#FFFFFF] rounded-lg p-4 mb-5 text-left transition"
+      style={{ border: `1.5px solid ${color}55` }}
+      onMouseEnter={(e) => e.currentTarget.style.borderColor = color}
+      onMouseLeave={(e) => e.currentTarget.style.borderColor = `${color}55`}>
+      <div className="flex items-center gap-3 min-w-0">
+        <div className="w-9 h-9 rounded-md flex items-center justify-center shrink-0" style={{ background: color }}><AlertTriangle size={16} color="#F7F6FB" /></div>
+        <div className="min-w-0">
+          <div className="text-[13.5px] font-medium">Needs your attention</div>
+          <div className="text-[11.5px] text-[#6B6980] truncate">{parts.join(" · ")}</div>
+        </div>
+      </div>
+      <ChevronRight size={16} className="text-[#8B889C] shrink-0" />
+    </button>
+  );
+}
+
 function CampusDashboard({ campus, projects, staff, notes, activity, dayEvents, calDate, onOpenProject, onGoTab, onOpenProfile, marginScores, canManageMargin, seasons }) {
   const today = seasons?.find((s) => (!s.startsOn || s.startsOn <= TODAY_STR) && (!s.endsOn || s.endsOn >= TODAY_STR));
   const upcoming = !today && seasons?.filter((s) => s.startsOn && s.startsOn > TODAY_STR).sort((a, b) => a.startsOn.localeCompare(b.startsOn))[0];
@@ -2421,6 +2480,8 @@ function CampusDashboard({ campus, projects, staff, notes, activity, dayEvents, 
           <div className="text-[10px] text-[#6B6980]">open projects</div>
         </div>
       </div>
+
+      <TeamAttentionBanner staff={staff} onGoTab={onGoTab} accentColor={campus.color} />
 
       <div className="grid lg:grid-cols-2 gap-4">
         <Window title="Staff & Team" icon={Users} onExpand={() => onGoTab("staff")} accentColor={campus.color}>
@@ -2529,7 +2590,7 @@ function ProgressBar({ subtasks }) {
   );
 }
 
-function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onAddTeamRole, onRemove, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile, users, onLinkUser, onCreateAndLinkUser, marginScores, canManageMargin, onSubmitMarginSurvey, onSendMarginPulse, onSetFlag, onLogCheckIn, teams, teamMembers, onCreateTeam, onDeleteTeam, onAddTeamMember, onRemoveTeamMember, onSetTeamMemberRole }) {
+function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onAddTeamRole, onRemove, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile, users, onLinkUser, onCreateAndLinkUser, marginScores, canManageMargin, onSubmitMarginSurvey, onSendMarginPulse, onSetFlag, onLogCheckIn, teams, teamMembers, onCreateTeam, onDeleteTeam, onAddTeamMember, onRemoveTeamMember, onSetTeamMemberRole, flagHistory, checkinLog }) {
   const [addingLane, setAddingLane] = useState(null); // which lane's "Add Team Role" modal is open
   const [creatingTeam, setCreatingTeam] = useState(false);
   const [newTeamName, setNewTeamName] = useState("");
@@ -2929,6 +2990,22 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                     </button>
                   ))}
                 </div>
+                <div className="text-[10.5px] text-[#6B6980] mb-1.5 mt-3">Recent history</div>
+                {(() => {
+                  const timeline = buildHealthTimeline(s.id, flagHistory, checkinLog);
+                  if (timeline.length === 0) return <div className="text-[10.5px] text-[#8B889C]">No flag changes or check-ins logged yet.</div>;
+                  return (
+                    <div className="space-y-1">
+                      {timeline.map((h, i) => (
+                        <div key={i} className="flex items-center gap-2 text-[11px]">
+                          <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: h.kind === "checkin" ? "#5E9E8A" : h.flag ? "#C15B5B" : "#8B889C" }} />
+                          <span className="text-[#6B6980] w-[76px] shrink-0">{new Date(h.at).toLocaleDateString()}</span>
+                          <span>{h.kind === "checkin" ? `Checked in by ${h.by || "—"}` : h.flag ? `Flagged: ${h.flag}` : "Flag cleared"}</span>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
               </div>
             )}
             {full && calendarPickerId === s.id && (
