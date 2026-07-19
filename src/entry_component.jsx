@@ -51,6 +51,23 @@ const TEAM_LANES = ["Operations", "Ministry", "Next Gen", "Programming"];
 // see land in their notifications, which a freeform label could never guarantee.
 const MINISTRY_AREA_OPTIONS = [...TEAM_LANES, "Central"];
 
+// A project's type, distinct from its Ministry Area (which lane owns it) — this is what kind of
+// work it is, and it's what capacity forecasting weights by. New projects default to "General"
+// so nothing is ever unclassified; existing projects created before this field existed also
+// land on "General" until re-tagged.
+const PROJECT_TYPE_OPTIONS = ["Event", "Facilities", "Administrative", "Strategic Initiative", "General"];
+
+// Mirrors capacity_weight_settings' column defaults (0026_capacity_weights.sql) — used before
+// that row has loaded, or if the fetch ever fails, so forecasting still works with sane numbers
+// rather than silently going blank.
+const DEFAULT_CAPACITY_WEIGHTS = {
+  typeWeights: { Event: 1, Facilities: 1, Administrative: 1, "Strategic Initiative": 1.3, General: 1 },
+  costBrackets: [{ maxCost: 1000, weight: 1 }, { maxCost: 5000, weight: 1.5 }, { maxCost: null, weight: 2 }],
+  urgencyBrackets: [{ maxDays: 0, weight: 3 }, { maxDays: 7, weight: 2 }, { maxDays: 30, weight: 1.5 }, { maxDays: null, weight: 1 }],
+  heavyLoadThreshold: 3,
+  overCapacityThreshold: 6,
+};
+
 const LANE_ROLE_OPTIONS = {
   "Operations": [
     "Operations Director", "Campus Support Director", "Facilities Coordinator", "Safety Coordinator",
@@ -104,15 +121,15 @@ let handleUnauthorized = () => {};
 // vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
 // the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
 // snake_case columns — so every existing call site keeps working unchanged.
-const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items" };
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings" };
 
 // Every table's primary key is "id" except campus_config (natural key campus_id) and
 // margin_scores (natural key staff_id, one row per staff member) — neither has a separate
 // surrogate "id" column.
-const PK_MAP = { campus_config: "campus_id", margin_scores: "staff_id" };
+const PK_MAP = { campus_config: "campus_id", margin_scores: "staff_id", capacity_weight_settings: "organization_id" };
 
 const FIELD_MAPS = {
-  projects: { organizationId: "organization_id", createdBy: "created_by", completedOn: "completed_on", sharedWith: "shared_with", dueTime: "due_time", seasonId: "season_id" },
+  projects: { organizationId: "organization_id", createdBy: "created_by", completedOn: "completed_on", sharedWith: "shared_with", dueTime: "due_time", seasonId: "season_id", projectType: "project_type" },
   subtasks: { projectId: "project_id", createdBy: "created_by", dueTime: "due_time" },
   staff: { organizationId: "organization_id", campusId: "campus_id", reportsTo: "reports_to", nextMeeting: "next_meeting", lastContact: "last_contact", calendarSynced: "calendar_synced", userId: "user_id" },
   profiles: { organizationId: "organization_id", firstName: "first_name", lastName: "last_name", campusId: "campus_id", googleCalendarIds: "google_calendar_ids", googleCalendarNames: "google_calendar_names" },
@@ -132,6 +149,7 @@ const FIELD_MAPS = {
   playbook_template_items: { templateId: "template_id", managedBy: "managed_by", dueOffsetDays: "due_offset_days" },
   playbook_runs: { organizationId: "organization_id", campusId: "campus_id", templateId: "template_id", templateName: "template_name", targetStaffId: "target_staff_id", targetProjectId: "target_project_id", startedBy: "started_by", startedAt: "started_at" },
   playbook_run_items: { runId: "run_id", doneBy: "done_by", doneAt: "done_at", assignedTo: "assigned_to", managedBy: "managed_by", dueDate: "due_date" },
+  capacity_weight_settings: { organizationId: "organization_id", typeWeights: "type_weights", costBrackets: "cost_brackets", urgencyBrackets: "urgency_brackets", heavyLoadThreshold: "heavy_load_threshold", overCapacityThreshold: "over_capacity_threshold", updatedAt: "updated_at", updatedBy: "updated_by" },
 };
 
 function toSnakeRow(table, obj) {
@@ -644,6 +662,51 @@ function estimateAccuracy(projectsList) {
 const MARGIN_STATUS_LABEL = { comfortable: "Comfortable", full: "Full", stretched: "Stretched", over_capacity: "Over capacity" };
 const MARGIN_STATUS_COLOR = { comfortable: "#5E9E8A", full: "#5E9E8A", stretched: "#B8862F", over_capacity: "#C15B5B" };
 
+// Finds the first bracket (sorted ascending by its "max" key) that the value falls under; a
+// null max means "and up," so it always matches whatever's left. Shared by cost and urgency
+// brackets since both follow the same "ordered ceilings" shape.
+function bracketWeight(brackets, value, maxKey) {
+  const sorted = [...(brackets || [])].sort((a, b) => (a[maxKey] ?? Infinity) - (b[maxKey] ?? Infinity));
+  for (const b of sorted) {
+    if (b[maxKey] == null || value <= b[maxKey]) return b.weight;
+  }
+  return 1;
+}
+
+// Capacity forecasting — Margin's survey/pulse score is a snapshot; this layers a forward-
+// looking, weighted read from what's already sitting on someone's plate instead of only the
+// after-the-fact status. Already-over-capacity people don't need a separate forecast — the real
+// signal there is the status itself. "Involved" mirrors StaffProfileModal's own definition
+// (owner, on the team, or created a sub-task) so this reads the same set of projects a person
+// would see attributed to them anywhere else in the app.
+//
+// Per assigned project: urgency (days to due) x cost bracket x project-type weight, divided by
+// how many people are actually on it — a $20k event three people are sharing carries less
+// per-person load than the same event one person is running solo. Summed across everything
+// they're on, then bucketed against Central's configured thresholds.
+function capacityForecast(person, projects, marginScores, weights) {
+  if (marginScores?.[person.id]?.status === "over_capacity") return null;
+  const w = weights || DEFAULT_CAPACITY_WEIGHTS;
+  const involved = (p) => p.stage !== "Completed" && (p.owner === person.name || (p.team || []).includes(person.name) || (p.subtasks || []).some((s) => s.createdBy === person.name));
+  const assigned = projects.filter(involved);
+  if (assigned.length === 0) return null;
+
+  const todayDate = new Date(TODAY_STR + "T00:00:00");
+  let totalLoad = 0;
+  assigned.forEach((p) => {
+    const daysUntilDue = p.due ? Math.round((new Date(p.due + "T00:00:00") - todayDate) / 86400000) : null;
+    const urgencyW = daysUntilDue == null ? 1 : bracketWeight(w.urgencyBrackets, daysUntilDue, "maxDays");
+    const costW = bracketWeight(w.costBrackets, projectBudget(p).total, "maxCost");
+    const typeW = w.typeWeights?.[p.projectType] ?? 1;
+    const teamSize = new Set([p.owner, ...(p.team || [])].filter(Boolean)).size || 1;
+    totalLoad += (urgencyW * costW * typeW) / teamSize;
+  });
+
+  if (totalLoad >= w.overCapacityThreshold) return { label: "Trending toward over capacity", detail: `load score ${totalLoad.toFixed(1)}`, color: "#C15B5B" };
+  if (totalLoad >= w.heavyLoadThreshold) return { label: "Heavy load", detail: `load score ${totalLoad.toFixed(1)}`, color: "#B8862F" };
+  return null;
+}
+
 // Team Health flag — a fixed, short vocabulary rather than the free-text field this used to
 // be, so it reads as a real signal instead of a stray note. Deliberately low-stakes: a
 // pastoral prompt, not a performance record.
@@ -913,6 +976,7 @@ export default function OpsDashboard() {
   const [playbookTemplateItems, setPlaybookTemplateItems] = useState([]);
   const [playbookRuns, setPlaybookRuns] = useState([]);
   const [playbookRunItems, setPlaybookRunItems] = useState([]);
+  const [capacityWeightSettings, setCapacityWeightSettings] = useState(null);
   const [pendingMarginPulse, setPendingMarginPulse] = useState(null);
   const [campuses, setCampuses] = useState([]);
   const [users, setUsers] = useState([]);
@@ -1101,8 +1165,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"),
       ]);
       if (cancelled) return;
 
@@ -1235,6 +1299,10 @@ export default function OpsDashboard() {
       if (playbookTemplateItemsResult.status === "fulfilled") setPlaybookTemplateItems(playbookTemplateItemsResult.value);
       if (playbookRunsResult.status === "fulfilled") setPlaybookRuns(playbookRunsResult.value);
       if (playbookRunItemsResult.status === "fulfilled") setPlaybookRunItems(playbookRunItemsResult.value);
+
+      // One row per org (0026_capacity_weights.sql) — falls back to DEFAULT_CAPACITY_WEIGHTS
+      // wherever it's read if this hasn't loaded yet or the row somehow doesn't exist.
+      if (capacityWeightSettingsResult.status === "fulfilled" && capacityWeightSettingsResult.value[0]) setCapacityWeightSettings(capacityWeightSettingsResult.value[0]);
 
       if (failures.length > 0) {
         setBackendStatus("offline");
@@ -1424,6 +1492,7 @@ export default function OpsDashboard() {
       spent: 0,
       shared: !!data.shared,
       section: data.section || MINISTRY_AREA_OPTIONS[0],
+      projectType: data.projectType || PROJECT_TYPE_OPTIONS[PROJECT_TYPE_OPTIONS.length - 1],
       recurrence: data.recurrence?.freq === "none" ? null : data.recurrence,
       subtasks: [],
       photos: [],
@@ -1560,6 +1629,11 @@ export default function OpsDashboard() {
     if (section === "Central" && prevProject?.section !== "Central" && prevProject) {
       notifyCentral({ ...prevProject, section }, `moved "${prevProject.title}" into the Central Ministry Area`);
     }
+  };
+
+  const setProjectType = (projId, projectType) => {
+    setProjects((ps) => ps.map((p) => p.id === projId ? { ...p, projectType } : p));
+    syncToBackend(apiUpdate("Projects", projId, { projectType }));
   };
 
   // One row per thread (organization_id, thread_key unique) — every mutation upserts the
@@ -1936,6 +2010,27 @@ export default function OpsDashboard() {
     syncToBackend(apiUpdate("PlaybookRunItems", itemId, { dueDate: dueDate || null }));
   };
 
+  // The capacity-forecasting weight policy — one row per org, upserted since the seed migration
+  // already creates it but a future org wouldn't have one yet.
+  const updateCapacityWeightSettings = async (patch) => {
+    setSyncing(true);
+    try {
+      const fields = { ...patch, updatedBy: currentViewerName, updatedAt: new Date().toISOString() };
+      if (capacityWeightSettings) {
+        await apiUpdate("CapacityWeightSettings", OSC_ORG_ID, fields);
+        setCapacityWeightSettings((prev) => ({ ...prev, ...fields }));
+      } else {
+        const created = await apiCreate("CapacityWeightSettings", { organizationId: OSC_ORG_ID, ...fields });
+        setCapacityWeightSettings(created);
+      }
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   // Persists a campus's Slides org-chart link to the CampusConfig sheet (id = campusId, so
   // this is a plain generic-CRUD upsert: create the row the first time, update it after that).
   const setCampusSlidesLink = (campusId, url) => {
@@ -2281,7 +2376,7 @@ export default function OpsDashboard() {
             <CentralOverview campuses={campuses} orgBudgetUsed={orgBudgetUsed} orgBudgetTotal={orgBudgetTotal}
               projects={displayProjects} staffByCampus={staffByCampus} onSelectCampus={(id) => { setSelectedCampus(id); setTab("overview"); }}
               onOpenProject={setOpenProject}
-              detail={detail} setDetail={setDetail} onGoTab={setTab} />
+              detail={detail} setDetail={setDetail} onGoTab={setTab} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings} />
           )}
 
           {tab === "centralmgmt" && auth.user.tier === "central" && (
@@ -2290,7 +2385,8 @@ export default function OpsDashboard() {
               centralThreads={centralThreads} onAddTag={addCentralTag} onRemoveTag={removeCentralTag} onAddMessage={addCentralMessage}
               currentViewerName={currentViewerName}
               seasons={seasons} onCreateSeason={createSeason}
-              onOpenProject={setOpenProject} onSelectCampus={(id) => { setSelectedCampus(id); setTab("overview"); }} />
+              onOpenProject={setOpenProject} onSelectCampus={(id) => { setSelectedCampus(id); setTab("overview"); }}
+              capacityWeightSettings={capacityWeightSettings} onUpdateCapacityWeightSettings={updateCapacityWeightSettings} />
           )}
 
           {tab === "overview" && (role !== "central" || selectedCampus) && activeCampus && (
@@ -2299,13 +2395,13 @@ export default function OpsDashboard() {
               dayEvents={dayEvents} calDate={calDate}
               onOpenProject={setOpenProject} onGoTab={setTab} onOpenProfile={setOpenStaffProfile}
               marginScores={marginScores} canManageMargin={auth.user.tier === "central" || auth.user.tier === "od"}
-              seasons={seasons}
+              seasons={seasons} capacityWeightSettings={capacityWeightSettings}
             />
           )}
 
           {tab === "projects" && (
             <ProjectsBoard projects={scopedProjects} campusLabel={activeCampus ? activeCampus.name : "All Campuses"}
-              onCycle={cycleStage} onOpen={setOpenProject} onSetSection={setProjectSection}
+              onCycle={cycleStage} onOpen={setOpenProject} onSetSection={setProjectSection} onSetProjectType={setProjectType}
               onNewProject={() => setShowNewProject(true)} />
           )}
 
@@ -2338,7 +2434,7 @@ export default function OpsDashboard() {
               teams={teams} teamMembers={teamMembers}
               onCreateTeam={createTeam} onDeleteTeam={deleteTeam}
               onAddTeamMember={addTeamMember} onRemoveTeamMember={removeTeamMember} onSetTeamMemberRole={setTeamMemberRole}
-              flagHistory={flagHistory} checkinLog={checkinLog}
+              flagHistory={flagHistory} checkinLog={checkinLog} projects={displayProjects} capacityWeightSettings={capacityWeightSettings}
             />
           )}
 
@@ -2579,7 +2675,7 @@ function CentralTeamWindow({ projects, campuses, centralThreads, onAddTag, onRem
   );
 }
 
-function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, onOpenProject, detail, setDetail, onGoTab }) {
+function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, onOpenProject, detail, setDetail, onGoTab, marginScores, capacityWeightSettings }) {
   const sharedProjects = projects.filter((p) => p.shared);
   const allStaff = Object.values(staffByCampus).flat();
 
@@ -2596,7 +2692,7 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
         <p className="text-[13px] text-[#6B6980] mt-1">Organization-wide standing, at a glance.</p>
       </div>
 
-      <TeamAttentionBanner staff={allStaff} onGoTab={onGoTab} accentColor="#C15B5B" />
+      <TeamAttentionBanner staff={allStaff} onGoTab={onGoTab} accentColor="#C15B5B" projects={projects} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings} />
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
         <SummaryCard onClick={() => setDetail("projects")} icon={ListChecks} label="Open Projects" value={projects.filter((p) => p.stage !== "Completed").length} sub="org-wide" color="#2B4C7E" />
@@ -2763,14 +2859,16 @@ function SummaryCard({ icon: Icon, label, value, sub, color, onClick }) {
 // Manager Nudges v1 — a proactive summary instead of relying on someone to notice the
 // per-row "Needs check-in" badge buried in Staff & Team. Renders nothing when there's nothing
 // to act on, so it doesn't become permanent noise once a team is caught up.
-function TeamAttentionBanner({ staff, onGoTab, accentColor }) {
+function TeamAttentionBanner({ staff, onGoTab, accentColor, projects, marginScores, capacityWeightSettings }) {
   const needingCheckIn = staff.filter((s) => needsCheckIn(s.lastContact));
   const flagged = staff.filter((s) => s.flag);
-  if (needingCheckIn.length === 0 && flagged.length === 0) return null;
+  const forecasted = projects && marginScores !== undefined ? staff.filter((s) => capacityForecast(s, projects, marginScores, capacityWeightSettings)) : [];
+  if (needingCheckIn.length === 0 && flagged.length === 0 && forecasted.length === 0) return null;
   const color = accentColor || "#C15B5B";
   const parts = [];
   if (needingCheckIn.length > 0) parts.push(`${needingCheckIn.length} need${needingCheckIn.length === 1 ? "s" : ""} a check-in`);
   if (flagged.length > 0) parts.push(`${flagged.length} flagged`);
+  if (forecasted.length > 0) parts.push(`${forecasted.length} flagged for capacity risk`);
   return (
     <button onClick={() => onGoTab("staff")}
       className="w-full flex items-center justify-between gap-3 bg-[#FFFFFF] rounded-lg p-4 mb-5 text-left transition"
@@ -2789,7 +2887,7 @@ function TeamAttentionBanner({ staff, onGoTab, accentColor }) {
   );
 }
 
-function CampusDashboard({ campus, projects, staff, notes, activity, dayEvents, calDate, onOpenProject, onGoTab, onOpenProfile, marginScores, canManageMargin, seasons }) {
+function CampusDashboard({ campus, projects, staff, notes, activity, dayEvents, calDate, onOpenProject, onGoTab, onOpenProfile, marginScores, canManageMargin, seasons, capacityWeightSettings }) {
   const today = seasons?.find((s) => (!s.startsOn || s.startsOn <= TODAY_STR) && (!s.endsOn || s.endsOn >= TODAY_STR));
   const upcoming = !today && seasons?.filter((s) => s.startsOn && s.startsOn > TODAY_STR).sort((a, b) => a.startsOn.localeCompare(b.startsOn))[0];
   const activeSeason = today || upcoming;
@@ -2807,11 +2905,11 @@ function CampusDashboard({ campus, projects, staff, notes, activity, dayEvents, 
         </div>
       </div>
 
-      <TeamAttentionBanner staff={staff} onGoTab={onGoTab} accentColor={campus.color} />
+      <TeamAttentionBanner staff={staff} onGoTab={onGoTab} accentColor={campus.color} projects={projects} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings} />
 
       <div className="grid lg:grid-cols-2 gap-4">
         <Window title="Staff & Team" icon={Users} onExpand={() => onGoTab("staff")} accentColor={campus.color}>
-          <StaffPanel staff={staff} compact onOpenProfile={onOpenProfile} marginScores={marginScores} />
+          <StaffPanel staff={staff} compact onOpenProfile={onOpenProfile} marginScores={marginScores} canManageMargin={canManageMargin} projects={projects} capacityWeightSettings={capacityWeightSettings} />
         </Window>
 
         {canManageMargin && (
@@ -2916,7 +3014,7 @@ function ProgressBar({ subtasks }) {
   );
 }
 
-function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onAddTeamRole, onRemove, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile, users, onLinkUser, onCreateAndLinkUser, marginScores, canManageMargin, onSubmitMarginSurvey, onSendMarginPulse, onSetFlag, onLogCheckIn, teams, teamMembers, onCreateTeam, onDeleteTeam, onAddTeamMember, onRemoveTeamMember, onSetTeamMemberRole, flagHistory, checkinLog }) {
+function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onAddTeamRole, onRemove, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile, users, onLinkUser, onCreateAndLinkUser, marginScores, canManageMargin, onSubmitMarginSurvey, onSendMarginPulse, onSetFlag, onLogCheckIn, teams, teamMembers, onCreateTeam, onDeleteTeam, onAddTeamMember, onRemoveTeamMember, onSetTeamMemberRole, flagHistory, checkinLog, projects, capacityWeightSettings }) {
   const [addingLane, setAddingLane] = useState(null); // which lane's "Add Team Role" modal is open
   const [creatingTeam, setCreatingTeam] = useState(false);
   const [newTeamName, setNewTeamName] = useState("");
@@ -3259,6 +3357,14 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                     Margin: {MARGIN_STATUS_LABEL[marginScores[s.id].status] || marginScores[s.id].status}
                   </span>
                 )}
+                {canManageMargin && projects && (() => {
+                  const forecast = capacityForecast(s, projects, marginScores, capacityWeightSettings);
+                  return forecast ? (
+                    <span title={forecast.detail} className="text-[9.5px] px-2 py-0.5 rounded-full whitespace-nowrap flex items-center gap-1" style={{ background: `${forecast.color}22`, color: forecast.color }}>
+                      <AlertTriangle size={9} />{forecast.label}
+                    </span>
+                  ) : null;
+                })()}
                 {full && campusId && canManageMargin && (
                   <>
                     <button onClick={() => setAssessingId(assessingId === s.id ? null : s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#B8862F66] text-[#B8862F] hover:border-[#B8862F] whitespace-nowrap">
@@ -4353,7 +4459,7 @@ function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectC
   );
 }
 
-function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, onNewProject }) {
+function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, onSetProjectType, onNewProject }) {
   const [sortBy, setSortBy] = useState("due");
   const [filterStage, setFilterStage] = useState("All");
   const [filterSection, setFilterSection] = useState("All");
@@ -4431,12 +4537,18 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, o
                       </span>
                     )}
                   </button>
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-1 flex-wrap">
                     <button onClick={() => onCycle(p.id)}><StageBadge stage={p.stage} /></button>
-                    <select value={p.section || MINISTRY_AREA_OPTIONS[0]} onChange={(e) => onSetSection(p.id, e.target.value)}
-                      className="bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-1.5 py-0.5 text-[9.5px] text-[#6B6980] outline-none">
-                      {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
-                    </select>
+                    <div className="flex items-center gap-1">
+                      <select value={p.projectType || PROJECT_TYPE_OPTIONS[PROJECT_TYPE_OPTIONS.length - 1]} onChange={(e) => onSetProjectType(p.id, e.target.value)}
+                        className="bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-1.5 py-0.5 text-[9.5px] text-[#6B6980] outline-none">
+                        {PROJECT_TYPE_OPTIONS.map((t) => <option key={t} value={t}>{t}</option>)}
+                      </select>
+                      <select value={p.section || MINISTRY_AREA_OPTIONS[0]} onChange={(e) => onSetSection(p.id, e.target.value)}
+                        className="bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-1.5 py-0.5 text-[9.5px] text-[#6B6980] outline-none">
+                        {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+                      </select>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -4953,6 +5065,7 @@ function EventsList({ campusId, campuses }) {
 function NewProjectModal({ onClose, onCreate, campusRoster, fullRoster, campusLabel }) {
   const [title, setTitle] = useState("");
   const [section, setSection] = useState(MINISTRY_AREA_OPTIONS[0]);
+  const [projectType, setProjectType] = useState(PROJECT_TYPE_OPTIONS[PROJECT_TYPE_OPTIONS.length - 1]);
   const [stage, setStage] = useState("Pending");
   const [due, setDue] = useState(TODAY_STR);
   const [dueTime, setDueTime] = useState("");
@@ -4974,7 +5087,7 @@ function NewProjectModal({ onClose, onCreate, campusRoster, fullRoster, campusLa
   const submit = () => {
     if (!title.trim()) return;
     const recurrence = recurFreq === "none" ? { freq: "none" } : { freq: recurFreq, customEvery, customUnit, endType, count, untilDate };
-    onCreate({ title: title.trim(), section, stage, due, dueTime, cost, owner: owner.trim(), team, collaborators, recurrence, shared: isCrossCampus });
+    onCreate({ title: title.trim(), section, projectType, stage, due, dueTime, cost, owner: owner.trim(), team, collaborators, recurrence, shared: isCrossCampus });
   };
 
   return (
@@ -4997,6 +5110,12 @@ function NewProjectModal({ onClose, onCreate, campusRoster, fullRoster, campusLa
               <label className="text-[10.5px] text-[#6B6980] block mb-1">Ministry Area</label>
               <select value={section} onChange={(e) => setSection(e.target.value)} className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2 py-2 text-[12.5px] outline-none">
                 {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-[10.5px] text-[#6B6980] block mb-1">Project Type</label>
+              <select value={projectType} onChange={(e) => setProjectType(e.target.value)} className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2 py-2 text-[12.5px] outline-none">
+                {PROJECT_TYPE_OPTIONS.map((t) => <option key={t} value={t}>{t}</option>)}
               </select>
             </div>
             <div>
@@ -5723,13 +5842,14 @@ function SeasonsPanel({ seasons, projects, campuses, onCreateSeason, onOpenProje
 // Central Management — the three org-wide tools (Central Team, Seasons, Location Scorecards)
 // that used to live as full-width buttons on All Campuses. Same accordion pattern throughout:
 // click a button, its panel expands in place below the row; only one open at a time.
-function CentralManagementPanel({ projects, campuses, staffByCampus, marginScores, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, seasons, onCreateSeason, onOpenProject, onSelectCampus }) {
-  const [open, setOpen] = useState(null); // "team" | "seasons" | "scorecards" | null
+function CentralManagementPanel({ projects, campuses, staffByCampus, marginScores, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, seasons, onCreateSeason, onOpenProject, onSelectCampus, capacityWeightSettings, onUpdateCapacityWeightSettings }) {
+  const [open, setOpen] = useState(null); // "team" | "seasons" | "scorecards" | "weights" | null
 
   const tools = [
     { key: "team", label: "Central Team", color: "#2B4C7E", icon: Users, desc: "Browse any project or task by campus, leave a private note, optionally assign it. Campus teams never see this." },
     { key: "seasons", label: "Seasons", color: "#6B4FA0", icon: CalendarDays, desc: "Easter, Christmas, VBS — see every campus's plan for a named window in one place." },
     { key: "scorecards", label: "Location Scorecards", color: "#5E9E8A", icon: ListChecks, desc: "Margin, budget adherence, and on-time delivery — every campus, side by side." },
+    { key: "weights", label: "Capacity Weights", color: "#B8862F", icon: Settings, desc: "Tune how project type, cost, deadline, and team size combine into the capacity forecast." },
   ];
 
   return (
@@ -5774,6 +5894,104 @@ function CentralManagementPanel({ projects, campuses, staffByCampus, marginScore
           <LocationScorecardsPanel campuses={campuses} projects={projects} staffByCampus={staffByCampus} marginScores={marginScores} onSelectCampus={onSelectCampus} />
         </div>
       )}
+      {open === "weights" && (
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mt-3 mb-8">
+          <CapacityWeightsPanel settings={capacityWeightSettings || DEFAULT_CAPACITY_WEIGHTS} onSave={onUpdateCapacityWeightSettings} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CapacityWeightsPanel({ settings, onSave }) {
+  const [typeWeights, setTypeWeights] = useState(settings.typeWeights);
+  const [costBrackets, setCostBrackets] = useState(settings.costBrackets);
+  const [urgencyBrackets, setUrgencyBrackets] = useState(settings.urgencyBrackets);
+  const [heavyLoadThreshold, setHeavyLoadThreshold] = useState(settings.heavyLoadThreshold);
+  const [overCapacityThreshold, setOverCapacityThreshold] = useState(settings.overCapacityThreshold);
+  const [saved, setSaved] = useState(false);
+
+  const updateTypeWeight = (type, val) => setTypeWeights((prev) => ({ ...prev, [type]: Number(val) }));
+  const updateCostBracket = (i, field, val) => setCostBrackets((prev) => prev.map((b, idx) => idx === i ? { ...b, [field]: val === "" ? null : Number(val) } : b));
+  const updateUrgencyBracket = (i, field, val) => setUrgencyBrackets((prev) => prev.map((b, idx) => idx === i ? { ...b, [field]: val === "" ? null : Number(val) } : b));
+
+  const save = () => {
+    onSave({ typeWeights, costBrackets, urgencyBrackets, heavyLoadThreshold: Number(heavyLoadThreshold), overCapacityThreshold: Number(overCapacityThreshold) });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  const numClass = "w-20 bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2 py-1 text-[12px] outline-none focus:border-[#B8862F]";
+
+  return (
+    <div>
+      <div className="text-[13px] font-semibold mb-1">Capacity Weights</div>
+      <p className="text-[11.5px] text-[#6B6980] mb-4">Per assigned project: urgency × cost × project-type weight, divided by team size, summed across everything someone's on. Tune the numbers below against real data — there's no universally "right" formula, only what matches how load actually feels here.</p>
+
+      <div className="mb-5">
+        <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">Project type weight</div>
+        <div className="grid sm:grid-cols-2 gap-2">
+          {PROJECT_TYPE_OPTIONS.map((t) => (
+            <div key={t} className="flex items-center justify-between gap-2 bg-[#F7F6FB] border border-[#E3E1F0] rounded-md px-3 py-2">
+              <span className="text-[12px]">{t}</span>
+              <input type="number" step="0.1" min="0" value={typeWeights[t] ?? 1} onChange={(e) => updateTypeWeight(t, e.target.value)} className={numClass} />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="mb-5">
+        <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">Cost weight (by project total cost)</div>
+        <div className="space-y-1.5">
+          {costBrackets.map((b, i) => (
+            <div key={i} className="flex items-center gap-2 text-[12px]">
+              <span className="text-[#6B6980] w-16">Up to</span>
+              {b.maxCost == null ? (
+                <span className="text-[#8B889C] italic w-24">any amount</span>
+              ) : (
+                <input type="number" min="0" value={b.maxCost} onChange={(e) => updateCostBracket(i, "maxCost", e.target.value)} className={numClass} />
+              )}
+              <span className="text-[#6B6980]">→ weight</span>
+              <input type="number" step="0.1" min="0" value={b.weight} onChange={(e) => updateCostBracket(i, "weight", e.target.value)} className={numClass} />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="mb-5">
+        <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">Urgency weight (by days until due)</div>
+        <div className="space-y-1.5">
+          {urgencyBrackets.map((b, i) => (
+            <div key={i} className="flex items-center gap-2 text-[12px]">
+              <span className="text-[#6B6980] w-16">Within</span>
+              {b.maxDays == null ? (
+                <span className="text-[#8B889C] italic w-24">any timeframe</span>
+              ) : (
+                <input type="number" value={b.maxDays} onChange={(e) => updateUrgencyBracket(i, "maxDays", e.target.value)} className={numClass} />
+              )}
+              <span className="text-[#6B6980]">days → weight</span>
+              <input type="number" step="0.1" min="0" value={b.weight} onChange={(e) => updateUrgencyBracket(i, "weight", e.target.value)} className={numClass} />
+            </div>
+          ))}
+        </div>
+        <p className="text-[10px] text-[#8B889C] mt-1.5">Negative days (overdue) fall into the first bracket automatically.</p>
+      </div>
+
+      <div className="mb-5 grid sm:grid-cols-2 gap-3">
+        <div>
+          <label className="text-[10.5px] text-[#6B6980] block mb-1">"Heavy load" total score at or above</label>
+          <input type="number" step="0.1" min="0" value={heavyLoadThreshold} onChange={(e) => setHeavyLoadThreshold(e.target.value)} className="w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#B8862F]" />
+        </div>
+        <div>
+          <label className="text-[10.5px] text-[#6B6980] block mb-1">"Trending toward over capacity" score at or above</label>
+          <input type="number" step="0.1" min="0" value={overCapacityThreshold} onChange={(e) => setOverCapacityThreshold(e.target.value)} className="w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#B8862F]" />
+        </div>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <button onClick={save} className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#B8862F", color: "#F7F6FB" }}>Save Weights</button>
+        {saved && <span className="text-[11.5px]" style={{ color: "#5E9E8A" }}>Saved</span>}
+      </div>
     </div>
   );
 }
