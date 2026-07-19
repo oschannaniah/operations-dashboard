@@ -4,7 +4,7 @@ import {
   ChevronLeft, ChevronRight, Plus, Circle, CheckCircle2, AlertTriangle,
   Link2, Building2, ShieldCheck, X, StickyNote, Activity as ActivityIcon,
   MessageSquare, Mic, Image as ImageIcon, Trash2, Clock, Bell, Camera, FileText,
-  MoreHorizontal, Settings
+  MoreHorizontal, Settings, Tag
 } from "lucide-react";
 import { Document, Packer, Paragraph, Table, TableRow, TableCell, HeadingLevel, TextRun, WidthType } from "docx";
 import jsPDF from "jspdf";
@@ -67,6 +67,22 @@ const DEFAULT_CAPACITY_WEIGHTS = {
   heavyLoadThreshold: 3,
   overCapacityThreshold: 6,
 };
+
+// Custom taxonomy — mirrors taxonomy_settings' column defaults (0030_taxonomy_settings.sql).
+// A *display* relabeling only: ministryAreaLabels maps each stored Ministry Area value to
+// whatever text should show instead — the stored values themselves (Operations/Ministry/Next
+// Gen/Programming/Central) never change, so nothing about how projects are tagged has to
+// migrate when Central renames the label.
+const DEFAULT_TAXONOMY = {
+  locationSingular: "Campus",
+  locationPlural: "Campuses",
+  ministryAreaFieldLabel: "Ministry Area",
+  ministryAreaLabels: { Operations: "Operations", Ministry: "Ministry", "Next Gen": "Next Gen", Programming: "Programming", Central: "Central" },
+};
+
+function maLabel(taxonomy, value) {
+  return taxonomy?.ministryAreaLabels?.[value] || value;
+}
 
 // Approval workflows — deliberately single-step (submit, one approver decides, done), no
 // multi-level chains. Who the approver actually is gets resolved at submit time, not stored as
@@ -138,12 +154,12 @@ let handleUnauthorized = () => {};
 // vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
 // the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
 // snake_case columns — so every existing call site keeps working unchanged.
-const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses", ApprovalRequests: "approval_requests" };
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses", ApprovalRequests: "approval_requests", TaxonomySettings: "taxonomy_settings" };
 
 // Every table's primary key is "id" except campus_config (natural key campus_id) and
 // margin_scores (natural key staff_id, one row per staff member) — neither has a separate
 // surrogate "id" column.
-const PK_MAP = { campus_config: "campus_id", margin_scores: "staff_id", capacity_weight_settings: "organization_id" };
+const PK_MAP = { campus_config: "campus_id", margin_scores: "staff_id", capacity_weight_settings: "organization_id", taxonomy_settings: "organization_id" };
 
 const FIELD_MAPS = {
   projects: { organizationId: "organization_id", createdBy: "created_by", completedOn: "completed_on", sharedWith: "shared_with", dueTime: "due_time", seasonId: "season_id", projectType: "project_type" },
@@ -171,6 +187,7 @@ const FIELD_MAPS = {
   pulse_wave_participants: { waveId: "wave_id", profileId: "profile_id", respondedAt: "responded_at" },
   pulse_responses: { waveId: "wave_id", campusId: "campus_id", submittedAt: "submitted_at" },
   approval_requests: { organizationId: "organization_id", campusId: "campus_id", startsOn: "starts_on", endsOn: "ends_on", requestedBy: "requested_by", requestedByProfileId: "requested_by_profile_id", decidedBy: "decided_by", decidedAt: "decided_at", decisionNote: "decision_note", createdAt: "created_at" },
+  taxonomy_settings: { organizationId: "organization_id", locationSingular: "location_singular", locationPlural: "location_plural", ministryAreaFieldLabel: "ministry_area_field_label", ministryAreaLabels: "ministry_area_labels", updatedAt: "updated_at", updatedBy: "updated_by" },
 };
 
 function toSnakeRow(table, obj) {
@@ -1025,6 +1042,8 @@ export default function OpsDashboard() {
   const [pulseParticipants, setPulseParticipants] = useState([]); // central sees everyone; od/staff see only their own row — RLS, 0027_org_pulse.sql
   const [pulseResponses, setPulseResponses] = useState([]); // central-only per RLS; empty for everyone else
   const [approvalRequests, setApprovalRequests] = useState([]);
+  const [taxonomySettings, setTaxonomySettings] = useState(null);
+  const taxonomy = taxonomySettings || DEFAULT_TAXONOMY;
   const [pendingMarginPulse, setPendingMarginPulse] = useState(null);
   const [campuses, setCampuses] = useState([]);
   const [users, setUsers] = useState([]);
@@ -1220,8 +1239,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult, approvalRequestsResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"), apiGet("ApprovalRequests"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult, approvalRequestsResult, taxonomySettingsResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"), apiGet("ApprovalRequests"), apiGet("TaxonomySettings"),
       ]);
       if (cancelled) return;
 
@@ -1367,6 +1386,8 @@ export default function OpsDashboard() {
       if (pulseResponsesResult.status === "fulfilled") setPulseResponses(pulseResponsesResult.value);
 
       if (approvalRequestsResult.status === "fulfilled") setApprovalRequests(approvalRequestsResult.value);
+
+      if (taxonomySettingsResult.status === "fulfilled" && taxonomySettingsResult.value[0]) setTaxonomySettings(taxonomySettingsResult.value[0]);
 
       if (failures.length > 0) {
         setBackendStatus("offline");
@@ -2095,6 +2116,26 @@ export default function OpsDashboard() {
     }
   };
 
+  // Same one-row-per-org upsert shape as updateCapacityWeightSettings above.
+  const updateTaxonomySettings = async (patch) => {
+    setSyncing(true);
+    try {
+      const fields = { ...patch, updatedBy: currentViewerName, updatedAt: new Date().toISOString() };
+      if (taxonomySettings) {
+        await apiUpdate("TaxonomySettings", OSC_ORG_ID, fields);
+        setTaxonomySettings((prev) => ({ ...prev, ...fields }));
+      } else {
+        const created = await apiCreate("TaxonomySettings", { organizationId: OSC_ORG_ID, ...fields });
+        setTaxonomySettings(created);
+      }
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   const createPulseWave = async (name, opensAt, closesAt) => {
     setSyncing(true);
     try {
@@ -2398,7 +2439,7 @@ export default function OpsDashboard() {
   // People/Admin) — presentation only, the id values themselves are load-bearing (URL deep
   // links, cross-tab onGoTab callbacks) and must never change.
   const navItems = [
-    { id: "overview", label: role === "central" && !selectedCampus ? "All Campuses" : "Campus View", icon: LayoutGrid, section: "Overview" },
+    { id: "overview", label: role === "central" && !selectedCampus ? `All ${taxonomy.locationPlural}` : `${taxonomy.locationSingular} View`, icon: LayoutGrid, section: "Overview" },
     { id: "projects", label: "Projects & Tasks", icon: ListChecks, section: "Work" },
     { id: "budget", label: "Budget", icon: DollarSign, section: "Work" },
     { id: "calendar", label: "Calendar", icon: CalendarDays, section: "Work" },
@@ -2528,7 +2569,7 @@ export default function OpsDashboard() {
             <CentralOverview campuses={campuses} orgBudgetUsed={orgBudgetUsed} orgBudgetTotal={orgBudgetTotal}
               projects={displayProjects} staffByCampus={staffByCampus} onSelectCampus={(id) => { setSelectedCampus(id); setTab("overview"); }}
               onOpenProject={setOpenProject}
-              detail={detail} setDetail={setDetail} onGoTab={setTab} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings} />
+              detail={detail} setDetail={setDetail} onGoTab={setTab} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings} taxonomy={taxonomy} />
           )}
 
           {tab === "centralmgmt" && auth.user.tier === "central" && (
@@ -2540,7 +2581,8 @@ export default function OpsDashboard() {
               onOpenProject={setOpenProject} onSelectCampus={(id) => { setSelectedCampus(id); setTab("overview"); }}
               capacityWeightSettings={capacityWeightSettings} onUpdateCapacityWeightSettings={updateCapacityWeightSettings}
               users={users} pulseWaves={pulseWaves} pulseParticipants={pulseParticipants} pulseResponses={pulseResponses}
-              onCreatePulseWave={createPulseWave} onDeletePulseWave={deletePulseWave} />
+              onCreatePulseWave={createPulseWave} onDeletePulseWave={deletePulseWave}
+              taxonomy={taxonomy} onUpdateTaxonomy={updateTaxonomySettings} />
           )}
 
           {tab === "overview" && (role !== "central" || selectedCampus) && activeCampus && (
@@ -2554,23 +2596,23 @@ export default function OpsDashboard() {
           )}
 
           {tab === "projects" && (
-            <ProjectsBoard projects={scopedProjects} campusLabel={activeCampus ? activeCampus.name : "All Campuses"}
+            <ProjectsBoard projects={scopedProjects} campusLabel={activeCampus ? activeCampus.name : `All ${taxonomy.locationPlural}`}
               onCycle={cycleStage} onOpen={setOpenProject} onSetSection={setProjectSection} onSetProjectType={setProjectType}
-              onNewProject={() => setShowNewProject(true)} />
+              onNewProject={() => setShowNewProject(true)} taxonomy={taxonomy} />
           )}
 
           {tab === "budget" && (
             <BudgetPanel
               projects={activeCampusId ? displayProjects.filter((p) => p.campus === activeCampusId) : displayProjects}
-              campuses={campuses} campusLabel={activeCampus ? activeCampus.name : "All Campuses"}
+              campuses={campuses} campusLabel={activeCampus ? activeCampus.name : `All ${taxonomy.locationPlural}`}
               onOpenProject={setOpenProject} onSelectCampus={activeCampusId ? null : (id) => { setSelectedCampus(id); setTab("budget"); }}
-              accentColor={activeCampus?.color}
+              accentColor={activeCampus?.color} taxonomy={taxonomy}
             />
           )}
 
           {tab === "staff" && (
             <StaffPanel
-              staff={staffForPanel} campusLabel={activeCampus ? activeCampus.name : (staffCampusId === "central" ? "Central Operations Team" : "Select a campus")} full
+              staff={staffForPanel} campusLabel={activeCampus ? activeCampus.name : (staffCampusId === "central" ? "Central Operations Team" : `Select a ${taxonomy.locationSingular.toLowerCase()}`)} full
               campusId={staffCampusId} roleOptions={roleOptions}
               onAdd={addStaff} onAddTeamRole={addTeamRole} onRemove={removeStaff} onUpdateRoles={updateStaffRoles}
               onSetCalendars={setStaffCalendars} onAddRoleOption={addRoleOption}
@@ -2599,7 +2641,7 @@ export default function OpsDashboard() {
 
           {tab === "notes" && (
             <NotesPanel notes={notes} newNote={newNote} setNewNote={setNewNote} addNote={addNote} removeNote={removeNote}
-              campusLabel={activeCampus ? activeCampus.name : "Select a campus"} full />
+              campusLabel={activeCampus ? activeCampus.name : `Select a ${taxonomy.locationSingular.toLowerCase()}`} full />
           )}
 
           {tab === "activity" && (
@@ -2612,7 +2654,7 @@ export default function OpsDashboard() {
           {tab === "playbooks" && (
             <PlaybooksPanel
               projects={displayProjects} campuses={campuses} staffByCampus={staffByCampus}
-              activeCampusId={activeCampusId} campusLabel={activeCampus ? activeCampus.name : "All Campuses"}
+              activeCampusId={activeCampusId} campusLabel={activeCampus ? activeCampus.name : `All ${taxonomy.locationPlural}`}
               tier={auth.user.tier}
               templates={playbookTemplates} templateItems={playbookTemplateItems}
               runs={playbookRuns} runItems={playbookRunItems}
@@ -2626,7 +2668,7 @@ export default function OpsDashboard() {
           {tab === "requests" && (
             <ApprovalRequestsPanel
               requests={approvalRequests} campuses={campuses}
-              activeCampusId={activeCampusId} campusLabel={activeCampus ? activeCampus.name : "All Campuses"}
+              activeCampusId={activeCampusId} campusLabel={activeCampus ? activeCampus.name : `All ${taxonomy.locationPlural}`}
               currentViewerName={currentViewerName} viewerTier={auth.user.tier}
               onSubmit={submitApprovalRequest} onDecide={decideApprovalRequest} onWithdraw={withdrawApprovalRequest}
             />
@@ -2651,7 +2693,7 @@ export default function OpsDashboard() {
         {navItems.filter((item) => ["overview", "projects", "calendar"].includes(item.id)).map((item) => (
           <button key={item.id} onClick={() => setTab(item.id)}
             className={`flex-1 flex flex-col items-center justify-center gap-0.5 py-2 text-[10.5px] ${tab === item.id ? "text-[#B8862F]" : "text-[#6B6980]"}`}>
-            <item.icon size={18} strokeWidth={2} />{item.label === "All Campuses" ? "Campuses" : item.label.split(" ")[0]}
+            <item.icon size={18} strokeWidth={2} />{item.id === "overview" ? (role === "central" && !selectedCampus ? taxonomy.locationPlural : taxonomy.locationSingular) : item.label.split(" ")[0]}
           </button>
         ))}
         <button onClick={() => setShowMoreSheet(true)}
@@ -2683,7 +2725,7 @@ export default function OpsDashboard() {
           roster={fullRoster} seasons={seasons} onSetSeason={setProjectSeason}
         />
       )}
-      {showNewProject && <NewProjectModal onClose={() => setShowNewProject(false)} onCreate={(data) => { addProject(data); setShowNewProject(false); }} campusRoster={campusRoster} fullRoster={fullRoster} campusLabel={activeCampus ? `${activeCampus.name} (${activeCampus.abbr})` : "Central"} />}
+      {showNewProject && <NewProjectModal onClose={() => setShowNewProject(false)} onCreate={(data) => { addProject(data); setShowNewProject(false); }} campusRoster={campusRoster} fullRoster={fullRoster} campusLabel={activeCampus ? `${activeCampus.name} (${activeCampus.abbr})` : "Central"} taxonomy={taxonomy} />}
       {openStaffProfile && <StaffProfileModal name={openStaffProfile} projects={displayProjects} onClose={() => setOpenStaffProfile(null)} onOpenProject={(id) => { setOpenStaffProfile(null); setOpenProject(id); }} />}
     </div>
   );
@@ -2843,7 +2885,7 @@ function CentralTeamWindow({ projects, campuses, centralThreads, onAddTag, onRem
   );
 }
 
-function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, onOpenProject, detail, setDetail, onGoTab, marginScores, capacityWeightSettings }) {
+function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, onOpenProject, detail, setDetail, onGoTab, marginScores, capacityWeightSettings, taxonomy }) {
   const sharedProjects = projects.filter((p) => p.shared);
   const allStaff = Object.values(staffByCampus).flat();
 
@@ -2856,7 +2898,7 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
   return (
     <div>
       <div className="mb-6">
-        <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(20px,4vw,26px)] font-semibold tracking-tight">All Campuses</h1>
+        <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(20px,4vw,26px)] font-semibold tracking-tight">All {taxonomy.locationPlural}</h1>
         <p className="text-[13px] text-[#6B6980] mt-1">Organization-wide standing, at a glance.</p>
       </div>
 
@@ -2865,7 +2907,7 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
         <SummaryCard onClick={() => setDetail("projects")} icon={ListChecks} label="Open Projects" value={projects.filter((p) => p.stage !== "Completed").length} sub="org-wide" color="#2B4C7E" />
         <SummaryCard onClick={() => setDetail("budget")} icon={DollarSign} label="Budget Used" value={fmtMoney(orgBudgetUsed)} sub={`of ${fmtMoney(orgBudgetTotal)} forecasted`} color="#B8862F" />
-        <SummaryCard onClick={() => setDetail("campuses")} icon={Building2} label="Campuses" value={campuses.length} sub="active sites" color="#5E9E8A" />
+        <SummaryCard onClick={() => setDetail("campuses")} icon={Building2} label={taxonomy.locationPlural} value={campuses.length} sub="active sites" color="#5E9E8A" />
         <SummaryCard onClick={() => setDetail("shared")} icon={Link2} label="Shared Projects" value={sharedProjects.length} sub="cross-campus" color="#6B4FA0" />
       </div>
 
@@ -2891,7 +2933,7 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
             <div className="text-[10.5px] text-[#8B889C]">sorted by open projects</div>
           </div>
           <div className="grid grid-cols-[1fr_50px_82px_16px] gap-2 text-[9.5px] text-[#8B889C] uppercase tracking-wide pb-1.5 mb-1 border-b border-[#E3E1F0]">
-            <span>Campus</span><span className="text-right">Open</span><span className="text-right">Budget</span><span></span>
+            <span>{taxonomy.locationSingular}</span><span className="text-right">Open</span><span className="text-right">Budget</span><span></span>
           </div>
           <div>
             {campusRows.map((row) => (
@@ -4494,7 +4536,7 @@ function CampusBudgetSummary({ projects, accentColor }) {
   );
 }
 
-function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectCampus, accentColor }) {
+function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectCampus, accentColor, taxonomy }) {
   const b = rollupBudget(projects);
   const pct = b.total ? Math.min(100, Math.round((b.spent / b.total) * 100)) : 0;
   const color = accentColor || "#B8862F";
@@ -4527,7 +4569,7 @@ function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectC
 
       {showYtd && (
         <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mb-5 -mt-3">
-          <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">By Ministry Area, {ytd.year}</div>
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">By {taxonomy.ministryAreaFieldLabel}, {ytd.year}</div>
           {ytdLanes.length === 0 && <div className="text-[11px] text-[#8B889C]">Nothing spent yet this year.</div>}
           <div className="space-y-2">
             {ytdLanes.map((lane) => {
@@ -4536,7 +4578,7 @@ function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectC
               return (
                 <div key={lane}>
                   <div className="flex items-center justify-between text-[11.5px] mb-1">
-                    <span>{lane}</span>
+                    <span>{maLabel(taxonomy, lane)}</span>
                     <span className="text-[#6B6980]">{fmtMoney(l.spent)} · {l.count} project{l.count === 1 ? "" : "s"}</span>
                   </div>
                   <div className="h-1.5 rounded-full bg-[#E3E1F0] overflow-hidden"><div className="h-full rounded-full" style={{ width: `${laneSharePct}%`, background: "#2B4C7E" }} /></div>
@@ -4665,7 +4707,7 @@ function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectC
   );
 }
 
-function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, onSetProjectType, onNewProject }) {
+function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, onSetProjectType, onNewProject, taxonomy }) {
   const [sortBy, setSortBy] = useState("due");
   const [filterStage, setFilterStage] = useState("All");
   const [filterSection, setFilterSection] = useState("All");
@@ -4710,10 +4752,10 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, o
           <option value="All">All Stages</option>
           {STAGES.map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
-        <span className="text-[10.5px] text-[#6B6980] ml-2">Ministry Area</span>
+        <span className="text-[10.5px] text-[#6B6980] ml-2">{taxonomy.ministryAreaFieldLabel}</span>
         <select value={filterSection} onChange={(e) => setFilterSection(e.target.value)} className="bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11.5px] outline-none">
-          <option value="All">All Ministry Areas</option>
-          {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+          <option value="All">All {taxonomy.ministryAreaFieldLabel}s</option>
+          {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{maLabel(taxonomy, s)}</option>)}
         </select>
         <label className="flex items-center gap-1.5 text-[11px] text-[#6B6980] ml-2 cursor-pointer">
           <input type="checkbox" checked={showCompleted} onChange={(e) => setShowCompleted(e.target.checked)} className="accent-[#B8862F]" />
@@ -4725,7 +4767,7 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, o
         {MINISTRY_AREA_OPTIONS.map((section) => (
           <div key={section}>
             <div className="text-[12px] font-medium text-[#2A2A3A] mb-2 flex items-center gap-2">
-              {section} <span className="text-[10.5px] text-[#6B6980] font-normal">· {grouped[section]?.length || 0}</span>
+              {maLabel(taxonomy, section)} <span className="text-[10.5px] text-[#6B6980] font-normal">· {grouped[section]?.length || 0}</span>
             </div>
             <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
               {(grouped[section] || []).map((p) => (
@@ -4752,7 +4794,7 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, o
                       </select>
                       <select value={p.section || MINISTRY_AREA_OPTIONS[0]} onChange={(e) => onSetSection(p.id, e.target.value)}
                         className="bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-1.5 py-0.5 text-[9.5px] text-[#6B6980] outline-none">
-                        {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+                        {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{maLabel(taxonomy, s)}</option>)}
                       </select>
                     </div>
                   </div>
@@ -5268,7 +5310,7 @@ function EventsList({ campusId, campuses }) {
   );
 }
 
-function NewProjectModal({ onClose, onCreate, campusRoster, fullRoster, campusLabel }) {
+function NewProjectModal({ onClose, onCreate, campusRoster, fullRoster, campusLabel, taxonomy }) {
   const [title, setTitle] = useState("");
   const [section, setSection] = useState(MINISTRY_AREA_OPTIONS[0]);
   const [projectType, setProjectType] = useState(PROJECT_TYPE_OPTIONS[PROJECT_TYPE_OPTIONS.length - 1]);
@@ -5313,9 +5355,9 @@ function NewProjectModal({ onClose, onCreate, campusRoster, fullRoster, campusLa
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="text-[10.5px] text-[#6B6980] block mb-1">Ministry Area</label>
+              <label className="text-[10.5px] text-[#6B6980] block mb-1">{taxonomy.ministryAreaFieldLabel}</label>
               <select value={section} onChange={(e) => setSection(e.target.value)} className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2 py-2 text-[12.5px] outline-none">
-                {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+                {MINISTRY_AREA_OPTIONS.map((s) => <option key={s} value={s}>{maLabel(taxonomy, s)}</option>)}
               </select>
             </div>
             <div>
@@ -6178,8 +6220,8 @@ function SeasonsPanel({ seasons, projects, campuses, onCreateSeason, onOpenProje
 // Central Management — the three org-wide tools (Central Team, Seasons, Location Scorecards)
 // that used to live as full-width buttons on All Campuses. Same accordion pattern throughout:
 // click a button, its panel expands in place below the row; only one open at a time.
-function CentralManagementPanel({ projects, campuses, staffByCampus, marginScores, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, seasons, onCreateSeason, onOpenProject, onSelectCampus, capacityWeightSettings, onUpdateCapacityWeightSettings, users, pulseWaves, pulseParticipants, pulseResponses, onCreatePulseWave, onDeletePulseWave }) {
-  const [open, setOpen] = useState(null); // "team" | "seasons" | "scorecards" | "weights" | "pulse" | null
+function CentralManagementPanel({ projects, campuses, staffByCampus, marginScores, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, seasons, onCreateSeason, onOpenProject, onSelectCampus, capacityWeightSettings, onUpdateCapacityWeightSettings, users, pulseWaves, pulseParticipants, pulseResponses, onCreatePulseWave, onDeletePulseWave, taxonomy, onUpdateTaxonomy }) {
+  const [open, setOpen] = useState(null); // "team" | "seasons" | "scorecards" | "weights" | "pulse" | "terminology" | null
 
   const tools = [
     { key: "team", label: "Central Team", color: "#2B4C7E", icon: Users, desc: "Browse any project or task by campus, leave a private note, optionally assign it. Campus teams never see this." },
@@ -6187,6 +6229,7 @@ function CentralManagementPanel({ projects, campuses, staffByCampus, marginScore
     { key: "scorecards", label: "Location Scorecards", color: "#5E9E8A", icon: ListChecks, desc: "Margin, budget adherence, and on-time delivery — every campus, side by side." },
     { key: "weights", label: "Capacity Weights", color: "#B8862F", icon: Settings, desc: "Tune how project type, cost, deadline, and team size combine into the capacity forecast." },
     { key: "pulse", label: "Org Pulse", color: "#C15B5B", icon: MessageSquare, desc: "A quarterly, anonymous org-wide sentiment read — separate from each person's Margin pulse." },
+    { key: "terminology", label: "Terminology", color: "#2A2A3A", icon: Tag, desc: "Rename \"Campus\" and the Ministry Area labels org-wide — a display change only." },
   ];
 
   return (
@@ -6240,6 +6283,11 @@ function CentralManagementPanel({ projects, campuses, staffByCampus, marginScore
         <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mt-3 mb-8">
           <OrgPulsePanel campuses={campuses} users={users} waves={pulseWaves} participants={pulseParticipants} responses={pulseResponses}
             onCreateWave={onCreatePulseWave} onDeleteWave={onDeletePulseWave} />
+        </div>
+      )}
+      {open === "terminology" && (
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mt-3 mb-8">
+          <TerminologyPanel settings={taxonomy || DEFAULT_TAXONOMY} onSave={onUpdateTaxonomy} />
         </div>
       )}
     </div>
@@ -6333,6 +6381,64 @@ function CapacityWeightsPanel({ settings, onSave }) {
 
       <div className="flex items-center gap-3">
         <button onClick={save} className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#B8862F", color: "#F7F6FB" }}>Save Weights</button>
+        {saved && <span className="text-[11.5px]" style={{ color: "#5E9E8A" }}>Saved</span>}
+      </div>
+    </div>
+  );
+}
+
+function TerminologyPanel({ settings, onSave }) {
+  const [locationSingular, setLocationSingular] = useState(settings.locationSingular);
+  const [locationPlural, setLocationPlural] = useState(settings.locationPlural);
+  const [ministryAreaFieldLabel, setMinistryAreaFieldLabel] = useState(settings.ministryAreaFieldLabel);
+  const [ministryAreaLabels, setMinistryAreaLabels] = useState(settings.ministryAreaLabels);
+  const [saved, setSaved] = useState(false);
+
+  const updateAreaLabel = (key, val) => setMinistryAreaLabels((prev) => ({ ...prev, [key]: val }));
+
+  const save = () => {
+    onSave({ locationSingular, locationPlural, ministryAreaFieldLabel, ministryAreaLabels });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  const inputClass = "w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#B8862F]";
+
+  return (
+    <div>
+      <div className="text-[13px] font-semibold mb-1">Terminology</div>
+      <p className="text-[11.5px] text-[#6B6980] mb-4">Renames how this app's fixed vocabulary reads across the org — a display relabeling only. What's actually stored (locations, ministry area tags) never changes, so nothing here affects filtering or reporting.</p>
+
+      <div className="mb-5 grid sm:grid-cols-2 gap-3">
+        <div>
+          <label className="text-[10.5px] text-[#6B6980] block mb-1">Location, singular</label>
+          <input value={locationSingular} onChange={(e) => setLocationSingular(e.target.value)} className={inputClass} />
+        </div>
+        <div>
+          <label className="text-[10.5px] text-[#6B6980] block mb-1">Location, plural</label>
+          <input value={locationPlural} onChange={(e) => setLocationPlural(e.target.value)} className={inputClass} />
+        </div>
+      </div>
+
+      <div className="mb-5">
+        <label className="text-[10.5px] text-[#6B6980] block mb-1">Ministry Area field label</label>
+        <input value={ministryAreaFieldLabel} onChange={(e) => setMinistryAreaFieldLabel(e.target.value)} className={inputClass} />
+      </div>
+
+      <div className="mb-5">
+        <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">Ministry Area labels</div>
+        <div className="grid sm:grid-cols-2 gap-2">
+          {MINISTRY_AREA_OPTIONS.map((key) => (
+            <div key={key} className="flex items-center justify-between gap-2 bg-[#F7F6FB] border border-[#E3E1F0] rounded-md px-3 py-2">
+              <span className="text-[11px] text-[#8B889C] w-24 shrink-0">{key}</span>
+              <input value={ministryAreaLabels[key] ?? key} onChange={(e) => updateAreaLabel(key, e.target.value)} className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 text-[12px] outline-none focus:border-[#B8862F]" />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <button onClick={save} className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#B8862F", color: "#F7F6FB" }}>Save Terminology</button>
         {saved && <span className="text-[11.5px]" style={{ color: "#5E9E8A" }}>Saved</span>}
       </div>
     </div>
