@@ -846,6 +846,7 @@ export default function OpsDashboard() {
   const [flagHistory, setFlagHistory] = useState([]);
   const [checkinLog, setCheckinLog] = useState([]);
   const [showSeasons, setShowSeasons] = useState(false);
+  const [showScorecards, setShowScorecards] = useState(false);
   const [pendingMarginPulse, setPendingMarginPulse] = useState(null);
   const [campuses, setCampuses] = useState([]);
   const [users, setUsers] = useState([]);
@@ -2033,7 +2034,8 @@ export default function OpsDashboard() {
               centralThreads={centralThreads} onAddTag={addCentralTag} onRemoveTag={removeCentralTag} onAddMessage={addCentralMessage}
               currentViewerName={currentViewerName} onOpenProject={setOpenProject}
               detail={detail} setDetail={setDetail} onGoTab={setTab}
-              seasons={seasons} onOpenSeasons={() => setShowSeasons(true)} />
+              seasons={seasons} onOpenSeasons={() => setShowSeasons(true)}
+              marginScores={marginScores} onOpenScorecards={() => setShowScorecards(true)} />
           )}
 
           {tab === "overview" && (role !== "central" || selectedCampus) && activeCampus && (
@@ -2139,6 +2141,12 @@ export default function OpsDashboard() {
         <SeasonsModal seasons={seasons} projects={displayProjects} campuses={campuses}
           onCreateSeason={createSeason} onClose={() => setShowSeasons(false)}
           onOpenProject={(id) => { setShowSeasons(false); setOpenProject(id); }} />
+      )}
+
+      {showScorecards && (
+        <LocationScorecardsModal campuses={campuses} projects={displayProjects} staffByCampus={staffByCampus} marginScores={marginScores}
+          onClose={() => setShowScorecards(false)}
+          onSelectCampus={(id) => { setShowScorecards(false); setSelectedCampus(id); setTab("overview"); }} />
       )}
 
       {openProject && (
@@ -2313,7 +2321,7 @@ function CentralTeamWindow({ projects, campuses, centralThreads, onAddTag, onRem
   );
 }
 
-function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, onOpenProject, detail, setDetail, onGoTab, seasons, onOpenSeasons }) {
+function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, onOpenProject, detail, setDetail, onGoTab, seasons, onOpenSeasons, marginScores, onOpenScorecards }) {
   const sharedProjects = projects.filter((p) => p.shared);
   const allStaff = Object.values(staffByCampus).flat();
   return (
@@ -2327,7 +2335,7 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-7">
         <SummaryCard onClick={() => setDetail("projects")} icon={ListChecks} label="Open Projects" value={projects.filter((p) => p.stage !== "Completed").length} sub="org-wide" color="#2B4C7E" />
-        <SummaryCard onClick={() => setDetail("budget")} icon={DollarSign} label="Budget Used" value={`${Math.round((orgBudgetUsed / orgBudgetTotal) * 100)}%`} sub={`${fmtMoney(orgBudgetUsed)} of ${fmtMoney(orgBudgetTotal)}`} color="#B8862F" />
+        <SummaryCard onClick={() => setDetail("budget")} icon={DollarSign} label="Budget Used" value={fmtMoney(orgBudgetUsed)} sub={`of ${fmtMoney(orgBudgetTotal)} forecasted`} color="#B8862F" />
         <SummaryCard onClick={() => setDetail("campuses")} icon={Building2} label="Campuses" value={campuses.length} sub="active sites" color="#5E9E8A" />
         <SummaryCard onClick={() => setDetail("shared")} icon={Link2} label="Shared Projects" value={sharedProjects.length} sub="cross-campus" color="#6B4FA0" />
       </div>
@@ -2367,6 +2375,21 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
           <div>
             <div className="text-[13.5px] font-medium">Seasons</div>
             <div className="text-[11.5px] text-[#6B6980]">{seasons.length > 0 ? `${seasons.length} season${seasons.length === 1 ? "" : "s"} tracked` : "Easter, Christmas, VBS"} — see every campus's plan for a season in one place.</div>
+          </div>
+        </div>
+        <ChevronRight size={16} className="text-[#8B889C] shrink-0" />
+      </button>
+
+      <button onClick={onOpenScorecards}
+        className="w-full flex items-center justify-between gap-3 bg-[#FFFFFF] rounded-lg p-4 mb-6 text-left transition"
+        style={{ border: "1.5px solid #5E9E8A55" }}
+        onMouseEnter={(e) => e.currentTarget.style.borderColor = "#5E9E8A"}
+        onMouseLeave={(e) => e.currentTarget.style.borderColor = "#5E9E8A55"}>
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-md flex items-center justify-center shrink-0" style={{ background: "#5E9E8A" }}><ListChecks size={16} color="#F7F6FB" /></div>
+          <div>
+            <div className="text-[13.5px] font-medium">Location Scorecards</div>
+            <div className="text-[11.5px] text-[#6B6980]">Margin, budget adherence, and on-time delivery — every campus, side by side.</div>
           </div>
         </div>
         <ChevronRight size={16} className="text-[#8B889C] shrink-0" />
@@ -4694,6 +4717,86 @@ function NewProjectModal({ onClose, onCreate, campusRoster, fullRoster, campusLa
 // (list+create, and one season's rollup) rather than separate screens, since v1 doesn't need
 // more than that — see 0018_seasons.sql for what's deliberately deferred (auto-suggesting next
 // year's checklist from this year's).
+// Location Scorecards — margin health, budget adherence, and on-time delivery side by side
+// across every campus, so coaching starts from the same numbers instead of a director's read
+// of their own site. Pure rollup over data already in memory (estimateAccuracy, marginScores,
+// due/completedOn) — no new schema.
+function LocationScorecardsModal({ campuses, projects, staffByCampus, marginScores, onClose, onSelectCampus }) {
+  useLockBodyScroll();
+
+  const pctColor = (pct) => pct == null ? "#8B889C" : pct >= 80 ? "#5E9E8A" : pct >= 60 ? "#B8862F" : "#C15B5B";
+
+  const rows = campuses.map((c) => {
+    const campusProjects = projects.filter((p) => p.campus === c.id);
+    const openProjects = campusProjects.filter((p) => p.stage !== "Completed");
+    const overdue = openProjects.filter((p) => p.due < TODAY_STR).length;
+    const accuracy = estimateAccuracy(campusProjects);
+    const completed = campusProjects.filter((p) => p.stage === "Completed" && p.completedOn && p.due);
+    const onTime = completed.filter((p) => p.completedOn <= p.due).length;
+    const onTimePct = completed.length ? Math.round((onTime / completed.length) * 100) : null;
+    const staffList = staffByCampus[c.id] || [];
+    const assessed = staffList.filter((s) => marginScores?.[s.id]);
+    const overCapacity = assessed.filter((s) => marginScores[s.id].status === "over_capacity").length;
+    const stretched = assessed.filter((s) => marginScores[s.id].status === "stretched").length;
+    const marginColor = assessed.length === 0 ? "#8B889C" : overCapacity > 0 ? "#C15B5B" : stretched > 0 ? "#B8862F" : "#5E9E8A";
+    const marginLabel = assessed.length === 0 ? "Not assessed" : overCapacity > 0 ? `${overCapacity} over capacity` : stretched > 0 ? `${stretched} stretched` : "Healthy";
+    return { campus: c, openCount: openProjects.length, overdue, accuracy, onTimePct, staffCount: staffList.length, marginColor, marginLabel };
+  });
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[860px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-[15px] font-semibold">Location Scorecards</h2>
+          <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
+        </div>
+        <p className="text-[11.5px] text-[#6B6980] mb-4">Margin health, budget adherence, and on-time delivery — side by side. Tap a row to open that campus.</p>
+
+        {rows.length === 0 ? (
+          <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No campuses yet.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[12px] border-collapse">
+              <thead>
+                <tr className="text-left text-[10px] text-[#8B889C] uppercase tracking-wide">
+                  <th className="pb-2 pr-3 font-medium">Campus</th>
+                  <th className="pb-2 pr-3 font-medium">Margin</th>
+                  <th className="pb-2 pr-3 font-medium">Budget adherence</th>
+                  <th className="pb-2 pr-3 font-medium">On-time delivery</th>
+                  <th className="pb-2 pr-3 font-medium">Open</th>
+                  <th className="pb-2 font-medium">Staff</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <tr key={row.campus.id} className="border-t border-[#E3E1F0] cursor-pointer hover:bg-[#F7F6FB]" onClick={() => onSelectCampus(row.campus.id)}>
+                    <td className="py-2.5 pr-3 font-medium whitespace-nowrap" style={{ color: row.campus.color }}>{row.campus.name}</td>
+                    <td className="py-2.5 pr-3">
+                      <span className="px-2 py-0.5 rounded-full text-[10.5px] whitespace-nowrap" style={{ background: `${row.marginColor}22`, color: row.marginColor }}>{row.marginLabel}</span>
+                    </td>
+                    <td className="py-2.5 pr-3">
+                      <span className="px-2 py-0.5 rounded-full text-[10.5px] whitespace-nowrap" style={{ background: `${pctColor(row.accuracy.atOrUnderPct)}22`, color: pctColor(row.accuracy.atOrUnderPct) }}>
+                        {row.accuracy.atOrUnderPct == null ? "No data" : `${row.accuracy.atOrUnderPct}% at/under`}
+                      </span>
+                    </td>
+                    <td className="py-2.5 pr-3">
+                      <span className="px-2 py-0.5 rounded-full text-[10.5px] whitespace-nowrap" style={{ background: `${pctColor(row.onTimePct)}22`, color: pctColor(row.onTimePct) }}>
+                        {row.onTimePct == null ? "No data" : `${row.onTimePct}% on time`}
+                      </span>
+                    </td>
+                    <td className="py-2.5 pr-3 text-[#6B6980] whitespace-nowrap">{row.openCount}{row.overdue > 0 ? ` (${row.overdue} overdue)` : ""}</td>
+                    <td className="py-2.5 text-[#6B6980]">{row.staffCount}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SeasonsModal({ seasons, projects, campuses, onCreateSeason, onClose, onOpenProject }) {
   useLockBodyScroll();
   const [creating, setCreating] = useState(false);
