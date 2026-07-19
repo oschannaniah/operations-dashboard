@@ -554,6 +554,35 @@ function budgetStatus(project) {
 const BUDGET_STATUS_LABEL = { under: "Under budget", at: "On budget", over: "Over budget" };
 const BUDGET_STATUS_COLOR = { under: "#5E9E8A", at: "#B8862F", over: "#C15B5B" };
 
+// Budget forecasting — the forward-looking counterpart to estimateAccuracy's rear-view. Burn
+// rate extrapolated from sub-task completion: if a project is 40% done on its checklist but
+// has already spent 60% of its budget, spending is outpacing progress, so projecting that same
+// rate out to 100% complete gives an early warning instead of waiting for the final variance
+// after the fact. Needs at least one completed sub-task to have a progress signal at all — a
+// project with money spent but nothing checked off yet can't be extrapolated, only flagged.
+function budgetForecast(p) {
+  if (p.stage === "Completed") return null;
+  const b = projectBudget(p);
+  if (b.total <= 0) return null;
+  const subtasks = p.subtasks || [];
+  if (subtasks.length === 0) return null;
+  const progressPct = subtasks.filter((s) => s.done).length / subtasks.length;
+  if (progressPct <= 0) return b.spent > 0 ? { project: p, budget: b, progressPct: 0, projectedTotal: null, projectedVariancePct: null, earlySpend: true } : null;
+  const projectedTotal = b.spent / progressPct;
+  const projectedVariancePct = ((projectedTotal - b.total) / b.total) * 100;
+  return { project: p, budget: b, progressPct, projectedTotal, projectedVariancePct, earlySpend: false };
+}
+
+function budgetForecastRollup(projectsList) {
+  const forecasts = projectsList.map(budgetForecast).filter(Boolean);
+  const withProjection = forecasts.filter((f) => f.projectedTotal != null);
+  const projectedTotal = withProjection.reduce((sum, f) => sum + f.projectedTotal, 0);
+  const budgetedTotal = withProjection.reduce((sum, f) => sum + f.budget.total, 0);
+  const atRisk = [...withProjection].filter((f) => f.projectedVariancePct > 10).sort((a, b) => b.projectedVariancePct - a.projectedVariancePct);
+  const earlySpend = forecasts.filter((f) => f.earlySpend);
+  return { count: withProjection.length, projectedTotal, budgetedTotal, atRisk, earlySpend };
+}
+
 // Financial stewardship, deliberately scoped narrow: not a campus budget system, just how well
 // completed projects were actually estimated. Variance is signed — negative means it landed
 // under, positive means over — so "average variance" reads as a real trend, not just a
@@ -1743,6 +1772,45 @@ export default function OpsDashboard() {
   // always recomputes this itself from campusId/role on write and is the actual source of truth.
   const tierFromAccess = (campusId, role) => campusId === "central" ? "central" : (role === "Campus Operations Director" ? "od" : "staff");
 
+  // campuses.id is a client-supplied text slug (not a surrogate key), so a new location needs
+  // one derived from its name, checked against every campus already loaded — collisions get a
+  // numeric suffix. "central" is reserved (the pseudo-campus row every org already has).
+  const slugifyCampusName = (name) => {
+    const base = name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || `campus-${Date.now()}`;
+    let id = base === "central" ? `${base}-campus` : base;
+    let n = 2;
+    while (campuses.some((c) => c.id === id)) { id = `${base}-${n}`; n++; }
+    return id;
+  };
+
+  // Creates a new location and, in the same step, an optional login for its Campus Operations
+  // Director — the common case for standing up a new campus. The OD account reuses the exact
+  // same admin-accounts path (and invite-vs-password choice) as every other account creation;
+  // this just chains a Campuses insert in front of it and back-fills lead_name/lead_profile_id
+  // once the account exists.
+  const addCampus = (campusData, odData) => {
+    setSyncing(true);
+    const id = slugifyCampusName(campusData.name);
+    const newCampus = { id, organizationId: OSC_ORG_ID, name: campusData.name, abbr: campusData.abbr, phase: Number(campusData.phase) || 1, color: campusData.color };
+    apiCreate("Campuses", newCampus)
+      .then(async () => {
+        setCampuses((prev) => [...prev, newCampus]);
+        logActivity("added a new campus", campusData.name, id);
+        if (odData?.email) {
+          const result = await apiAdminAccounts("create", { firstName: odData.firstName, lastName: odData.lastName, email: odData.email, phone: odData.phone || "", campusId: id, role: "Campus Operations Director", password: odData.password });
+          const leadName = `${odData.firstName} ${odData.lastName}`.trim();
+          const newUser = { id: result.id, firstName: odData.firstName, lastName: odData.lastName, email: odData.email, phone: odData.phone || "", campusId: id, role: "Campus Operations Director", tier: "od", createdAt: TODAY_STR };
+          setUsers((prev) => [...prev, newUser]);
+          await apiUpdate("Campuses", id, { lead: leadName, leadProfileId: result.id });
+          setCampuses((prev) => prev.map((c) => c.id === id ? { ...c, lead: leadName, leadProfileId: result.id } : c));
+          logActivity("created a login for", leadName, id);
+        }
+        setBackendStatus("connected"); setBackendError("");
+      })
+      .catch((err) => { setBackendStatus("offline"); setBackendError(err?.message || String(err)); })
+      .finally(() => setSyncing(false));
+  };
+
   // Creates a real login — a normal, ordinary account, exactly like every account after the
   // very first. Only Central can do this (enforced server-side too, via the admin-accounts
   // Edge Function — creating an account for someone else with a chosen password needs the
@@ -2109,6 +2177,7 @@ export default function OpsDashboard() {
           {tab === "accounts" && auth.user.tier === "central" && (
             <AccountsPanel users={users} campuses={campuses} roleOptions={roleOptions}
               onCreate={addUserAccount} onUpdateAccess={updateUserAccess} onRemove={removeUserAccount}
+              onCreateCampus={addCampus}
               currentUserId={auth.user.id} />
           )}
 
@@ -3884,6 +3953,8 @@ function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectC
   const pct = b.total ? Math.min(100, Math.round((b.spent / b.total) * 100)) : 0;
   const color = accentColor || "#B8862F";
   const acc = estimateAccuracy(projects);
+  const forecast = budgetForecastRollup(projects);
+  const forecastVariancePct = forecast.budgetedTotal > 0 ? ((forecast.projectedTotal - forecast.budgetedTotal) / forecast.budgetedTotal) * 100 : 0;
   return (
     <div>
       <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(18px,3.6vw,22px)] font-semibold tracking-tight mb-1">Budget — {campusLabel}</h1>
@@ -3894,6 +3965,51 @@ function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectC
         <div className="text-[26px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color }}>{fmtMoney(b.spent)} <span className="text-[15px] font-normal">of {fmtMoney(b.total)}</span></div>
         <div className="h-2 rounded-full bg-[#E3E1F0] overflow-hidden mt-2"><div className="h-full rounded-full" style={{ width: `${pct}%`, background: color }} /></div>
       </div>
+
+      {(forecast.count > 0 || forecast.earlySpend.length > 0) && (
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mb-6">
+          <h2 className="text-[13px] font-bold mb-1">Budget Forecast</h2>
+          <p className="text-[11px] text-[#6B6980] mb-3">At the current burn rate vs. checklist progress, where {forecast.count} open project{forecast.count === 1 ? "" : "s"} {forecast.count === 1 ? "is" : "are"} headed — not what's been spent, what's projected.</p>
+          {forecast.count > 0 && (
+            <div className="flex items-center gap-6 mb-3">
+              <div>
+                <div className="text-[20px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color: forecastVariancePct <= 5 ? "#5E9E8A" : forecastVariancePct <= 20 ? "#B8862F" : "#C15B5B" }}>{fmtMoney(Math.round(forecast.projectedTotal))}</div>
+                <div className="text-[10px] text-[#6B6980]">projected total, of {fmtMoney(forecast.budgetedTotal)} budgeted</div>
+              </div>
+              <div>
+                <div className="text-[20px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color: forecastVariancePct <= 5 ? "#5E9E8A" : forecastVariancePct <= 20 ? "#B8862F" : "#C15B5B" }}>{forecastVariancePct > 0 ? "+" : ""}{Math.round(forecastVariancePct)}%</div>
+                <div className="text-[10px] text-[#6B6980]">projected variance</div>
+              </div>
+            </div>
+          )}
+          {forecast.atRisk.length > 0 && (
+            <div className="mb-1">
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] mb-1.5">Trending over budget</div>
+              <div className="space-y-1">
+                {forecast.atRisk.map((f) => (
+                  <button key={f.project.id} onClick={() => onOpenProject(f.project.id)} className="w-full flex items-center justify-between gap-2 text-left hover:bg-[#EFEEFA] rounded-md px-2 py-1">
+                    <span className="text-[11.5px] truncate">{f.project.title} <span className="text-[10px] text-[#8B889C]">({Math.round(f.progressPct * 100)}% done)</span></span>
+                    <span className="text-[11px] shrink-0" style={{ color: "#C15B5B" }}>+{Math.round(f.projectedVariancePct)}%</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {forecast.earlySpend.length > 0 && (
+            <div className="mt-2">
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] mb-1.5">Spending before progress</div>
+              <div className="space-y-1">
+                {forecast.earlySpend.map((f) => (
+                  <button key={f.project.id} onClick={() => onOpenProject(f.project.id)} className="w-full flex items-center justify-between gap-2 text-left hover:bg-[#EFEEFA] rounded-md px-2 py-1">
+                    <span className="text-[11.5px] truncate">{f.project.title} <span className="text-[10px] text-[#8B889C]">(0% done)</span></span>
+                    <span className="text-[11px] shrink-0" style={{ color: "#B8862F" }}>{fmtMoney(f.budget.spent)} spent</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {acc.count > 0 && (
         <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mb-6">
@@ -5314,8 +5430,9 @@ function ReportsPanel({ projects, campuses, staffByCampus, roster, isCentral, on
 // Central-only. Login accounts (Users sheet, real auth) are deliberately kept separate from
 // the Staff directory (contact/assignment info, no login) — this panel is specifically about
 // who can sign in and what campus/role their token carries, not who's on a campus team.
-function AccountsPanel({ users, campuses, roleOptions, onCreate, onUpdateAccess, onRemove, currentUserId }) {
+function AccountsPanel({ users, campuses, roleOptions, onCreate, onUpdateAccess, onRemove, onCreateCampus, currentUserId }) {
   const [showCreate, setShowCreate] = useState(false);
+  const [showAddCampus, setShowAddCampus] = useState(false);
   const sorted = [...users].sort((a, b) => `${a.firstName} ${a.lastName}`.localeCompare(`${b.firstName} ${b.lastName}`));
 
   return (
@@ -5325,9 +5442,14 @@ function AccountsPanel({ users, campuses, roleOptions, onCreate, onUpdateAccess,
           <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(20px,4vw,26px)] font-semibold tracking-tight">User Management</h1>
           <p className="text-[13px] text-[#6B6980] mt-1">Create logins and control which campus and role each person's account has access to.</p>
         </div>
-        <button onClick={() => setShowCreate(true)} className="flex items-center gap-1.5 text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>
-          <Plus size={14} /> New Account
-        </button>
+        <div className="flex gap-2">
+          <button onClick={() => setShowAddCampus(true)} className="flex items-center gap-1.5 text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#5E9E8A", color: "#F7F6FB" }}>
+            <Plus size={14} /> New Location
+          </button>
+          <button onClick={() => setShowCreate(true)} className="flex items-center gap-1.5 text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>
+            <Plus size={14} /> New Account
+          </button>
+        </div>
       </div>
 
       {sorted.length === 0 && <div className="text-[12.5px] text-[#8B889C] py-8 text-center">No accounts yet besides yours.</div>}
@@ -5346,6 +5468,87 @@ function AccountsPanel({ users, campuses, roleOptions, onCreate, onUpdateAccess,
           onClose={() => setShowCreate(false)}
           onCreate={(data) => { onCreate(data); setShowCreate(false); }} />
       )}
+
+      {showAddCampus && (
+        <AddCampusModal
+          onClose={() => setShowAddCampus(false)}
+          onCreate={(campusData, odData) => { onCreateCampus(campusData, odData); setShowAddCampus(false); }} />
+      )}
+    </div>
+  );
+}
+
+const CAMPUS_COLOR_PALETTE = ["#2B4C7E", "#B8862F", "#6B4FA0", "#5E9E8A", "#C15B5B", "#C15B8F", "#8A6420", "#5E7E9E"];
+
+function AddCampusModal({ onClose, onCreate }) {
+  useLockBodyScroll();
+  const [name, setName] = useState("");
+  const [abbr, setAbbr] = useState("");
+  const [phase, setPhase] = useState(1);
+  const [color, setColor] = useState(CAMPUS_COLOR_PALETTE[0]);
+  const [odFirstName, setOdFirstName] = useState("");
+  const [odLastName, setOdLastName] = useState("");
+  const [odEmail, setOdEmail] = useState("");
+  const [odPhone, setOdPhone] = useState("");
+  const [loginMode, setLoginMode] = useState("invite");
+  const [odPassword, setOdPassword] = useState("");
+  const [error, setError] = useState("");
+
+  const inputClass = "w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#2B4C7E]";
+  const labelClass = "text-[11px] font-medium text-[#6B6980] mb-1 block";
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!name.trim() || !abbr.trim()) { setError("Campus name and abbreviation are required."); return; }
+    if (odEmail.trim() && loginMode === "password" && odPassword.length < 8) { setError("Password must be at least 8 characters."); return; }
+    onCreate(
+      { name: name.trim(), abbr: abbr.trim().toUpperCase(), phase, color },
+      odEmail.trim() ? { firstName: odFirstName.trim(), lastName: odLastName.trim(), email: odEmail.trim(), phone: odPhone.trim(), password: loginMode === "password" ? odPassword : undefined } : null
+    );
+  };
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[440px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-[15px] font-semibold">New Location</h2>
+          <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
+        </div>
+        <form onSubmit={submit} className="space-y-3">
+          <div className="grid grid-cols-[1fr_90px] gap-2">
+            <div><label className={labelClass}>Campus name</label><input required value={name} onChange={(e) => setName(e.target.value)} className={inputClass} /></div>
+            <div><label className={labelClass}>Abbr.</label><input required maxLength={5} value={abbr} onChange={(e) => setAbbr(e.target.value)} className={inputClass} /></div>
+          </div>
+          <div className="grid grid-cols-[90px_1fr] gap-2">
+            <div><label className={labelClass}>Phase</label><input type="number" min={1} value={phase} onChange={(e) => setPhase(e.target.value)} className={inputClass} /></div>
+            <div>
+              <label className={labelClass}>Color</label>
+              <div className="flex gap-1.5 pt-1.5">
+                {CAMPUS_COLOR_PALETTE.map((c) => (
+                  <button type="button" key={c} onClick={() => setColor(c)} className="w-6 h-6 rounded-full shrink-0" style={{ background: c, border: color === c ? "2px solid #2A2A3A" : "2px solid transparent" }} />
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="pt-3 border-t border-[#E3E1F0]">
+            <div className="text-[11.5px] font-medium text-[#2A2A3A] mb-2">Campus Operations Director <span className="text-[#8B889C] font-normal">(optional — leave email blank to assign later)</span></div>
+            <div className="grid grid-cols-2 gap-2 mb-2">
+              <div><label className={labelClass}>First name</label><input value={odFirstName} onChange={(e) => setOdFirstName(e.target.value)} className={inputClass} /></div>
+              <div><label className={labelClass}>Last name</label><input value={odLastName} onChange={(e) => setOdLastName(e.target.value)} className={inputClass} /></div>
+            </div>
+            <div className="mb-2"><label className={labelClass}>Email</label><input type="email" value={odEmail} onChange={(e) => setOdEmail(e.target.value)} className={inputClass} /></div>
+            <div className="mb-2"><label className={labelClass}>Phone (optional)</label><input value={odPhone} onChange={(e) => setOdPhone(e.target.value)} className={inputClass} /></div>
+            <LoginSetupFields email={odEmail} loginMode={loginMode} setLoginMode={setLoginMode} password={odPassword} setPassword={setOdPassword} />
+          </div>
+
+          {error && <div className="text-[12px] rounded-md px-3 py-2" style={{ background: "#C15B5B1A", color: "#C15B5B" }}>{error}</div>}
+          <div className="flex gap-2 pt-1">
+            <button type="submit" className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Create Location</button>
+            <button type="button" onClick={onClose} className="text-[13px] text-[#6B6980] px-2">Cancel</button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }
