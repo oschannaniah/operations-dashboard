@@ -131,7 +131,7 @@ const FIELD_MAPS = {
   playbook_templates: { organizationId: "organization_id", createdBy: "created_by", createdAt: "created_at" },
   playbook_template_items: { templateId: "template_id" },
   playbook_runs: { organizationId: "organization_id", campusId: "campus_id", templateId: "template_id", templateName: "template_name", targetStaffId: "target_staff_id", targetProjectId: "target_project_id", startedBy: "started_by", startedAt: "started_at" },
-  playbook_run_items: { runId: "run_id", doneBy: "done_by", doneAt: "done_at" },
+  playbook_run_items: { runId: "run_id", doneBy: "done_by", doneAt: "done_at", assignedTo: "assigned_to" },
 };
 
 function toSnakeRow(table, obj) {
@@ -1803,12 +1803,12 @@ export default function OpsDashboard() {
 
   // Central-curated checklist library. od/staff can read (to apply a template) but RLS blocks
   // them from ever reaching create/delete, so no client-side tier gate is needed here either.
-  const createPlaybookTemplate = async (name, type, itemTexts) => {
+  const createPlaybookTemplate = async (name, type, itemsList) => {
     setSyncing(true);
     try {
       const template = await apiCreate("PlaybookTemplates", { organizationId: OSC_ORG_ID, name, type, createdBy: currentViewerName });
       setPlaybookTemplates((prev) => [...prev, template]);
-      const createdItems = await Promise.all(itemTexts.map((text, idx) => apiCreate("PlaybookTemplateItems", { templateId: template.id, position: idx, text })));
+      const createdItems = await Promise.all(itemsList.map((it, idx) => apiCreate("PlaybookTemplateItems", { templateId: template.id, position: idx, text: it.text })));
       setPlaybookTemplateItems((prev) => [...prev, ...createdItems]);
       setBackendStatus("connected"); setBackendError("");
     } catch (err) {
@@ -1859,6 +1859,61 @@ export default function OpsDashboard() {
     setPlaybookRuns((prev) => prev.filter((r) => r.id !== runId));
     setPlaybookRunItems((prev) => prev.filter((i) => i.runId !== runId));
     syncToBackend(apiDelete("PlaybookRuns", runId));
+  };
+
+  // Renames a template and reconciles its item list against the edited set — items with an id
+  // already exist and get updated in place (position/text), items without one are new and get
+  // created, anything dropped from the list gets deleted. Editing a template never touches runs
+  // already started from it — those hold their own snapshot copy (see 0022_playbooks.sql).
+  const updatePlaybookTemplate = async (templateId, name, itemsList) => {
+    setSyncing(true);
+    try {
+      await apiUpdate("PlaybookTemplates", templateId, { name });
+      setPlaybookTemplates((prev) => prev.map((t) => t.id === templateId ? { ...t, name } : t));
+
+      const existingItems = playbookTemplateItems.filter((i) => i.templateId === templateId);
+      const keepIds = new Set(itemsList.filter((i) => i.id).map((i) => i.id));
+      const removed = existingItems.filter((i) => !keepIds.has(i.id));
+      await Promise.all(removed.map((i) => apiDelete("PlaybookTemplateItems", i.id)));
+
+      const settled = await Promise.all(itemsList.map((it, idx) =>
+        it.id
+          ? apiUpdate("PlaybookTemplateItems", it.id, { position: idx, text: it.text }).then(() => ({ id: it.id, templateId, position: idx, text: it.text }))
+          : apiCreate("PlaybookTemplateItems", { templateId, position: idx, text: it.text })
+      ));
+      setPlaybookTemplateItems((prev) => [...prev.filter((i) => i.templateId !== templateId), ...settled]);
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  // A location-specific step added directly to an already-started run — never written back to
+  // the shared template, so it only ever affects this one run.
+  const addPlaybookRunItem = async (runId, text, assignedTo) => {
+    setSyncing(true);
+    try {
+      const position = playbookRunItems.filter((i) => i.runId === runId).length;
+      const item = await apiCreate("PlaybookRunItems", { runId, position, text, assignedTo: assignedTo || null });
+      setPlaybookRunItems((prev) => [...prev, item]);
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const removePlaybookRunItem = (itemId) => {
+    setPlaybookRunItems((prev) => prev.filter((i) => i.id !== itemId));
+    syncToBackend(apiDelete("PlaybookRunItems", itemId));
+  };
+
+  const setPlaybookRunItemAssignee = (itemId, assignedTo) => {
+    setPlaybookRunItems((prev) => prev.map((i) => i.id === itemId ? { ...i, assignedTo: assignedTo || null } : i));
+    syncToBackend(apiUpdate("PlaybookRunItems", itemId, { assignedTo: assignedTo || null }));
   };
 
   // Persists a campus's Slides org-chart link to the CampusConfig sheet (id = campusId, so
@@ -2291,8 +2346,9 @@ export default function OpsDashboard() {
               tier={auth.user.tier}
               templates={playbookTemplates} templateItems={playbookTemplateItems}
               runs={playbookRuns} runItems={playbookRunItems}
-              onCreateTemplate={createPlaybookTemplate} onDeleteTemplate={deletePlaybookTemplate}
+              onCreateTemplate={createPlaybookTemplate} onUpdateTemplate={updatePlaybookTemplate} onDeleteTemplate={deletePlaybookTemplate}
               onStartRun={startPlaybookRun} onToggleRunItem={togglePlaybookRunItem} onDeleteRun={deletePlaybookRun}
+              onAddRunItem={addPlaybookRunItem} onRemoveRunItem={removePlaybookRunItem} onSetRunItemAssignee={setPlaybookRunItemAssignee}
             />
           )}
 
@@ -5101,16 +5157,26 @@ function LocationScorecardsPanel({ campuses, projects, staffByCampus, marginScor
 const PLAYBOOK_TYPE_LABEL = { onboarding: "Onboarding", project: "Project", standing: "Standing / Recurring" };
 const PLAYBOOK_TYPE_COLOR = { onboarding: "#2B4C7E", project: "#B8862F", standing: "#5E9E8A" };
 
-function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, campusLabel, tier, templates, templateItems, runs, runItems, onCreateTemplate, onDeleteTemplate, onStartRun, onToggleRunItem, onDeleteRun }) {
+function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, campusLabel, tier, templates, templateItems, runs, runItems, onCreateTemplate, onUpdateTemplate, onDeleteTemplate, onStartRun, onToggleRunItem, onDeleteRun, onAddRunItem, onRemoveRunItem, onSetRunItemAssignee }) {
   const [showNewTemplate, setShowNewTemplate] = useState(false);
+  const [editingTemplateId, setEditingTemplateId] = useState(null);
   const [showStartRun, setShowStartRun] = useState(false);
   const [expandedRunId, setExpandedRunId] = useState(null);
+  const [editingAssigneeItemId, setEditingAssigneeItemId] = useState(null);
+  const [newStepText, setNewStepText] = useState("");
+  const [addingStep, setAddingStep] = useState(false);
   const isCentral = tier === "central";
 
   const scopedRuns = activeCampusId ? runs.filter((r) => r.campusId === activeCampusId) : runs;
   const sortedRuns = [...scopedRuns].sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
   const itemsForRun = (runId) => runItems.filter((i) => i.runId === runId).sort((a, b) => a.position - b.position);
   const campusName = (id) => campuses.find((c) => c.id === id)?.name || (id === "central" ? "Central" : id);
+  const editingTemplate = templates.find((t) => t.id === editingTemplateId);
+
+  const expandRun = (runId) => {
+    setExpandedRunId(expandedRunId === runId ? null : runId);
+    setAddingStep(false); setNewStepText(""); setEditingAssigneeItemId(null);
+  };
 
   return (
     <div>
@@ -5144,7 +5210,10 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
                   <div className="flex items-start justify-between gap-2 mb-1.5">
                     <span className="text-[12.5px] font-medium">{t.name}</span>
                     {isCentral && (
-                      <button onClick={() => onDeleteTemplate(t.id)} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><Trash2 size={13} /></button>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button onClick={() => setEditingTemplateId(t.id)} className="text-[10.5px] text-[#6B6980] hover:text-[#B8862F]">Edit</button>
+                        <button onClick={() => onDeleteTemplate(t.id)} className="text-[#8B889C] hover:text-[#C15B5B]"><Trash2 size={13} /></button>
+                      </div>
                     )}
                   </div>
                   <span className="text-[10px] px-2 py-0.5 rounded-full" style={{ background: `${PLAYBOOK_TYPE_COLOR[t.type]}22`, color: PLAYBOOK_TYPE_COLOR[t.type] }}>{PLAYBOOK_TYPE_LABEL[t.type] || t.type}</span>
@@ -5165,14 +5234,15 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
           const pct = total ? Math.round((done / total) * 100) : 0;
           const complete = total > 0 && done === total;
           const isExpanded = expandedRunId === run.id;
+          const runCampusStaff = staffByCampus[run.campusId] || [];
           const targetLabel = run.type === "onboarding"
-            ? (staffByCampus[run.campusId] || []).find((s) => s.id === run.targetStaffId)?.name || "Unknown person"
+            ? runCampusStaff.find((s) => s.id === run.targetStaffId)?.name || "Unknown person"
             : run.type === "project"
               ? projects.find((p) => p.id === run.targetProjectId)?.title || "Unknown project"
               : "Standing checklist";
           return (
             <div key={run.id} className="bg-[#FFFFFF] border rounded-lg p-3" style={{ borderColor: complete ? "#5E9E8A88" : "#E3E1F0" }}>
-              <button onClick={() => setExpandedRunId(isExpanded ? null : run.id)} className="w-full text-left">
+              <button onClick={() => expandRun(run.id)} className="w-full text-left">
                 <div className="flex items-center justify-between gap-2 mb-1">
                   <span className="text-[12.5px] font-medium truncate">{run.templateName}{complete && <span className="ml-1.5 text-[10px] font-normal" style={{ color: "#5E9E8A" }}>Complete</span>}</span>
                   <ChevronRight size={14} className="text-[#8B889C] shrink-0 transition-transform" style={{ transform: isExpanded ? "rotate(90deg)" : "none" }} />
@@ -5188,12 +5258,47 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
               {isExpanded && (
                 <div className="mt-3 pt-3 border-t border-[#E3E1F0] space-y-1.5">
                   {items.map((item) => (
-                    <label key={item.id} className="flex items-start gap-2 text-[12px] cursor-pointer">
-                      <input type="checkbox" checked={item.done} onChange={(e) => onToggleRunItem(item.id, e.target.checked)} className="mt-0.5" />
-                      <span className={item.done ? "line-through text-[#8B889C]" : ""}>{item.text}</span>
-                    </label>
+                    <div key={item.id} className="flex items-start justify-between gap-2 text-[12px]">
+                      <label className="flex items-start gap-2 cursor-pointer min-w-0">
+                        <input type="checkbox" checked={item.done} onChange={(e) => onToggleRunItem(item.id, e.target.checked)} className="mt-0.5 shrink-0" />
+                        <span className="min-w-0">
+                          <span className={item.done ? "line-through text-[#8B889C]" : ""}>{item.text}</span>
+                          <span className="block">
+                            {editingAssigneeItemId === item.id ? (
+                              <select autoFocus value={item.assignedTo || ""} onChange={(e) => { onSetRunItemAssignee(item.id, e.target.value); setEditingAssigneeItemId(null); }}
+                                onBlur={() => setEditingAssigneeItemId(null)}
+                                className="text-[10px] bg-[#F7F6FB] border border-[#D8D5EC] rounded px-1 py-0.5 outline-none mt-0.5">
+                                <option value="">Unassigned</option>
+                                {runCampusStaff.map((s) => <option key={s.id} value={s.name}>{s.name}</option>)}
+                              </select>
+                            ) : (
+                              <button onClick={() => setEditingAssigneeItemId(item.id)} className="text-[10px] text-[#8B889C] hover:text-[#2B4C7E]">
+                                {item.assignedTo ? `Responsible: ${item.assignedTo}` : "Assign responsible person…"}
+                              </button>
+                            )}
+                          </span>
+                        </span>
+                      </label>
+                      <button onClick={() => onRemoveRunItem(item.id)} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><X size={13} /></button>
+                    </div>
                   ))}
-                  <button onClick={() => onDeleteRun(run.id)} className="text-[10.5px] text-[#8B889C] hover:text-[#C15B5B] mt-2">Delete this run</button>
+
+                  {addingStep ? (
+                    <div className="flex gap-1.5 items-center pt-1">
+                      <input autoFocus value={newStepText} onChange={(e) => setNewStepText(e.target.value)} placeholder="New step for this run…"
+                        onKeyDown={(e) => { if (e.key === "Enter" && newStepText.trim()) { onAddRunItem(run.id, newStepText.trim()); setNewStepText(""); } }}
+                        className="flex-1 bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11.5px] outline-none" />
+                      <button onClick={() => { if (newStepText.trim()) { onAddRunItem(run.id, newStepText.trim()); setNewStepText(""); } }}
+                        className="text-[10.5px] rounded-md px-2 py-1 font-medium" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Add</button>
+                      <button onClick={() => { setAddingStep(false); setNewStepText(""); }} className="text-[10.5px] text-[#6B6980]">Done</button>
+                    </div>
+                  ) : (
+                    <button onClick={() => setAddingStep(true)} className="flex items-center gap-1 text-[10.5px] mt-1" style={{ color: "#2B4C7E" }}>
+                      <Plus size={11} /> Add a location-specific step
+                    </button>
+                  )}
+
+                  <button onClick={() => onDeleteRun(run.id)} className="block text-[10.5px] text-[#8B889C] hover:text-[#C15B5B] mt-2">Delete this run</button>
                 </div>
               )}
             </div>
@@ -5203,7 +5308,13 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
       </div>
 
       {showNewTemplate && (
-        <NewPlaybookTemplateModal onClose={() => setShowNewTemplate(false)} onCreate={(name, type, items) => { onCreateTemplate(name, type, items); setShowNewTemplate(false); }} />
+        <PlaybookTemplateModal onClose={() => setShowNewTemplate(false)} onSave={(name, type, items) => { onCreateTemplate(name, type, items); setShowNewTemplate(false); }} />
+      )}
+      {editingTemplate && (
+        <PlaybookTemplateModal
+          template={editingTemplate} existingItems={templateItems.filter((i) => i.templateId === editingTemplate.id).sort((a, b) => a.position - b.position)}
+          onClose={() => setEditingTemplateId(null)}
+          onSave={(name, type, items) => { onUpdateTemplate(editingTemplate.id, name, items); setEditingTemplateId(null); }} />
       )}
       {showStartRun && (
         <StartPlaybookRunModal templates={templates} campuses={campuses} staffByCampus={staffByCampus} projects={projects}
@@ -5214,21 +5325,27 @@ function PlaybooksPanel({ projects, campuses, staffByCampus, activeCampusId, cam
   );
 }
 
-function NewPlaybookTemplateModal({ onClose, onCreate }) {
+// Handles both create (no `template` prop) and edit (template + existingItems passed in).
+// Items carry their real id when editing so the save handler can diff updates/inserts/deletes
+// instead of recreating the whole list — see updatePlaybookTemplate.
+function PlaybookTemplateModal({ template, existingItems, onClose, onSave }) {
   useLockBodyScroll();
-  const [name, setName] = useState("");
-  const [type, setType] = useState("onboarding");
-  const [items, setItems] = useState([""]);
+  const isEditing = !!template;
+  const [name, setName] = useState(template?.name || "");
+  const [type, setType] = useState(template?.type || "onboarding");
+  const [items, setItems] = useState(
+    existingItems && existingItems.length > 0 ? existingItems.map((i) => ({ id: i.id, text: i.text })) : [{ text: "" }]
+  );
 
-  const updateItem = (i, val) => setItems((prev) => prev.map((it, idx) => idx === i ? val : it));
-  const addItem = () => setItems((prev) => [...prev, ""]);
+  const updateItem = (i, val) => setItems((prev) => prev.map((it, idx) => idx === i ? { ...it, text: val } : it));
+  const addItem = () => setItems((prev) => [...prev, { text: "" }]);
   const removeItem = (i) => setItems((prev) => prev.filter((_, idx) => idx !== i));
 
   const submit = (e) => {
     e.preventDefault();
-    const clean = items.map((i) => i.trim()).filter(Boolean);
+    const clean = items.map((it) => ({ id: it.id, text: it.text.trim() })).filter((it) => it.text);
     if (!name.trim() || clean.length === 0) return;
-    onCreate(name.trim(), type, clean);
+    onSave(name.trim(), type, clean);
   };
 
   const labelClass = "text-[11px] font-medium text-[#6B6980] mb-1 block";
@@ -5238,7 +5355,7 @@ function NewPlaybookTemplateModal({ onClose, onCreate }) {
     <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
       <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[480px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-[15px] font-semibold">New Playbook Template</h2>
+          <h2 className="text-[15px] font-semibold">{isEditing ? "Edit Playbook Template" : "New Playbook Template"}</h2>
           <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
         </div>
         <form onSubmit={submit} className="space-y-3">
@@ -5247,8 +5364,8 @@ function NewPlaybookTemplateModal({ onClose, onCreate }) {
             <input required value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. New Hire Onboarding" className={inputClass} />
           </div>
           <div>
-            <label className={labelClass}>Applies to</label>
-            <select value={type} onChange={(e) => setType(e.target.value)} className={inputClass}>
+            <label className={labelClass}>Applies to{isEditing ? " (locked after creation)" : ""}</label>
+            <select value={type} disabled={isEditing} onChange={(e) => setType(e.target.value)} className={`${inputClass} disabled:opacity-60`}>
               <option value="onboarding">A person (onboarding)</option>
               <option value="project">A project</option>
               <option value="standing">Standing / recurring (no specific target)</option>
@@ -5258,8 +5375,8 @@ function NewPlaybookTemplateModal({ onClose, onCreate }) {
             <label className={labelClass}>Checklist items</label>
             <div className="space-y-1.5">
               {items.map((it, i) => (
-                <div key={i} className="flex gap-1.5">
-                  <input value={it} onChange={(e) => updateItem(i, e.target.value)} placeholder={`Item ${i + 1}`}
+                <div key={it.id || i} className="flex gap-1.5">
+                  <input value={it.text} onChange={(e) => updateItem(i, e.target.value)} placeholder={`Item ${i + 1}`}
                     className="flex-1 bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[12.5px] outline-none focus:border-[#2B4C7E]" />
                   {items.length > 1 && (
                     <button type="button" onClick={() => removeItem(i)} className="text-[#8B889C] hover:text-[#C15B5B] px-1"><Trash2 size={13} /></button>
@@ -5272,7 +5389,7 @@ function NewPlaybookTemplateModal({ onClose, onCreate }) {
             </button>
           </div>
           <div className="flex gap-2 pt-1">
-            <button type="submit" className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>Create Template</button>
+            <button type="submit" className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>{isEditing ? "Save Changes" : "Create Template"}</button>
             <button type="button" onClick={onClose} className="text-[13px] text-[#6B6980] px-2">Cancel</button>
           </div>
         </form>

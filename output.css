@@ -1928,6 +1928,11 @@ video {
   color: rgb(42 42 58 / var(--tw-text-opacity, 1));
 }
 
+.hover\:text-\[\#2B4C7E\]:hover {
+  --tw-text-opacity: 1;
+  color: rgb(43 76 126 / var(--tw-text-opacity, 1));
+}
+
 .hover\:text-\[\#8A6420\]:hover {
   --tw-text-opacity: 1;
   color: rgb(138 100 32 / var(--tw-text-opacity, 1));
