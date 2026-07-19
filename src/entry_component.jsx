@@ -573,6 +573,30 @@ function budgetForecast(p) {
   return { project: p, budget: b, progressPct, projectedTotal, projectedVariancePct, earlySpend: false };
 }
 
+// Spent YTD — unlike rollupBudget (deliberately open-projects-only, a "how are we tracking
+// right now" read), this is the lifetime-this-year view: open and completed both count, bucketed
+// by Ministry Area. There's no per-transaction ledger in this schema, only a project's own
+// running total, so "this year" is a proxy — a completed project counts by its completedOn date,
+// an open one by its due date, falling back to createdAt for anything missing both.
+function ytdBudgetByLane(projectsList) {
+  const year = new Date().getFullYear();
+  const inYear = (dateStr) => !!dateStr && new Date(dateStr).getFullYear() === year;
+  const relevant = projectsList.filter((p) => inYear(p.stage === "Completed" ? p.completedOn : p.due) || inYear(p.createdAt));
+  const byLane = {};
+  MINISTRY_AREA_OPTIONS.forEach((lane) => { byLane[lane] = { spent: 0, total: 0, count: 0 }; });
+  let totalSpent = 0, totalBudget = 0;
+  relevant.forEach((p) => {
+    const b = projectBudget(p);
+    const lane = MINISTRY_AREA_OPTIONS.includes(p.section) ? p.section : MINISTRY_AREA_OPTIONS[MINISTRY_AREA_OPTIONS.length - 1];
+    byLane[lane].spent += b.spent;
+    byLane[lane].total += b.total;
+    byLane[lane].count += 1;
+    totalSpent += b.spent;
+    totalBudget += b.total;
+  });
+  return { year, totalSpent, totalBudget, byLane };
+}
+
 function budgetForecastRollup(projectsList) {
   const forecasts = projectsList.map(budgetForecast).filter(Boolean);
   const withProjection = forecasts.filter((f) => f.projectedTotal != null);
@@ -3955,16 +3979,51 @@ function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectC
   const acc = estimateAccuracy(projects);
   const forecast = budgetForecastRollup(projects);
   const forecastVariancePct = forecast.budgetedTotal > 0 ? ((forecast.projectedTotal - forecast.budgetedTotal) / forecast.budgetedTotal) * 100 : 0;
+  const ytd = ytdBudgetByLane(projects);
+  const [showYtd, setShowYtd] = useState(false);
+  const ytdLanes = MINISTRY_AREA_OPTIONS.filter((lane) => ytd.byLane[lane].count > 0).sort((a, b) => ytd.byLane[b].spent - ytd.byLane[a].spent);
   return (
     <div>
       <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(18px,3.6vw,22px)] font-semibold tracking-tight mb-1">Budget — {campusLabel}</h1>
       <p className="text-[12px] text-[#6B6980] mb-5">Tallies every project's estimate and spend, plus every task and sub-task budget underneath it.</p>
 
-      <div className="rounded-lg p-4 mb-5" style={{ background: `${color}18`, border: `1px solid ${color}55` }}>
-        <div className="text-[11px] mb-1" style={{ color }}>Total spent</div>
+      <div className="rounded-lg p-4 mb-3" style={{ background: `${color}18`, border: `1px solid ${color}55` }}>
+        <div className="text-[11px] mb-1" style={{ color }}>Total spent <span className="opacity-70">— open projects</span></div>
         <div className="text-[26px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color }}>{fmtMoney(b.spent)} <span className="text-[15px] font-normal">of {fmtMoney(b.total)}</span></div>
         <div className="h-2 rounded-full bg-[#E3E1F0] overflow-hidden mt-2"><div className="h-full rounded-full" style={{ width: `${pct}%`, background: color }} /></div>
       </div>
+
+      <button onClick={() => setShowYtd((v) => !v)} className="w-full text-left rounded-lg p-4 mb-5" style={{ background: "#2B4C7E18", border: "1px solid #2B4C7E55" }}>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-[11px] mb-1" style={{ color: "#2B4C7E" }}>Spent YTD ({ytd.year}) <span className="opacity-70">— open + completed</span></div>
+            <div className="text-[22px] font-semibold" style={{ fontFamily: "'JetBrains Mono', monospace", color: "#2B4C7E" }}>{fmtMoney(ytd.totalSpent)} <span className="text-[13px] font-normal">of {fmtMoney(ytd.totalBudget)}</span></div>
+          </div>
+          <ChevronRight size={16} className="text-[#2B4C7E] shrink-0 transition-transform" style={{ transform: showYtd ? "rotate(90deg)" : "none" }} />
+        </div>
+      </button>
+
+      {showYtd && (
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mb-5 -mt-3">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">By Ministry Area, {ytd.year}</div>
+          {ytdLanes.length === 0 && <div className="text-[11px] text-[#8B889C]">Nothing spent yet this year.</div>}
+          <div className="space-y-2">
+            {ytdLanes.map((lane) => {
+              const l = ytd.byLane[lane];
+              const laneSharePct = ytd.totalSpent ? Math.round((l.spent / ytd.totalSpent) * 100) : 0;
+              return (
+                <div key={lane}>
+                  <div className="flex items-center justify-between text-[11.5px] mb-1">
+                    <span>{lane}</span>
+                    <span className="text-[#6B6980]">{fmtMoney(l.spent)} · {l.count} project{l.count === 1 ? "" : "s"}</span>
+                  </div>
+                  <div className="h-1.5 rounded-full bg-[#E3E1F0] overflow-hidden"><div className="h-full rounded-full" style={{ width: `${laneSharePct}%`, background: "#2B4C7E" }} /></div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {(forecast.count > 0 || forecast.earlySpend.length > 0) && (
         <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mb-6">
