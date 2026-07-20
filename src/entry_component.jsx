@@ -6472,6 +6472,10 @@ function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject
             {step === "map" && (
               <div className="py-2">
                 <p className="text-[12px] text-[#6B6980] mb-4">{fileName} · {rows.length} row{rows.length === 1 ? "" : "s"}. Map each column, or leave it as "Don't import."</p>
+                <div className="flex items-center justify-between gap-3 px-3 mb-1.5">
+                  <span className="text-[10.5px] font-medium uppercase tracking-wide text-[#9B98AC] flex-1">Column in your file</span>
+                  <span className="text-[10.5px] font-medium uppercase tracking-wide text-[#9B98AC]">Maps to</span>
+                </div>
                 <div className="space-y-2 mb-4 max-h-[360px] overflow-y-auto pr-1">
                   {headers.map((h) => (
                     <div key={h} className="flex items-center justify-between gap-3 bg-[#F7F6FB] rounded-md px-3 py-2">
