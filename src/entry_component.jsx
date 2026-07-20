@@ -6227,6 +6227,10 @@ const IMPORT_TARGET_FIELDS = [
 
 function guessFieldForHeader(header) {
   const h = (header || "").toLowerCase().trim();
+  // ID-type columns (e.g. Asana's "Task ID") are never a useful target field, and must be
+  // excluded before the title check below — otherwise "Task ID" prefix-matches "task" and wins
+  // the auto-guess over the real "Name" column since it usually appears first in export order.
+  if (/\bid\b/.test(h)) return "ignore";
   if (/team|collaborat|assignees|members/.test(h)) return "team";
   if (/owner|lead|assignee$|responsible/.test(h)) return "owner";
   if (/due|deadline|end date|target date/.test(h)) return "due";
@@ -6234,7 +6238,7 @@ function guessFieldForHeader(header) {
   if (/stage|status/.test(h)) return "stage";
   if (/section|ministry|area|category|department|lane/.test(h)) return "section";
   if (/note|description|detail|comment/.test(h)) return "notes";
-  if (/^(task|title|name|project|item)/.test(h)) return "title";
+  if (/^(name|title)$/.test(h) || /^(task|project|item)\s*name$/.test(h) || h === "task") return "title";
   return "ignore";
 }
 
@@ -6297,9 +6301,30 @@ function readSpreadsheetFile(file) {
         const data = new Uint8Array(e.target.result);
         const workbook = XLSX.read(data, { type: "array", cellDates: true });
         const sheet = workbook.Sheets[workbook.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-        const headers = rows.length > 0 ? Object.keys(rows[0]) : (XLSX.utils.sheet_to_json(sheet, { header: 1 })[0] || []);
-        resolve({ headers, rows });
+        const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+        if (raw.length === 0) { resolve({ headers: [], rows: [] }); return; }
+
+        // Real exports (Asana included) often lead with a title row and a blank spacer row
+        // before the real column headers — don't assume row 1 is the header row. Scan the
+        // first several rows and treat whichever has the most non-empty cells as the header
+        // row; a title row typically has one, a spacer row has zero, the real header row has
+        // however many columns the export actually uses.
+        const scanLimit = Math.min(raw.length, 15);
+        let headerIdx = 0, bestCount = -1;
+        for (let i = 0; i < scanLimit; i++) {
+          const count = raw[i].filter((c) => String(c).trim() !== "").length;
+          if (count > bestCount) { bestCount = count; headerIdx = i; }
+        }
+
+        const headerRow = raw[headerIdx].map((h, i) => String(h).trim() || `Column ${i + 1}`);
+        const rows = raw.slice(headerIdx + 1)
+          .filter((r) => r.some((c) => String(c).trim() !== ""))
+          .map((r) => {
+            const obj = {};
+            headerRow.forEach((h, i) => { obj[h] = r[i] ?? ""; });
+            return obj;
+          });
+        resolve({ headers: headerRow, rows });
       } catch (err) {
         reject(new Error("Couldn't parse that file — is it a valid CSV or Excel export?"));
       }
