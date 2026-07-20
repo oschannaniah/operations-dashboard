@@ -68,6 +68,39 @@ const DEFAULT_CAPACITY_WEIGHTS = {
   overCapacityThreshold: 6,
 };
 
+// Engagement rhythm — mirrors engagement_rhythm_settings' column defaults
+// (0036_engagement_rhythm_settings.sql). "On track" within targetDays of the last check-in or
+// pulse a leader logged for someone, "due soon" within the grace window past that, "overdue"
+// beyond it, "never" if nothing has ever been logged at all.
+const DEFAULT_ENGAGEMENT_RHYTHM = { targetDays: 30, graceDays: 14 };
+
+function computeEngagementRhythm(person, checkinLog, marginPulses, settings) {
+  const w = settings || DEFAULT_ENGAGEMENT_RHYTHM;
+  const events = [
+    ...(checkinLog || []).filter((c) => String(c.staffId) === String(person.id)).map((c) => c.loggedAt),
+    ...(marginPulses || []).filter((p) => String(p.staffId) === String(person.id) && p.sentAt).map((p) => p.sentAt),
+  ];
+  if (events.length === 0) return { status: "never", daysSince: null, label: "Never engaged", color: "#C15B5B" };
+  const lastAt = events.sort().at(-1);
+  const daysSince = Math.round((new Date(TODAY_STR + "T00:00:00") - new Date(lastAt)) / 86400000);
+  if (daysSince <= w.targetDays) return { status: "on_track", daysSince, label: "On track", color: "#5E9E8A" };
+  if (daysSince <= w.targetDays + w.graceDays) return { status: "due_soon", daysSince, label: "Due soon", color: "#B8862F" };
+  return { status: "overdue", daysSince, label: "Overdue", color: "#C15B5B" };
+}
+
+// Leader feedback grade — a proxy, not a direct "rate your leader" question: the average of how
+// supported this person has said they feel across their own self-initiated Mobile Check-ins
+// (0031_mobile_checkins.sql). Deliberately not a Central-configurable rubric like the cadence
+// above; these thresholds are just a reasonable first read and easy to change directly in code.
+function computeLeaderFeedbackGrade(person, mobileCheckins) {
+  const supportScores = (mobileCheckins || []).filter((c) => String(c.staffId) === String(person.id)).map((c) => Number(c.support)).filter((n) => !isNaN(n));
+  if (supportScores.length === 0) return { average: null, count: 0, label: "No check-in data yet", color: "#8B889C" };
+  const average = supportScores.reduce((a, b) => a + b, 0) / supportScores.length;
+  const label = average >= 4 ? "Strong" : average >= 3 ? "Moderate" : "Needs attention";
+  const color = average >= 4 ? "#5E9E8A" : average >= 3 ? "#B8862F" : "#C15B5B";
+  return { average, count: supportScores.length, label, color };
+}
+
 // Custom taxonomy — mirrors taxonomy_settings' column defaults (0030_taxonomy_settings.sql).
 // A *display* relabeling only: ministryAreaLabels maps each stored Ministry Area value to
 // whatever text should show instead — the stored values themselves (Operations/Ministry/Next
@@ -166,12 +199,12 @@ let handleUnauthorized = () => {};
 // vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
 // the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
 // snake_case columns — so every existing call site keeps working unchanged.
-const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses", ApprovalRequests: "approval_requests", TaxonomySettings: "taxonomy_settings", MobileCheckins: "mobile_checkins", PushSubscriptions: "push_subscriptions", CapacityLoadSnapshots: "capacity_load_snapshots", StaffStyleProfile: "staff_style_profile", StaffAssignmentHistory: "staff_assignment_history" };
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses", ApprovalRequests: "approval_requests", TaxonomySettings: "taxonomy_settings", MobileCheckins: "mobile_checkins", PushSubscriptions: "push_subscriptions", CapacityLoadSnapshots: "capacity_load_snapshots", StaffStyleProfile: "staff_style_profile", StaffAssignmentHistory: "staff_assignment_history", EngagementRhythmSettings: "engagement_rhythm_settings" };
 
 // Every table's primary key is "id" except campus_config (natural key campus_id) and
 // margin_scores (natural key staff_id, one row per staff member) — neither has a separate
 // surrogate "id" column.
-const PK_MAP = { campus_config: "campus_id", margin_scores: "staff_id", capacity_weight_settings: "organization_id", taxonomy_settings: "organization_id", staff_style_profile: "staff_id" };
+const PK_MAP = { campus_config: "campus_id", margin_scores: "staff_id", capacity_weight_settings: "organization_id", taxonomy_settings: "organization_id", staff_style_profile: "staff_id", engagement_rhythm_settings: "organization_id" };
 
 const FIELD_MAPS = {
   projects: { organizationId: "organization_id", createdBy: "created_by", completedOn: "completed_on", sharedWith: "shared_with", dueTime: "due_time", seasonId: "season_id", projectType: "project_type" },
@@ -211,6 +244,7 @@ const FIELD_MAPS = {
     updatedAt: "updated_at",
   },
   staff_assignment_history: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", changedBy: "changed_by", changedAt: "changed_at" },
+  engagement_rhythm_settings: { organizationId: "organization_id", targetDays: "target_days", graceDays: "grace_days", updatedAt: "updated_at", updatedBy: "updated_by" },
 };
 
 function toSnakeRow(table, obj) {
@@ -1091,6 +1125,8 @@ export default function OpsDashboard() {
   const [marginSurveys, setMarginSurveys] = useState([]); // history for the Staff Profile trend view — see 0006_margin.sql; empty for 'staff'-tier viewers by RLS
   const [staffStyleProfiles, setStaffStyleProfiles] = useState([]); // self-reported WG/Enneagram/DISC — see 0035
   const [staffAssignmentHistory, setStaffAssignmentHistory] = useState([]);
+  const [allMarginPulses, setAllMarginPulses] = useState([]); // full history (not just pending) — feeds engagement rhythm scoring
+  const [engagementRhythmSettings, setEngagementRhythmSettings] = useState(null);
   const [mobileCheckins, setMobileCheckins] = useState([]);
   const [pushSubscriptions, setPushSubscriptions] = useState([]); // own row(s) only, per RLS
   const [capacityLoadSnapshots, setCapacityLoadSnapshots] = useState([]);
@@ -1295,8 +1331,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult, approvalRequestsResult, taxonomySettingsResult, mobileCheckinsResult, pushSubscriptionsResult, capacityLoadSnapshotsResult, marginSurveysResult, staffStyleProfilesResult, staffAssignmentHistoryResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"), apiGet("ApprovalRequests"), apiGet("TaxonomySettings"), apiGet("MobileCheckins"), apiGet("PushSubscriptions"), apiGet("CapacityLoadSnapshots"), apiGet("MarginSurveys"), apiGet("StaffStyleProfile"), apiGet("StaffAssignmentHistory"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult, approvalRequestsResult, taxonomySettingsResult, mobileCheckinsResult, pushSubscriptionsResult, capacityLoadSnapshotsResult, marginSurveysResult, staffStyleProfilesResult, staffAssignmentHistoryResult, allMarginPulsesResult, engagementRhythmSettingsResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"), apiGet("ApprovalRequests"), apiGet("TaxonomySettings"), apiGet("MobileCheckins"), apiGet("PushSubscriptions"), apiGet("CapacityLoadSnapshots"), apiGet("MarginSurveys"), apiGet("StaffStyleProfile"), apiGet("StaffAssignmentHistory"), apiGet("MarginPulses"), apiGet("EngagementRhythmSettings"),
       ]);
       if (cancelled) return;
 
@@ -1450,6 +1486,8 @@ export default function OpsDashboard() {
       if (marginSurveysResult.status === "fulfilled") setMarginSurveys(marginSurveysResult.value);
       if (staffStyleProfilesResult.status === "fulfilled") setStaffStyleProfiles(staffStyleProfilesResult.value);
       if (staffAssignmentHistoryResult.status === "fulfilled") setStaffAssignmentHistory(staffAssignmentHistoryResult.value);
+      if (allMarginPulsesResult.status === "fulfilled") setAllMarginPulses(allMarginPulsesResult.value);
+      if (engagementRhythmSettingsResult.status === "fulfilled" && engagementRhythmSettingsResult.value[0]) setEngagementRhythmSettings(engagementRhythmSettingsResult.value[0]);
 
       if (failures.length > 0) {
         setBackendStatus("offline");
@@ -2243,6 +2281,26 @@ export default function OpsDashboard() {
   };
 
   // Same one-row-per-org upsert shape as updateCapacityWeightSettings above.
+  const updateEngagementRhythmSettings = async (patch) => {
+    setSyncing(true);
+    try {
+      const fields = { ...patch, updatedBy: currentViewerName, updatedAt: new Date().toISOString() };
+      if (engagementRhythmSettings) {
+        await apiUpdate("EngagementRhythmSettings", OSC_ORG_ID, fields);
+        setEngagementRhythmSettings((prev) => ({ ...prev, ...fields }));
+      } else {
+        const created = await apiCreate("EngagementRhythmSettings", { organizationId: OSC_ORG_ID, ...fields });
+        setEngagementRhythmSettings(created);
+      }
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  // Same one-row-per-org upsert shape as updateCapacityWeightSettings above.
   const updateTaxonomySettings = async (patch) => {
     setSyncing(true);
     try {
@@ -2791,7 +2849,8 @@ export default function OpsDashboard() {
               capacityWeightSettings={capacityWeightSettings} onUpdateCapacityWeightSettings={updateCapacityWeightSettings}
               users={users} pulseWaves={pulseWaves} pulseParticipants={pulseParticipants} pulseResponses={pulseResponses}
               onCreatePulseWave={createPulseWave} onDeletePulseWave={deletePulseWave}
-              taxonomy={taxonomy} onUpdateTaxonomy={updateTaxonomySettings} />
+              taxonomy={taxonomy} onUpdateTaxonomy={updateTaxonomySettings}
+              engagementRhythmSettings={engagementRhythmSettings} onUpdateEngagementRhythmSettings={updateEngagementRhythmSettings} />
           )}
 
           {tab === "overview" && (role !== "central" || selectedCampus) && activeCampus && (
@@ -2897,7 +2956,10 @@ export default function OpsDashboard() {
           )}
 
           {tab === "reports" && (
-            <ReportsPanel projects={displayProjects} campuses={campuses} staffByCampus={staffByCampus} roster={roster} isCentral={role === "central" && !selectedCampus} onClearAllProjects={clearAllProjects} onLoadDemoData={loadDemoData} />
+            <ReportsPanel projects={displayProjects} campuses={campuses} staffByCampus={staffByCampus} roster={roster} isCentral={role === "central" && !selectedCampus} onClearAllProjects={clearAllProjects} onLoadDemoData={loadDemoData}
+              teams={teams} teamMembers={teamMembers} taxonomy={taxonomy} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings}
+              mobileCheckins={mobileCheckins} checkinLog={checkinLog} allMarginPulses={allMarginPulses} engagementRhythmSettings={engagementRhythmSettings}
+              staffStyleProfiles={staffStyleProfiles} activeCampusId={staffCampusId} />
           )}
         </main>
       </div>
@@ -6807,8 +6869,8 @@ function SeasonsPanel({ seasons, projects, campuses, onCreateSeason, onOpenProje
 // Central Management — the three org-wide tools (Central Team, Seasons, Location Scorecards)
 // that used to live as full-width buttons on All Campuses. Same accordion pattern throughout:
 // click a button, its panel expands in place below the row; only one open at a time.
-function CentralManagementPanel({ projects, campuses, staffByCampus, marginScores, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, seasons, onCreateSeason, onOpenProject, onSelectCampus, capacityWeightSettings, onUpdateCapacityWeightSettings, users, pulseWaves, pulseParticipants, pulseResponses, onCreatePulseWave, onDeletePulseWave, taxonomy, onUpdateTaxonomy }) {
-  const [open, setOpen] = useState(null); // "team" | "seasons" | "scorecards" | "weights" | "pulse" | "terminology" | null
+function CentralManagementPanel({ projects, campuses, staffByCampus, marginScores, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, seasons, onCreateSeason, onOpenProject, onSelectCampus, capacityWeightSettings, onUpdateCapacityWeightSettings, users, pulseWaves, pulseParticipants, pulseResponses, onCreatePulseWave, onDeletePulseWave, taxonomy, onUpdateTaxonomy, engagementRhythmSettings, onUpdateEngagementRhythmSettings }) {
+  const [open, setOpen] = useState(null); // "team" | "seasons" | "scorecards" | "weights" | "pulse" | "terminology" | "rhythm" | null
 
   const tools = [
     { key: "team", label: "Central Team", color: "#2B4C7E", icon: Users, desc: "Browse any project or task by campus, leave a private note, optionally assign it. Campus teams never see this." },
@@ -6817,6 +6879,7 @@ function CentralManagementPanel({ projects, campuses, staffByCampus, marginScore
     { key: "weights", label: "Capacity Weights", color: "#B8862F", icon: Settings, desc: "Tune how project type, cost, deadline, and team size combine into the capacity forecast." },
     { key: "pulse", label: "Org Pulse", color: "#C15B5B", icon: MessageSquare, desc: "A quarterly, anonymous org-wide sentiment read — separate from each person's Margin pulse." },
     { key: "terminology", label: "Terminology", color: "#2A2A3A", icon: Tag, desc: "Rename \"Campus\" and the Ministry Area labels org-wide — a display change only." },
+    { key: "rhythm", label: "Engagement Rhythm", color: "#5E9E8A", icon: Clock, desc: "Set the target check-in/pulse cadence used to grade each leader's engagement on the Team Review export." },
   ];
 
   return (
@@ -6875,6 +6938,11 @@ function CentralManagementPanel({ projects, campuses, staffByCampus, marginScore
       {open === "terminology" && (
         <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mt-3 mb-8">
           <TerminologyPanel settings={taxonomy || DEFAULT_TAXONOMY} onSave={onUpdateTaxonomy} />
+        </div>
+      )}
+      {open === "rhythm" && (
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mt-3 mb-8">
+          <EngagementRhythmPanel settings={engagementRhythmSettings || DEFAULT_ENGAGEMENT_RHYTHM} onSave={onUpdateEngagementRhythmSettings} />
         </div>
       )}
     </div>
@@ -7026,6 +7094,40 @@ function TerminologyPanel({ settings, onSave }) {
 
       <div className="flex items-center gap-3">
         <button onClick={save} className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#B8862F", color: "#F7F6FB" }}>Save Terminology</button>
+        {saved && <span className="text-[11.5px]" style={{ color: "#5E9E8A" }}>Saved</span>}
+      </div>
+    </div>
+  );
+}
+
+function EngagementRhythmPanel({ settings, onSave }) {
+  const [targetDays, setTargetDays] = useState(settings.targetDays);
+  const [graceDays, setGraceDays] = useState(settings.graceDays);
+  const [saved, setSaved] = useState(false);
+
+  const save = () => {
+    onSave({ targetDays: Number(targetDays), graceDays: Number(graceDays) });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  return (
+    <div>
+      <div className="text-[13px] font-semibold mb-1">Engagement Rhythm</div>
+      <p className="text-[11.5px] text-[#6B6980] mb-4">How often a leader should be checking in or sending a pulse to each person on their team, used to grade engagement rhythm on the Team Review export. Based on the most recent Check-in or Margin pulse logged for that person — there's no "right" cadence, only what fits how this org actually operates.</p>
+      <div className="mb-5 grid sm:grid-cols-2 gap-3">
+        <div>
+          <label className="text-[10.5px] text-[#6B6980] block mb-1">"On track" within (days)</label>
+          <input type="number" min="1" value={targetDays} onChange={(e) => setTargetDays(e.target.value)} className="w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#B8862F]" />
+        </div>
+        <div>
+          <label className="text-[10.5px] text-[#6B6980] block mb-1">Extra grace period before "overdue" (days)</label>
+          <input type="number" min="0" value={graceDays} onChange={(e) => setGraceDays(e.target.value)} className="w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#B8862F]" />
+        </div>
+      </div>
+      <p className="text-[10.5px] text-[#8B889C] mb-4">Example with the values above: on track through day {Number(targetDays) || 0}, due soon through day {(Number(targetDays) || 0) + (Number(graceDays) || 0)}, overdue after that.</p>
+      <div className="flex items-center gap-3">
+        <button onClick={save} className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#5E9E8A", color: "#F7F6FB" }}>Save Rhythm</button>
         {saved && <span className="text-[11.5px]" style={{ color: "#5E9E8A" }}>Saved</span>}
       </div>
     </div>
@@ -7335,7 +7437,8 @@ function latestActivity(p) {
   return dates.length ? dates.sort().slice(-1)[0] : p.createdAt || null;
 }
 
-function ReportsPanel({ projects, campuses, staffByCampus, roster, isCentral, onClearAllProjects, onLoadDemoData }) {
+function ReportsPanel({ projects, campuses, staffByCampus, roster, isCentral, onClearAllProjects, onLoadDemoData, teams, teamMembers, taxonomy, marginScores, capacityWeightSettings, mobileCheckins, checkinLog, allMarginPulses, engagementRhythmSettings, staffStyleProfiles, activeCampusId }) {
+  const [mode, setMode] = useState("projects"); // "projects" | "team-review"
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [selectedCampuses, setSelectedCampuses] = useState([]);
@@ -7431,8 +7534,27 @@ function ReportsPanel({ projects, campuses, staffByCampus, roster, isCentral, on
   return (
     <div>
       <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(18px,3.6vw,22px)] font-semibold tracking-tight mb-1">Reports</h1>
-      <p className="text-[12px] text-[#6B6980] mb-4">Filter across every campus, project, and task, then export the results.</p>
+      <p className="text-[12px] text-[#6B6980] mb-4">
+        {mode === "projects" ? "Filter across every campus, project, and task, then export the results." : "A per-person review — Margin, capacity, working style, and how consistently their leader is engaging with them."}
+      </p>
 
+      <div className="flex gap-1 bg-[#EFEEFA] border border-[#D8D5EC] rounded-md p-0.5 mb-4 w-fit">
+        <button onClick={() => setMode("projects")} className={`text-[11.5px] px-3 py-1.5 rounded ${mode === "projects" ? "bg-[#B8862F] text-[#F7F6FB]" : "text-[#6B6980]"}`}>Projects</button>
+        <button onClick={() => setMode("team-review")} className={`text-[11.5px] px-3 py-1.5 rounded ${mode === "team-review" ? "bg-[#B8862F] text-[#F7F6FB]" : "text-[#6B6980]"}`}>Team Review</button>
+      </div>
+
+      {mode === "team-review" && (
+        <TeamReviewExportPanel
+          staffByCampus={staffByCampus} campuses={campuses} teams={teams} teamMembers={teamMembers} taxonomy={taxonomy}
+          projects={projects} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings}
+          mobileCheckins={mobileCheckins} checkinLog={checkinLog} allMarginPulses={allMarginPulses}
+          engagementRhythmSettings={engagementRhythmSettings} staffStyleProfiles={staffStyleProfiles}
+          isCentral={isCentral} activeCampusId={activeCampusId}
+        />
+      )}
+
+      {mode === "projects" && (
+      <>
       <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mb-5">
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
           <div>
@@ -7613,6 +7735,234 @@ function ReportsPanel({ projects, campuses, staffByCampus, roster, isCentral, on
           )}
         </div>
       )}
+      </>
+      )}
+    </div>
+  );
+}
+
+// Builds one person's Team Review section — reused identically by the on-screen preview, the
+// PDF export, and the DOCX export, so all three can never drift apart on what a "review" means.
+function buildPersonReview(person, ctx) {
+  const isInvolved = (p) => p.owner === person.name || (p.team || []).includes(person.name) || (p.subtasks || []).some((s) => s.createdBy === person.name);
+  const involved = ctx.projects.filter(isInvolved);
+  const current = involved.filter((p) => p.stage !== "Completed");
+  const completed = involved.filter((p) => p.stage === "Completed");
+  const overdue = current.filter((p) => p.due && p.due < TODAY_STR);
+
+  const margin = ctx.marginScores?.[person.id];
+  const forecast = capacityForecast(person, ctx.projects, ctx.marginScores, ctx.capacityWeightSettings);
+  const engagement = computeEngagementRhythm(person, ctx.checkinLog, ctx.allMarginPulses, ctx.engagementRhythmSettings);
+  const leaderFeedback = computeLeaderFeedbackGrade(person, ctx.mobileCheckins);
+  const style = ctx.staffStyleProfiles?.find((p) => String(p.staffId) === String(person.id));
+
+  return {
+    person,
+    campusName: ctx.campusName(person.campusId),
+    roles: (person.roles || []).join(", ") || "No role set",
+    email: person.email || "", phone: person.phone || "",
+    commPreferences: person.commPreferences || [],
+    marginLabel: margin ? (MARGIN_STATUS_LABEL[margin.status] || margin.status) : "Not assessed",
+    capacityLabel: forecast ? forecast.label : "Normal",
+    engagement, leaderFeedback,
+    workingGenius: style?.workingGeniusGeniuses?.length ? style.workingGeniusGeniuses.join(", ") : "Not taken",
+    enneagram: style?.enneagramType ? `Type ${style.enneagramType}${style.enneagramWing ? `w${style.enneagramWing}` : ""}` : "Not taken",
+    disc: style?.discPrimary ? `${style.discPrimary}${style.discSecondary ? `/${style.discSecondary}` : ""} — ${DISC_LABELS[style.discPrimary] || ""}` : "Not taken",
+    currentCount: current.length, completedCount: completed.length, overdueCount: overdue.length,
+  };
+}
+
+// Central can slice the whole org by campus, team, or ministry lane, or pull one person
+// specifically; an OD is automatically scoped to their own campus (they never see the
+// campus/lane pickers, since there's nothing else for them to pick).
+function TeamReviewExportPanel({ staffByCampus, campuses, teams, teamMembers, taxonomy, projects, marginScores, capacityWeightSettings, mobileCheckins, checkinLog, allMarginPulses, engagementRhythmSettings, staffStyleProfiles, isCentral, activeCampusId }) {
+  const [reviewMode, setReviewMode] = useState("team"); // "team" | "individual"
+  const [scopeCampusIds, setScopeCampusIds] = useState([]);
+  const [scopeTeamId, setScopeTeamId] = useState("");
+  const [scopeLane, setScopeLane] = useState("");
+  const [individualId, setIndividualId] = useState("");
+
+  const allStaff = useMemo(() => Object.values(staffByCampus).flat(), [staffByCampus]);
+  const campusName = (id) => id === "central" ? "Central" : (campuses.find((c) => c.id === id)?.name || id);
+  const toggleScopeCampus = (id) => setScopeCampusIds((prev) => prev.includes(id) ? prev.filter((c) => c !== id) : [...prev, id]);
+
+  const scopedCampusIds = isCentral ? (scopeCampusIds.length ? scopeCampusIds : null) : [activeCampusId];
+  const teamStaffIds = scopeTeamId ? new Set((teamMembers || []).filter((tm) => tm.teamId === scopeTeamId).map((tm) => String(tm.staffId))) : null;
+
+  const teamRoster = useMemo(() => {
+    return allStaff.filter((s) => {
+      if (scopedCampusIds && !scopedCampusIds.includes(s.campusId)) return false;
+      if (teamStaffIds && !teamStaffIds.has(String(s.id))) return false;
+      if (scopeLane && s.lane !== scopeLane) return false;
+      return true;
+    }).sort((a, b) => a.name.localeCompare(b.name));
+  }, [allStaff, scopedCampusIds, teamStaffIds, scopeLane]);
+
+  const individualPerson = individualId ? allStaff.find((s) => String(s.id) === Number(individualId) || String(s.id) === individualId) : null;
+  const reviewSubjects = reviewMode === "individual" ? (individualPerson ? [individualPerson] : []) : teamRoster;
+
+  const buildCtx = { projects, marginScores, capacityWeightSettings, mobileCheckins, checkinLog, allMarginPulses, engagementRhythmSettings, staffStyleProfiles, campusName };
+  const reviews = useMemo(() => reviewSubjects.map((p) => buildPersonReview(p, buildCtx)), [reviewSubjects, projects, marginScores, capacityWeightSettings, mobileCheckins, checkinLog, allMarginPulses, engagementRhythmSettings, staffStyleProfiles]);
+
+  const campusTeams = isCentral ? (teams || []) : (teams || []).filter((t) => t.campusId === activeCampusId);
+
+  const reviewRow = (r) => ([
+    ["Contact", [r.email, r.phone].filter(Boolean).join("  ") || "—"],
+    ["Preferred contact", r.commPreferences.length ? r.commPreferences.map((m, idx) => `${idx + 1}. ${m}`).join("  ") : "—"],
+    ["Margin", r.marginLabel],
+    ["Capacity", r.capacityLabel],
+    ["Engagement rhythm", `${r.engagement.label}${r.engagement.daysSince != null ? ` (${r.engagement.daysSince}d since last check-in/pulse)` : ""}`],
+    ["Leader feedback", r.leaderFeedback.average != null ? `${r.leaderFeedback.label} — avg ${r.leaderFeedback.average.toFixed(1)}/5 (${r.leaderFeedback.count} check-in${r.leaderFeedback.count === 1 ? "" : "s"})` : r.leaderFeedback.label],
+    ["Working Genius", r.workingGenius],
+    ["Enneagram", r.enneagram],
+    ["DISC", r.disc],
+    ["Contribution", `${r.currentCount} current · ${r.completedCount} completed · ${r.overdueCount} overdue`],
+  ]);
+
+  const exportPdf = () => {
+    const docPdf = new jsPDF();
+    docPdf.setFontSize(16);
+    docPdf.text("OpsCore Team Review", 14, 16);
+    docPdf.setFontSize(10);
+    docPdf.text(`Generated ${TODAY_STR} · ${reviews.length} team member${reviews.length === 1 ? "" : "s"}`, 14, 22);
+    let y = 30;
+    reviews.forEach((r) => {
+      if (y > 250) { docPdf.addPage(); y = 20; }
+      docPdf.setFontSize(13);
+      docPdf.setTextColor(43, 76, 126);
+      docPdf.text(r.person.name, 14, y); y += 6;
+      docPdf.setFontSize(9);
+      docPdf.setTextColor(100);
+      docPdf.text(`${r.roles} · ${r.campusName}`, 14, y); y += 4;
+      docPdf.setTextColor(20);
+      autoTable(docPdf, {
+        startY: y, body: reviewRow(r), theme: "plain",
+        styles: { fontSize: 9, cellPadding: 1 },
+        columnStyles: { 0: { fontStyle: "bold", cellWidth: 50 } },
+        margin: { left: 14 },
+      });
+      y = docPdf.lastAutoTable.finalY + 10;
+    });
+    docPdf.save(`opscore-team-review-${TODAY_STR}.pdf`);
+  };
+
+  const exportDocx = async () => {
+    const children = [
+      new Paragraph({ text: "OpsCore Team Review", heading: HeadingLevel.HEADING1 }),
+      new Paragraph({ text: `Generated ${TODAY_STR} · ${reviews.length} team member${reviews.length === 1 ? "" : "s"}` }),
+      new Paragraph({ text: "" }),
+    ];
+    reviews.forEach((r) => {
+      children.push(new Paragraph({ text: r.person.name, heading: HeadingLevel.HEADING2 }));
+      children.push(new Paragraph({ text: `${r.roles} · ${r.campusName}` }));
+      children.push(new Table({
+        rows: reviewRow(r).map(([label, value]) => new TableRow({
+          children: [
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: label, bold: true })] })] }),
+            new TableCell({ children: [new Paragraph(String(value))] }),
+          ],
+        })),
+        width: { size: 100, type: WidthType.PERCENTAGE },
+      }));
+      children.push(new Paragraph({ text: "" }));
+    });
+    const doc = new Document({ sections: [{ children }] });
+    const blob = await Packer.toBlob(doc);
+    downloadBlob(blob, `opscore-team-review-${TODAY_STR}.docx`);
+  };
+
+  return (
+    <div>
+      <div className="flex gap-1 bg-[#F7F6FB] border border-[#D8D5EC] rounded-md p-0.5 mb-4 w-fit">
+        <button onClick={() => setReviewMode("team")} className={`text-[11.5px] px-3 py-1.5 rounded ${reviewMode === "team" ? "bg-[#2B4C7E] text-[#F7F6FB]" : "text-[#6B6980]"}`}>Whole team</button>
+        <button onClick={() => setReviewMode("individual")} className={`text-[11.5px] px-3 py-1.5 rounded ${reviewMode === "individual" ? "bg-[#2B4C7E] text-[#F7F6FB]" : "text-[#6B6980]"}`}>One person</button>
+      </div>
+
+      <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mb-5">
+        {reviewMode === "individual" ? (
+          <div>
+            <div className="text-[10.5px] text-[#6B6980] mb-1.5">Team member</div>
+            <select value={individualId} onChange={(e) => setIndividualId(e.target.value)} className="w-full sm:w-[320px] bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[12px] outline-none">
+              <option value="">Choose someone…</option>
+              {[...allStaff].sort((a, b) => a.name.localeCompare(b.name)).map((s) => (
+                <option key={s.id} value={s.id}>{s.name} — {campusName(s.campusId)}</option>
+              ))}
+            </select>
+          </div>
+        ) : (
+          <div className="grid sm:grid-cols-3 gap-4">
+            {isCentral && (
+              <div>
+                <div className="text-[10.5px] text-[#6B6980] mb-1.5">Campus</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {[...campuses].sort((a, b) => a.name.localeCompare(b.name)).map((c) => (
+                    <button key={c.id} onClick={() => toggleScopeCampus(c.id)}
+                      className={`text-[10.5px] px-2 py-1 rounded-full border ${scopeCampusIds.includes(c.id) ? "text-white" : "text-[#6B6980]"}`}
+                      style={scopeCampusIds.includes(c.id) ? { background: c.color, borderColor: c.color } : { borderColor: "#D8D5EC" }}>
+                      {c.abbr}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div>
+              <div className="text-[10.5px] text-[#6B6980] mb-1.5">Team</div>
+              <select value={scopeTeamId} onChange={(e) => setScopeTeamId(e.target.value)} className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[12px] outline-none">
+                <option value="">All teams</option>
+                {campusTeams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <div className="text-[10.5px] text-[#6B6980] mb-1.5">Ministry lane</div>
+              <select value={scopeLane} onChange={(e) => setScopeLane(e.target.value)} className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[12px] outline-none">
+                <option value="">All lanes</option>
+                {TEAM_LANES.map((l) => <option key={l} value={l}>{maLabel(taxonomy, l)}</option>)}
+              </select>
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center gap-2 mt-4 flex-wrap">
+          <div className="text-[11.5px] text-[#6B6980]">{reviews.length} team member{reviews.length === 1 ? "" : "s"} in this review</div>
+          <div className="ml-auto flex gap-2">
+            <button onClick={exportPdf} disabled={reviews.length === 0} className="flex items-center gap-1.5 text-[12px] rounded-md px-3 py-1.5 font-medium disabled:opacity-40" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>
+              <FileText size={13} /> Export PDF
+            </button>
+            <button onClick={exportDocx} disabled={reviews.length === 0} className="flex items-center gap-1.5 text-[12px] rounded-md px-3 py-1.5 font-medium disabled:opacity-40" style={{ background: "#B8862F", color: "#F7F6FB" }}>
+              <FileText size={13} /> Export DOCX
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-3">
+        {reviews.map((r) => (
+          <div key={r.person.id} className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4">
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <div>
+                <div className="text-[13.5px] font-medium">{r.person.name}</div>
+                <div className="text-[11px] text-[#6B6980]">{r.roles} · {r.campusName}</div>
+              </div>
+              <span className="text-[9.5px] px-2 py-0.5 rounded-full whitespace-nowrap" style={{ background: `${r.engagement.color}22`, color: r.engagement.color }}>
+                {r.engagement.label}
+              </span>
+            </div>
+            <div className="grid sm:grid-cols-2 gap-x-4 gap-y-1 text-[11.5px]">
+              <div><span className="text-[#8B889C]">Margin:</span> {r.marginLabel}</div>
+              <div><span className="text-[#8B889C]">Capacity:</span> {r.capacityLabel}</div>
+              <div><span className="text-[#8B889C]">Leader feedback:</span> <span style={{ color: r.leaderFeedback.color }}>{r.leaderFeedback.label}</span>{r.leaderFeedback.average != null && ` (${r.leaderFeedback.average.toFixed(1)}/5)`}</div>
+              <div><span className="text-[#8B889C]">Contribution:</span> {r.currentCount} current · {r.completedCount} completed{r.overdueCount > 0 && `, ${r.overdueCount} overdue`}</div>
+              <div><span className="text-[#8B889C]">Working Genius:</span> {r.workingGenius}</div>
+              <div><span className="text-[#8B889C]">Enneagram / DISC:</span> {r.enneagram} · {r.disc}</div>
+            </div>
+          </div>
+        ))}
+        {reviews.length === 0 && (
+          <div className="text-center text-[#8B889C] py-8 text-[11.5px] bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg">
+            {reviewMode === "individual" ? "Choose a team member above." : "No team members match this scope."}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
