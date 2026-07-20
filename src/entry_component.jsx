@@ -9,6 +9,7 @@ import {
 import { Document, Packer, Paragraph, Table, TableRow, TableCell, HeadingLevel, TextRun, WidthType } from "docx";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
+import * as XLSX from "xlsx";
 import { createClient } from "@supabase/supabase-js";
 
 const CENTRAL_TEAM = ["Hannaniah Owens", "Kassi Bourgeois", "Natalie Benton", "Lauren Bostic"];
@@ -1098,6 +1099,7 @@ export default function OpsDashboard() {
   const [selectedCampus, setSelectedCampus] = useState(() => readNavFromUrl().campus);
   const [openProject, setOpenProject] = useState(() => readNavFromUrl().project);
   const [showNewProject, setShowNewProject] = useState(() => readNavFromUrl().isNew);
+  const [showImportProjects, setShowImportProjects] = useState(false);
   const [detail, setDetail] = useState(() => readNavFromUrl().detail); // central callout detail modal
   const [calDate, setCalDate] = useState(() => {
     const now = new Date();
@@ -1724,6 +1726,7 @@ export default function OpsDashboard() {
     if (newProject.section === "Central") notifyCentral(newProject, `tagged "${newProject.title}" as a Central Ministry Area project`);
     const { subtasks, ...projectRow } = newProject;
     syncToBackend(apiCreate("Projects", { ...projectRow, organizationId: OSC_ORG_ID }));
+    return newProject;
   };
 
   // Marking a recurring task done never spawns or resets anything immediately — it just
@@ -2899,7 +2902,7 @@ export default function OpsDashboard() {
           {tab === "projects" && (
             <ProjectsBoard projects={scopedProjects} campusLabel={activeCampus ? activeCampus.name : `All ${taxonomy.locationPlural}`}
               onCycle={cycleStage} onOpen={setOpenProject} onSetSection={setProjectSection} onSetProjectType={setProjectType}
-              onNewProject={() => setShowNewProject(true)} taxonomy={taxonomy} />
+              onNewProject={() => setShowNewProject(true)} onImport={() => setShowImportProjects(true)} taxonomy={taxonomy} />
           )}
 
           {tab === "budget" && (
@@ -3036,6 +3039,13 @@ export default function OpsDashboard() {
         />
       )}
       {showNewProject && <NewProjectModal onClose={() => setShowNewProject(false)} onCreate={(data) => { addProject(data); setShowNewProject(false); }} campusRoster={campusRoster} fullRoster={fullRoster} campusLabel={activeCampus ? `${activeCampus.name} (${activeCampus.abbr})` : "Central"} taxonomy={taxonomy} />}
+      {showImportProjects && (
+        <ImportProjectsModal
+          onClose={() => setShowImportProjects(false)}
+          roster={campusRoster} projects={scopedProjects} taxonomy={taxonomy}
+          onAddProject={addProject} onAddSubtask={addSubtask}
+        />
+      )}
       {openStaffProfile && (
         <StaffProfileModal name={openStaffProfile} projects={displayProjects} onClose={() => setOpenStaffProfile(null)} onOpenProject={(id) => { setOpenStaffProfile(null); setOpenProject(id); }}
           staffByCampus={staffByCampus} canViewTrends={auth.user.tier === "central" || auth.user.tier === "od"}
@@ -5595,7 +5605,7 @@ function BudgetPanel({ projects, campuses, campusLabel, onOpenProject, onSelectC
   );
 }
 
-function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, onSetProjectType, onNewProject, taxonomy }) {
+function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, onSetProjectType, onNewProject, onImport, taxonomy }) {
   const [sortBy, setSortBy] = useState("due");
   const [filterStage, setFilterStage] = useState("All");
   const [filterSection, setFilterSection] = useState("All");
@@ -5623,7 +5633,10 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, o
           <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(18px,3.6vw,22px)] font-semibold tracking-tight">Projects & Tasks — {campusLabel}</h1>
           <p className="text-[12px] text-[#6B6980] mt-1">Click a card to open cost, sub-tasks, and notes. Click the stage pill to advance it.</p>
         </div>
-        <button onClick={onNewProject} className="flex items-center gap-1.5 text-[12px] bg-[#B8862F] text-[#F7F6FB] rounded-md px-3 py-1.5 font-medium"><Plus size={14} /> New Project</button>
+        <div className="flex items-center gap-2">
+          <button onClick={onImport} className="flex items-center gap-1.5 text-[12px] bg-[#EFEEFA] border border-[#D8D5EC] text-[#2A2A3A] rounded-md px-3 py-1.5 font-medium"><FileText size={14} /> Import</button>
+          <button onClick={onNewProject} className="flex items-center gap-1.5 text-[12px] bg-[#B8862F] text-[#F7F6FB] rounded-md px-3 py-1.5 font-medium"><Plus size={14} /> New Project</button>
+        </div>
       </div>
 
       <div className="flex flex-wrap items-center gap-2 mb-5 bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg px-3 py-2.5">
@@ -6193,6 +6206,352 @@ function EventsList({ campusId, campuses }) {
             <span className="text-[10.5px] px-2 py-0.5 rounded-full" style={{ background: `${typeColor[e.type]}22`, color: typeColor[e.type] }}>{e.type}</span>
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Import from CSV/XLSX (Asana export, Google Sheet tracker, etc.) ----------
+
+const IMPORT_TARGET_FIELDS = [
+  { key: "title", label: "Title", required: true },
+  { key: "section", label: "Ministry Area" },
+  { key: "stage", label: "Stage" },
+  { key: "owner", label: "Owner" },
+  { key: "team", label: "Team (comma-separated ok)" },
+  { key: "due", label: "Due Date" },
+  { key: "cost", label: "Budget / Cost" },
+  { key: "notes", label: "Notes" },
+  { key: "ignore", label: "— Don't import —" },
+];
+
+function guessFieldForHeader(header) {
+  const h = (header || "").toLowerCase().trim();
+  if (/team|collaborat|assignees|members/.test(h)) return "team";
+  if (/owner|lead|assignee$|responsible/.test(h)) return "owner";
+  if (/due|deadline|end date|target date/.test(h)) return "due";
+  if (/cost|budget|price|amount|spend/.test(h)) return "cost";
+  if (/stage|status/.test(h)) return "stage";
+  if (/section|ministry|area|category|department|lane/.test(h)) return "section";
+  if (/note|description|detail|comment/.test(h)) return "notes";
+  if (/^(task|title|name|project|item)/.test(h)) return "title";
+  return "ignore";
+}
+
+// Handles a JS Date (from SheetJS's cellDates), an Excel serial number, ISO text, US-style
+// MM/DD/YYYY, or anything Date.parse can make sense of ("Jan 5, 2026") — exports of the same
+// tracker can hand back any of these depending on the source and how the cell was formatted.
+function parseImportedDate(raw) {
+  if (raw == null || raw === "") return null;
+  if (raw instanceof Date) {
+    if (isNaN(raw)) return null;
+    return `${raw.getFullYear()}-${String(raw.getMonth() + 1).padStart(2, "0")}-${String(raw.getDate()).padStart(2, "0")}`;
+  }
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const serial = Number(s);
+    if (serial > 20000 && serial < 60000) {
+      const d = new Date(Date.UTC(1899, 11, 30) + Math.round(serial) * 86400000);
+      if (!isNaN(d)) return d.toISOString().slice(0, 10);
+    }
+  }
+  const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (mdy) {
+    let [, m, d, y] = mdy;
+    if (y.length === 2) y = (Number(y) > 50 ? "19" : "20") + y;
+    const iso = `${y.padStart(4, "0")}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+    if (!isNaN(new Date(iso + "T00:00:00"))) return iso;
+  }
+  const nd = new Date(s);
+  if (!isNaN(nd)) return `${nd.getFullYear()}-${String(nd.getMonth() + 1).padStart(2, "0")}-${String(nd.getDate()).padStart(2, "0")}`;
+  return null;
+}
+
+function guessStage(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (!s) return "Pending";
+  if (/done|complete|finished|closed/.test(s)) return "Completed";
+  if (/stall|block|stuck|on hold|paused/.test(s)) return "Stalled";
+  if (/progress|doing|active|started/.test(s)) return "In Progress";
+  return "Pending";
+}
+
+// Strips currency symbols/thousands separators ("$1,200") so imported budget columns still
+// parse — Number() alone chokes on anything but a bare digit string.
+function parseImportedCost(raw) {
+  if (raw == null || raw === "") return 0;
+  if (typeof raw === "number") return raw;
+  const cleaned = String(raw).replace(/[^0-9.\-]/g, "");
+  const n = Number(cleaned);
+  return isNaN(n) ? 0 : n;
+}
+
+function readSpreadsheetFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Couldn't read that file."));
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const workbook = XLSX.read(data, { type: "array", cellDates: true });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+        const headers = rows.length > 0 ? Object.keys(rows[0]) : (XLSX.utils.sheet_to_json(sheet, { header: 1 })[0] || []);
+        resolve({ headers, rows });
+      } catch (err) {
+        reject(new Error("Couldn't parse that file — is it a valid CSV or Excel export?"));
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+// Splits a "team"/"assignees" cell on comma or semicolon — exports vary on which they use.
+function splitPeopleCell(raw) {
+  return String(raw || "").split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+}
+
+function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject, onAddSubtask }) {
+  useLockBodyScroll();
+  const [step, setStep] = useState("upload"); // "upload" | "map" | "people" | "preview"
+  const [fileName, setFileName] = useState("");
+  const [fileError, setFileError] = useState("");
+  const [headers, setHeaders] = useState([]);
+  const [rows, setRows] = useState([]);
+  const [fieldMap, setFieldMap] = useState({});
+  const [personMap, setPersonMap] = useState({});
+  const [importMode, setImportMode] = useState("projects"); // "projects" | "tasks"
+  const [targetProjectId, setTargetProjectId] = useState("");
+  const [newTaskListTitle, setNewTaskListTitle] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [importedCount, setImportedCount] = useState(null);
+
+  const handleFile = async (file) => {
+    setFileError("");
+    setFileName(file.name);
+    try {
+      const { headers: h, rows: r } = await readSpreadsheetFile(file);
+      if (h.length === 0) { setFileError("That file doesn't seem to have any columns."); return; }
+      setHeaders(h);
+      setRows(r);
+      const guesses = {};
+      h.forEach((header) => { guesses[header] = guessFieldForHeader(header); });
+      setFieldMap(guesses);
+      setStep("map");
+    } catch (err) {
+      setFileError(err.message || "Couldn't read that file.");
+    }
+  };
+
+  const titleHeader = Object.keys(fieldMap).find((h) => fieldMap[h] === "title");
+  const ownerHeader = Object.keys(fieldMap).find((h) => fieldMap[h] === "owner");
+  const teamHeader = Object.keys(fieldMap).find((h) => fieldMap[h] === "team");
+
+  const uniquePeople = useMemo(() => {
+    const set = new Set();
+    rows.forEach((row) => {
+      if (ownerHeader && row[ownerHeader]) splitPeopleCell(row[ownerHeader]).forEach((n) => set.add(n));
+      if (teamHeader && row[teamHeader]) splitPeopleCell(row[teamHeader]).forEach((n) => set.add(n));
+    });
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [rows, ownerHeader, teamHeader]);
+
+  const resolvePerson = (name) => personMap[name] || name;
+
+  const preview = useMemo(() => {
+    return rows.map((row) => {
+      const get = (key) => { const h = Object.keys(fieldMap).find((h) => fieldMap[h] === key); return h ? row[h] : ""; };
+      const title = String(get("title") || "").trim();
+      const owner = ownerHeader ? splitPeopleCell(row[ownerHeader]).map(resolvePerson)[0] || "" : "";
+      const team = teamHeader ? splitPeopleCell(row[teamHeader]).map(resolvePerson) : [];
+      return {
+        title, section: String(get("section") || "").trim(), stageRaw: get("stage"),
+        owner, team, due: parseImportedDate(get("due")), cost: parseImportedCost(get("cost")), notes: String(get("notes") || "").trim(),
+        valid: !!title,
+      };
+    });
+  }, [rows, fieldMap, ownerHeader, teamHeader, personMap]);
+
+  const validCount = preview.filter((r) => r.valid).length;
+  const invalidCount = preview.length - validCount;
+
+  const commitImport = () => {
+    setImporting(true);
+    const validRows = preview.filter((r) => r.valid);
+    if (importMode === "projects") {
+      validRows.forEach((r) => {
+        onAddProject({
+          title: r.title,
+          section: MINISTRY_AREA_OPTIONS.includes(r.section) ? r.section : undefined,
+          stage: guessStage(r.stageRaw),
+          owner: r.owner,
+          team: r.team.join(", "),
+          collaborators: "", due: r.due, dueTime: "", cost: r.cost,
+          recurrence: { freq: "none" }, shared: false,
+        });
+      });
+    } else {
+      let projId = targetProjectId;
+      if (projId === "__new__") {
+        const created = onAddProject({
+          title: newTaskListTitle.trim() || `Imported from ${fileName}`,
+          stage: "Pending", owner: "Unassigned", team: "", collaborators: "",
+          due: null, dueTime: "", cost: 0, recurrence: { freq: "none" }, shared: false,
+        });
+        projId = created?.id;
+      }
+      if (projId) {
+        validRows.forEach((r) => {
+          const assignees = [r.owner, ...r.team].filter(Boolean);
+          onAddSubtask(projId, r.title, { freq: "none" }, r.due, r.cost, "", assignees);
+        });
+      }
+    }
+    setImportedCount(validRows.length);
+    setImporting(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[640px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-[15px] font-semibold">Import from CSV / Excel</h2>
+          <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
+        </div>
+
+        {importedCount !== null ? (
+          <div className="text-center py-8">
+            <div className="w-14 h-14 rounded-full flex items-center justify-center mb-4 mx-auto" style={{ background: "#5E9E8A22" }}>
+              <CheckCircle2 size={28} color="#5E9E8A" />
+            </div>
+            <div className="text-[14px] font-medium mb-1">Imported {importedCount} {importMode === "projects" ? "project" : "task"}{importedCount === 1 ? "" : "s"}</div>
+            <p className="text-[12px] text-[#6B6980] mb-5">{invalidCount > 0 ? `${invalidCount} row${invalidCount === 1 ? "" : "s"} skipped — no title.` : "Everything with a title came in."}</p>
+            <button onClick={onClose} className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#B8862F", color: "#F7F6FB" }}>Done</button>
+          </div>
+        ) : (
+          <>
+            {step === "upload" && (
+              <div className="py-4">
+                <p className="text-[12px] text-[#6B6980] mb-4">Export your Asana list, Google Sheet tracker, or any other CSV/Excel file and drop it in — you'll map the columns and match people to your OpsCore roster before anything is created.</p>
+                <label className="flex flex-col items-center justify-center gap-2 border-2 border-dashed border-[#D8D5EC] rounded-lg py-10 cursor-pointer hover:border-[#B8862F]">
+                  <FileText size={24} className="text-[#8B889C]" />
+                  <span className="text-[12.5px] text-[#6B6980]">Click to choose a .csv, .xlsx, or .xls file</span>
+                  <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={(e) => e.target.files[0] && handleFile(e.target.files[0])} />
+                </label>
+                {fileError && <div className="text-[11.5px] mt-3" style={{ color: "#C15B5B" }}>{fileError}</div>}
+              </div>
+            )}
+
+            {step === "map" && (
+              <div className="py-2">
+                <p className="text-[12px] text-[#6B6980] mb-4">{fileName} · {rows.length} row{rows.length === 1 ? "" : "s"}. Map each column, or leave it as "Don't import."</p>
+                <div className="space-y-2 mb-4 max-h-[360px] overflow-y-auto pr-1">
+                  {headers.map((h) => (
+                    <div key={h} className="flex items-center justify-between gap-3 bg-[#F7F6FB] rounded-md px-3 py-2">
+                      <span className="text-[12px] truncate flex-1">{h}</span>
+                      <select value={fieldMap[h] || "ignore"} onChange={(e) => setFieldMap((prev) => ({ ...prev, [h]: e.target.value }))}
+                        className="text-[11.5px] bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 outline-none">
+                        {IMPORT_TARGET_FIELDS.map((f) => <option key={f.key} value={f.key}>{f.label}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+                {!titleHeader && <div className="text-[11.5px] mb-3" style={{ color: "#C15B5B" }}>Map a column to Title before continuing — every row needs one to import.</div>}
+                <div className="flex gap-2">
+                  <button onClick={() => setStep("upload")} className="text-[12px] text-[#6B6980] px-3 py-2">Back</button>
+                  <button onClick={() => setStep(uniquePeople.length > 0 ? "people" : "preview")} disabled={!titleHeader}
+                    className="flex-1 text-[13px] font-medium rounded-md px-3 py-2.5 disabled:opacity-40" style={{ background: "#B8862F", color: "#F7F6FB" }}>
+                    Continue
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {step === "people" && (
+              <div className="py-2">
+                <p className="text-[12px] text-[#6B6980] mb-4">Match names from the file to people already in OpsCore — anything left as "Keep as typed" still imports, just as plain text rather than a linked roster member.</p>
+                <div className="space-y-2 mb-4 max-h-[360px] overflow-y-auto pr-1">
+                  {uniquePeople.map((name) => (
+                    <div key={name} className="flex items-center justify-between gap-3 bg-[#F7F6FB] rounded-md px-3 py-2">
+                      <span className="text-[12px] truncate flex-1">{name}</span>
+                      <select value={personMap[name] || ""} onChange={(e) => setPersonMap((prev) => ({ ...prev, [name]: e.target.value }))}
+                        className="text-[11.5px] bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 outline-none max-w-[220px]">
+                        <option value="">Keep as typed ("{name}")</option>
+                        {roster.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => setStep("map")} className="text-[12px] text-[#6B6980] px-3 py-2">Back</button>
+                  <button onClick={() => setStep("preview")} className="flex-1 text-[13px] font-medium rounded-md px-3 py-2.5" style={{ background: "#B8862F", color: "#F7F6FB" }}>
+                    Continue
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {step === "preview" && (
+              <div className="py-2">
+                <div className="flex gap-1 bg-[#F7F6FB] border border-[#D8D5EC] rounded-md p-0.5 mb-3 w-fit">
+                  <button onClick={() => setImportMode("projects")} className={`text-[11.5px] px-3 py-1.5 rounded ${importMode === "projects" ? "bg-[#2B4C7E] text-[#F7F6FB]" : "text-[#6B6980]"}`}>Each row is a new project</button>
+                  <button onClick={() => setImportMode("tasks")} className={`text-[11.5px] px-3 py-1.5 rounded ${importMode === "tasks" ? "bg-[#2B4C7E] text-[#F7F6FB]" : "text-[#6B6980]"}`}>Each row is a task</button>
+                </div>
+
+                {importMode === "tasks" && (
+                  <div className="mb-3">
+                    <div className="text-[10.5px] text-[#6B6980] mb-1.5">Add these tasks to</div>
+                    <select value={targetProjectId} onChange={(e) => setTargetProjectId(e.target.value)} className="w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[12px] outline-none mb-2">
+                      <option value="">Choose a project…</option>
+                      <option value="__new__">Create a new project for these tasks</option>
+                      {projects.filter((p) => p.stage !== "Completed").map((p) => <option key={p.id} value={p.id}>{p.title}</option>)}
+                    </select>
+                    {targetProjectId === "__new__" && (
+                      <input value={newTaskListTitle} onChange={(e) => setNewTaskListTitle(e.target.value)} placeholder={`New project title (default: Imported from ${fileName})`}
+                        className="w-full bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[12px] outline-none" />
+                    )}
+                  </div>
+                )}
+
+                <div className="text-[11.5px] text-[#6B6980] mb-2">{validCount} ready to import{invalidCount > 0 ? ` · ${invalidCount} skipped (no title)` : ""}</div>
+                <div className="border border-[#E3E1F0] rounded-lg overflow-x-auto max-h-[300px] overflow-y-auto mb-4">
+                  <table className="w-full text-[11px]">
+                    <thead className="sticky top-0 bg-[#FFFFFF]">
+                      <tr className="border-b border-[#E3E1F0] text-left text-[#6B6980]">
+                        <th className="px-2 py-1.5 font-medium">Title</th>
+                        <th className="px-2 py-1.5 font-medium">Owner</th>
+                        <th className="px-2 py-1.5 font-medium">Team</th>
+                        <th className="px-2 py-1.5 font-medium">Due</th>
+                        <th className="px-2 py-1.5 font-medium">Stage</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {preview.map((r, i) => (
+                        <tr key={i} className={`border-b border-[#E3E1F0] last:border-0 ${!r.valid ? "opacity-40" : ""}`}>
+                          <td className="px-2 py-1.5 max-w-[160px] truncate">{r.title || "—"}</td>
+                          <td className="px-2 py-1.5 whitespace-nowrap">{r.owner || "—"}</td>
+                          <td className="px-2 py-1.5 max-w-[120px] truncate">{r.team.join(", ") || "—"}</td>
+                          <td className="px-2 py-1.5 whitespace-nowrap">{r.due || "—"}</td>
+                          <td className="px-2 py-1.5 whitespace-nowrap">{guessStage(r.stageRaw)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="flex gap-2">
+                  <button onClick={() => setStep(uniquePeople.length > 0 ? "people" : "map")} className="text-[12px] text-[#6B6980] px-3 py-2">Back</button>
+                  <button onClick={commitImport} disabled={importing || validCount === 0 || (importMode === "tasks" && !targetProjectId)}
+                    className="flex-1 text-[13px] font-medium rounded-md px-3 py-2.5 disabled:opacity-40" style={{ background: "#5E9E8A", color: "#F7F6FB" }}>
+                    {importing ? "Importing…" : `Import ${validCount} ${importMode === "projects" ? "project" : "task"}${validCount === 1 ? "" : "s"}`}
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
