@@ -166,17 +166,17 @@ let handleUnauthorized = () => {};
 // vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
 // the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
 // snake_case columns — so every existing call site keeps working unchanged.
-const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses", ApprovalRequests: "approval_requests", TaxonomySettings: "taxonomy_settings", MobileCheckins: "mobile_checkins", PushSubscriptions: "push_subscriptions", CapacityLoadSnapshots: "capacity_load_snapshots" };
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses", ApprovalRequests: "approval_requests", TaxonomySettings: "taxonomy_settings", MobileCheckins: "mobile_checkins", PushSubscriptions: "push_subscriptions", CapacityLoadSnapshots: "capacity_load_snapshots", StaffStyleProfile: "staff_style_profile", StaffAssignmentHistory: "staff_assignment_history" };
 
 // Every table's primary key is "id" except campus_config (natural key campus_id) and
 // margin_scores (natural key staff_id, one row per staff member) — neither has a separate
 // surrogate "id" column.
-const PK_MAP = { campus_config: "campus_id", margin_scores: "staff_id", capacity_weight_settings: "organization_id", taxonomy_settings: "organization_id" };
+const PK_MAP = { campus_config: "campus_id", margin_scores: "staff_id", capacity_weight_settings: "organization_id", taxonomy_settings: "organization_id", staff_style_profile: "staff_id" };
 
 const FIELD_MAPS = {
   projects: { organizationId: "organization_id", createdBy: "created_by", completedOn: "completed_on", sharedWith: "shared_with", dueTime: "due_time", seasonId: "season_id", projectType: "project_type" },
   subtasks: { projectId: "project_id", createdBy: "created_by", dueTime: "due_time" },
-  staff: { organizationId: "organization_id", campusId: "campus_id", reportsTo: "reports_to", nextMeeting: "next_meeting", lastContact: "last_contact", calendarSynced: "calendar_synced", userId: "user_id" },
+  staff: { organizationId: "organization_id", campusId: "campus_id", reportsTo: "reports_to", nextMeeting: "next_meeting", lastContact: "last_contact", calendarSynced: "calendar_synced", userId: "user_id", commPreferences: "comm_preferences" },
   profiles: { organizationId: "organization_id", firstName: "first_name", lastName: "last_name", campusId: "campus_id", googleCalendarIds: "google_calendar_ids", googleCalendarNames: "google_calendar_names" },
   campus_config: { campusId: "campus_id", slidesLink: "slides_link" },
   notifications: { organizationId: "organization_id", forUser: "for_user_name", projectId: "project_id" },
@@ -203,6 +203,14 @@ const FIELD_MAPS = {
   mobile_checkins: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", profileId: "profile_id", createdAt: "created_at" },
   push_subscriptions: { profileId: "profile_id", authKey: "auth_key", createdAt: "created_at" },
   capacity_load_snapshots: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", loadScore: "load_score", snapshotDate: "snapshot_date", snapshottedAt: "snapshotted_at" },
+  staff_style_profile: {
+    staffId: "staff_id", organizationId: "organization_id", campusId: "campus_id",
+    workingGeniusGeniuses: "working_genius_geniuses", workingGeniusCompetencies: "working_genius_competencies", workingGeniusFrustrations: "working_genius_frustrations", workingGeniusCompletedAt: "working_genius_completed_at",
+    enneagramType: "enneagram_type", enneagramWing: "enneagram_wing", enneagramCompletedAt: "enneagram_completed_at",
+    discPrimary: "disc_primary", discSecondary: "disc_secondary", discCompletedAt: "disc_completed_at",
+    updatedAt: "updated_at",
+  },
+  staff_assignment_history: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", changedBy: "changed_by", changedAt: "changed_at" },
 };
 
 function toSnakeRow(table, obj) {
@@ -814,7 +822,7 @@ function buildHealthTimeline(staffId, flagHistory, checkinLog, limit = 6) {
   const flags = (flagHistory || []).filter((f) => String(f.staffId) === String(staffId))
     .map((f) => ({ kind: "flag", at: f.setAt, flag: f.flag, by: f.setBy }));
   const checkins = (checkinLog || []).filter((c) => String(c.staffId) === String(staffId))
-    .map((c) => ({ kind: "checkin", at: c.loggedAt, by: c.loggedBy }));
+    .map((c) => ({ kind: "checkin", at: c.loggedAt, by: c.loggedBy, note: c.note }));
   return [...flags, ...checkins].sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, limit);
 }
 
@@ -1081,6 +1089,8 @@ export default function OpsDashboard() {
   const [taxonomySettings, setTaxonomySettings] = useState(null);
   const taxonomy = taxonomySettings || DEFAULT_TAXONOMY;
   const [marginSurveys, setMarginSurveys] = useState([]); // history for the Staff Profile trend view — see 0006_margin.sql; empty for 'staff'-tier viewers by RLS
+  const [staffStyleProfiles, setStaffStyleProfiles] = useState([]); // self-reported WG/Enneagram/DISC — see 0035
+  const [staffAssignmentHistory, setStaffAssignmentHistory] = useState([]);
   const [mobileCheckins, setMobileCheckins] = useState([]);
   const [pushSubscriptions, setPushSubscriptions] = useState([]); // own row(s) only, per RLS
   const [capacityLoadSnapshots, setCapacityLoadSnapshots] = useState([]);
@@ -1184,6 +1194,11 @@ export default function OpsDashboard() {
     ? pulseWaves.find((w) => w.opensAt <= TODAY_STR && w.closesAt >= TODAY_STR && !pulseParticipants.some((p) => p.waveId === w.id && p.profileId === auth.user.id))
     : null;
 
+  // This login's own linked staff record, if any — feeds the self-service Working Style
+  // surveys (Calendar tab) and mobile check-in submission alike.
+  const myStaff = Object.values(staffByCampus).flat().find((s) => s.userId === auth?.user?.id);
+  const myStyleProfile = myStaff ? staffStyleProfiles.find((p) => String(p.staffId) === String(myStaff.id)) : null;
+
   // A logged-in campus OD/staff account is permanently scoped to its own campus — the role
   // switcher in the header is Central-only. This just keeps local `role` state in sync with
   // that identity; the backend enforces the actual scoping independently either way.
@@ -1280,8 +1295,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult, approvalRequestsResult, taxonomySettingsResult, mobileCheckinsResult, pushSubscriptionsResult, capacityLoadSnapshotsResult, marginSurveysResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"), apiGet("ApprovalRequests"), apiGet("TaxonomySettings"), apiGet("MobileCheckins"), apiGet("PushSubscriptions"), apiGet("CapacityLoadSnapshots"), apiGet("MarginSurveys"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult, approvalRequestsResult, taxonomySettingsResult, mobileCheckinsResult, pushSubscriptionsResult, capacityLoadSnapshotsResult, marginSurveysResult, staffStyleProfilesResult, staffAssignmentHistoryResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"), apiGet("ApprovalRequests"), apiGet("TaxonomySettings"), apiGet("MobileCheckins"), apiGet("PushSubscriptions"), apiGet("CapacityLoadSnapshots"), apiGet("MarginSurveys"), apiGet("StaffStyleProfile"), apiGet("StaffAssignmentHistory"),
       ]);
       if (cancelled) return;
 
@@ -1433,6 +1448,8 @@ export default function OpsDashboard() {
       if (pushSubscriptionsResult.status === "fulfilled") setPushSubscriptions(pushSubscriptionsResult.value);
       if (capacityLoadSnapshotsResult.status === "fulfilled") setCapacityLoadSnapshots(capacityLoadSnapshotsResult.value);
       if (marginSurveysResult.status === "fulfilled") setMarginSurveys(marginSurveysResult.value);
+      if (staffStyleProfilesResult.status === "fulfilled") setStaffStyleProfiles(staffStyleProfilesResult.value);
+      if (staffAssignmentHistoryResult.status === "fulfilled") setStaffAssignmentHistory(staffAssignmentHistoryResult.value);
 
       if (failures.length > 0) {
         setBackendStatus("offline");
@@ -1904,8 +1921,36 @@ export default function OpsDashboard() {
     syncToBackend(apiDelete("Staff", id));
   };
   const updateStaffRoles = (campusId, id, roles) => {
-    setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, roles: roles.slice(0, 2) } : s) }));
-    syncToBackend(apiUpdate("Staff", id, { roles: roles.slice(0, 2) }));
+    const trimmed = roles.slice(0, 2);
+    setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, roles: trimmed } : s) }));
+    syncToBackend(apiUpdate("Staff", id, { roles: trimmed }));
+    const changedAt = new Date().toISOString();
+    setStaffAssignmentHistory((prev) => [{ id: `${Date.now()}-${Math.random()}`, staffId: id, campusId, roles: trimmed, changedBy: currentViewerName, changedAt }, ...prev]);
+    syncToBackend(apiCreate("StaffAssignmentHistory", { organizationId: OSC_ORG_ID, campusId, staffId: id, roles: trimmed, changedBy: currentViewerName }));
+  };
+  const updateCommPreferences = (campusId, id, commPreferences) => {
+    setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, commPreferences } : s) }));
+    syncToBackend(apiUpdate("Staff", id, { commPreferences }));
+  };
+  // Self-reported working-style results — see 0035_staff_profile_expansion.sql. Upserts
+  // (staff_id is the table's own primary key) so retaking a survey just replaces the prior
+  // result rather than accumulating history; these are a current-state read, not a log.
+  const submitStyleProfile = async (staffId, campusId, patch) => {
+    setSyncing(true);
+    try {
+      const fields = { staffId, organizationId: OSC_ORG_ID, campusId, ...patch, updatedAt: new Date().toISOString() };
+      await apiUpsert("StaffStyleProfile", fields, "staff_id");
+      setStaffStyleProfiles((prev) => {
+        const existing = prev.find((p) => String(p.staffId) === String(staffId));
+        return existing ? prev.map((p) => String(p.staffId) === String(staffId) ? { ...p, ...fields } : p) : [...prev, fields];
+      });
+      setBackendStatus("connected"); setBackendError("");
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+      throw err;
+    } finally {
+      setSyncing(false);
+    }
   };
   const setStaffFlag = (campusId, id, flag) => {
     setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, flag } : s) }));
@@ -1916,12 +1961,13 @@ export default function OpsDashboard() {
   };
   // A pastoral prompt, not a performance record — just marks "someone actually checked in with
   // this person today," reusing the same date-string convention as due/completedOn elsewhere.
-  const logStaffCheckIn = (campusId, id) => {
+  const logStaffCheckIn = (campusId, id, note) => {
     setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, lastContact: TODAY_STR } : s) }));
     syncToBackend(apiUpdate("Staff", id, { lastContact: TODAY_STR }));
     const loggedAt = new Date().toISOString();
-    setCheckinLog((prev) => [{ id: `${Date.now()}-${Math.random()}`, staffId: id, campusId, loggedBy: currentViewerName, loggedAt }, ...prev]);
-    syncToBackend(apiCreate("StaffCheckinLog", { organizationId: OSC_ORG_ID, campusId, staffId: id, loggedBy: currentViewerName }));
+    const trimmedNote = (note || "").trim() || null;
+    setCheckinLog((prev) => [{ id: `${Date.now()}-${Math.random()}`, staffId: id, campusId, loggedBy: currentViewerName, loggedAt, note: trimmedNote }, ...prev]);
+    syncToBackend(apiCreate("StaffCheckinLog", { organizationId: OSC_ORG_ID, campusId, staffId: id, loggedBy: currentViewerName, note: trimmedNote }));
   };
   const setStaffCalendars = (campusId, id, calendars) => {
     setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, calendars, calendarSynced: calendars.length > 0 } : s) }));
@@ -2789,7 +2835,7 @@ export default function OpsDashboard() {
               users={users} onLinkUser={linkStaffUser} onCreateAndLinkUser={createAndLinkUser}
               marginScores={marginScores} canManageMargin={auth.user.tier === "central" || auth.user.tier === "od"}
               onSubmitMarginSurvey={submitMarginSurvey} onSendMarginPulse={sendMarginPulse}
-              onSetFlag={setStaffFlag} onLogCheckIn={logStaffCheckIn}
+              onSetFlag={setStaffFlag} onLogCheckIn={logStaffCheckIn} onSetCommPreferences={updateCommPreferences}
               teams={teams} teamMembers={teamMembers}
               onCreateTeam={createTeam} onDeleteTeam={deleteTeam}
               onAddTeamMember={addTeamMember} onRemoveTeamMember={removeTeamMember} onSetTeamMemberRole={setTeamMemberRole}
@@ -2798,9 +2844,12 @@ export default function OpsDashboard() {
           )}
 
           {tab === "calendar" && (
-            <CalendarPanel calDate={calDate} setCalDate={setCalDate} calView={calView} setCalView={setCalView} dayEvents={dayEvents} full
-              authUser={auth.user} onSaveGoogleCalendars={saveMyGoogleCalendars} onSetGoogleConnected={setMyGoogleConnected}
-              pushEnabled={pushSubscriptions.length > 0} onSubscribePush={subscribeToPush} onUnsubscribePush={unsubscribeFromPush} />
+            <>
+              <WorkingStylePanel myStaff={myStaff} styleProfile={myStyleProfile} onSubmitSurvey={submitStyleProfile} />
+              <CalendarPanel calDate={calDate} setCalDate={setCalDate} calView={calView} setCalView={setCalView} dayEvents={dayEvents} full
+                authUser={auth.user} onSaveGoogleCalendars={saveMyGoogleCalendars} onSetGoogleConnected={setMyGoogleConnected}
+                pushEnabled={pushSubscriptions.length > 0} onSubscribePush={subscribeToPush} onUnsubscribePush={unsubscribeFromPush} />
+            </>
           )}
 
           {tab === "notes" && (
@@ -2893,7 +2942,8 @@ export default function OpsDashboard() {
       {openStaffProfile && (
         <StaffProfileModal name={openStaffProfile} projects={displayProjects} onClose={() => setOpenStaffProfile(null)} onOpenProject={(id) => { setOpenStaffProfile(null); setOpenProject(id); }}
           staffByCampus={staffByCampus} canViewTrends={auth.user.tier === "central" || auth.user.tier === "od"}
-          marginSurveys={marginSurveys} mobileCheckins={mobileCheckins} capacityLoadSnapshots={capacityLoadSnapshots} />
+          marginSurveys={marginSurveys} mobileCheckins={mobileCheckins} capacityLoadSnapshots={capacityLoadSnapshots}
+          staffAssignmentHistory={staffAssignmentHistory} staffStyleProfiles={staffStyleProfiles} />
       )}
     </div>
   );
@@ -3402,7 +3452,7 @@ function ProgressBar({ subtasks }) {
   );
 }
 
-function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onAddTeamRole, onRemove, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile, users, onLinkUser, onCreateAndLinkUser, marginScores, canManageMargin, onSubmitMarginSurvey, onSendMarginPulse, onSetFlag, onLogCheckIn, teams, teamMembers, onCreateTeam, onDeleteTeam, onAddTeamMember, onRemoveTeamMember, onSetTeamMemberRole, flagHistory, checkinLog, projects, capacityWeightSettings }) {
+function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onAddTeamRole, onRemove, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile, users, onLinkUser, onCreateAndLinkUser, marginScores, canManageMargin, onSubmitMarginSurvey, onSendMarginPulse, onSetFlag, onLogCheckIn, onSetCommPreferences, teams, teamMembers, onCreateTeam, onDeleteTeam, onAddTeamMember, onRemoveTeamMember, onSetTeamMemberRole, flagHistory, checkinLog, projects, capacityWeightSettings }) {
   const [addingLane, setAddingLane] = useState(null); // which lane's "Add Team Role" modal is open
   const [creatingTeam, setCreatingTeam] = useState(false);
   const [newTeamName, setNewTeamName] = useState("");
@@ -3413,7 +3463,9 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
   const [editingRoleId, setEditingRoleId] = useState(null); // which team_member row's role is being edited
   const [roleDraft, setRoleDraft] = useState("");
   const [linkingId, setLinkingId] = useState(null); // which staff row's login-linker is open
-  const [editingId, setEditingId] = useState(null);
+  const [editingId, setEditingId] = useState(null); // which row's "Manage" panel is open
+  const [checkinNoteId, setCheckinNoteId] = useState(null); // which row's quick check-in composer is open
+  const [checkinNoteDraft, setCheckinNoteDraft] = useState("");
   const [calendarPickerId, setCalendarPickerId] = useState(null);
   const [assessingId, setAssessingId] = useState(null); // which staff row's Margin survey modal is open
   const [adding, setAdding] = useState(false);
@@ -3753,37 +3805,16 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                     </span>
                   ) : null;
                 })()}
-                {full && campusId && canManageMargin && (
-                  <>
-                    <button onClick={() => setAssessingId(assessingId === s.id ? null : s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#B8862F66] text-[#B8862F] hover:border-[#B8862F] whitespace-nowrap">
-                      {marginScores?.[s.id] ? "Re-assess" : "Assess"}
-                    </button>
-                    <button onClick={() => onSendMarginPulse(s.id, campusId)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#6B4FA066] text-[#6B4FA0] hover:border-[#6B4FA0] whitespace-nowrap">
-                      Send pulse
-                    </button>
-                  </>
-                )}
                 {full && campusId && (
                   <>
-                    {(() => {
-                      const linkedUser = s.userId ? users?.find((u) => String(u.id) === String(s.userId)) : null;
-                      return linkedUser ? (
-                        <span className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#5E9E8A] text-[#5E9E8A] whitespace-nowrap flex items-center gap-1">
-                          <ShieldCheck size={10} /> {linkedUser.email}
-                        </span>
-                      ) : (
-                        <button onClick={() => setLinkingId(linkingId === s.id ? null : s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#5E9E8A66] text-[#5E9E8A] hover:border-[#5E9E8A] whitespace-nowrap">
-                          Link Login
-                        </button>
-                      );
-                    })()}
-                    <button onClick={() => setCalendarPickerId(calendarPickerId === s.id ? null : s.id)}
-                      className={`text-[9.5px] px-2 py-0.5 rounded-full border whitespace-nowrap ${s.calendarSynced ? "border-[#5E9E8A] text-[#5E9E8A]" : "border-[#2B4C7E66] text-[#2B4C7E] hover:border-[#2B4C7E]"}`}>
-                      {s.calendarSynced ? `${s.calendars?.length || 0} cal${s.calendars?.length === 1 ? "" : "s"} synced` : "Sync Calendar"}
+                    <button onClick={() => { setCheckinNoteId(checkinNoteId === s.id ? null : s.id); setCheckinNoteDraft(""); }}
+                      className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#5E9E8A66] text-[#5E9E8A] hover:border-[#5E9E8A] whitespace-nowrap">
+                      Check in
                     </button>
-                    <button onClick={() => onLogCheckIn(campusId, s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#5E9E8A66] text-[#5E9E8A] hover:border-[#5E9E8A] whitespace-nowrap">Log check-in</button>
-                    <button onClick={() => setEditingId(editingId === s.id ? null : s.id)} className="text-[10.5px] text-[#6B6980] hover:text-[#B8862F] whitespace-nowrap">Edit</button>
-                    <button onClick={() => onRemove(campusId, s.id)} className="text-[#8B889C] hover:text-[#C15B5B] shrink-0"><Trash2 size={13} /></button>
+                    <button onClick={() => setEditingId(editingId === s.id ? null : s.id)}
+                      className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#D8D5EC] text-[#6B6980] hover:border-[#8B889C] whitespace-nowrap flex items-center gap-1">
+                      <MoreHorizontal size={11} /> Manage
+                    </button>
                   </>
                 )}
               </div>
@@ -3793,10 +3824,62 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
               <span>Last contact: {s.lastContact}</span>
               {s.reportsTo && <span>Reports to: {s.reportsTo}</span>}
             </div>
+            {full && checkinNoteId === s.id && (
+              <div className="mt-3 pt-3 border-t border-[#E3E1F0]">
+                <div className="text-[10.5px] text-[#6B6980] mb-1.5">Anything worth remembering from this check-in? <span className="text-[#8B889C]">(optional)</span></div>
+                <textarea value={checkinNoteDraft} onChange={(e) => setCheckinNoteDraft(e.target.value)} rows={2} placeholder="e.g. Doing well, excited about the new season…"
+                  className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2.5 py-1.5 text-[12px] outline-none focus:border-[#5E9E8A]" />
+                <div className="flex gap-2 mt-2">
+                  <button onClick={() => { onLogCheckIn(campusId, s.id, checkinNoteDraft); setCheckinNoteId(null); }}
+                    className="text-[11.5px] font-medium rounded-md px-3 py-1.5" style={{ background: "#5E9E8A", color: "#F7F6FB" }}>
+                    Save check-in
+                  </button>
+                  <button onClick={() => setCheckinNoteId(null)} className="text-[11.5px] text-[#6B6980] px-2">Cancel</button>
+                </div>
+              </div>
+            )}
             {full && editingId === s.id && (
               <div className="mt-3 pt-3 border-t border-[#E3E1F0]">
+                {campusId && (
+                  <>
+                    <div className="text-[10.5px] text-[#6B6980] mb-1.5">Actions</div>
+                    <div className="flex flex-wrap gap-1.5 mb-3">
+                      {canManageMargin && (
+                        <>
+                          <button onClick={() => setAssessingId(assessingId === s.id ? null : s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#B8862F66] text-[#B8862F] hover:border-[#B8862F] whitespace-nowrap">
+                            {marginScores?.[s.id] ? "Re-assess" : "Assess"}
+                          </button>
+                          <button onClick={() => onSendMarginPulse(s.id, campusId)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#6B4FA066] text-[#6B4FA0] hover:border-[#6B4FA0] whitespace-nowrap">
+                            Send pulse
+                          </button>
+                        </>
+                      )}
+                      {(() => {
+                        const linkedUser = s.userId ? users?.find((u) => String(u.id) === String(s.userId)) : null;
+                        return linkedUser ? (
+                          <span className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#5E9E8A] text-[#5E9E8A] whitespace-nowrap flex items-center gap-1">
+                            <ShieldCheck size={10} /> {linkedUser.email}
+                          </span>
+                        ) : (
+                          <button onClick={() => setLinkingId(linkingId === s.id ? null : s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#5E9E8A66] text-[#5E9E8A] hover:border-[#5E9E8A] whitespace-nowrap">
+                            Link Login
+                          </button>
+                        );
+                      })()}
+                      <button onClick={() => setCalendarPickerId(calendarPickerId === s.id ? null : s.id)}
+                        className={`text-[9.5px] px-2 py-0.5 rounded-full border whitespace-nowrap ${s.calendarSynced ? "border-[#5E9E8A] text-[#5E9E8A]" : "border-[#2B4C7E66] text-[#2B4C7E] hover:border-[#2B4C7E]"}`}>
+                        {s.calendarSynced ? `${s.calendars?.length || 0} cal${s.calendars?.length === 1 ? "" : "s"} synced` : "Sync Calendar"}
+                      </button>
+                      <button onClick={() => onRemove(campusId, s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#C15B5B66] text-[#C15B5B] hover:border-[#C15B5B] whitespace-nowrap flex items-center gap-1">
+                        <Trash2 size={10} /> Remove
+                      </button>
+                    </div>
+                  </>
+                )}
                 <div className="text-[10.5px] text-[#6B6980] mb-1.5">Role(s) — up to 2</div>
                 <RolePicker selected={s.roles || []} onChange={(roles) => onUpdateRoles(campusId, s.id, roles)} roleOptions={roleOptions} onAddRoleOption={onAddRoleOption} />
+                <div className="text-[10.5px] text-[#6B6980] mb-1.5 mt-3">Preferred contact methods — in order</div>
+                <CommPreferencesPicker selected={s.commPreferences} onChange={(prefs) => onSetCommPreferences(campusId, s.id, prefs)} />
                 <div className="text-[10.5px] text-[#6B6980] mb-1.5 mt-3">Team Health flag</div>
                 <div className="flex flex-wrap gap-1.5">
                   <button onClick={() => onSetFlag(campusId, s.id, null)}
@@ -3817,10 +3900,13 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                   return (
                     <div className="space-y-1">
                       {timeline.map((h, i) => (
-                        <div key={i} className="flex items-center gap-2 text-[11px]">
-                          <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: h.kind === "checkin" ? "#5E9E8A" : h.flag ? "#C15B5B" : "#8B889C" }} />
+                        <div key={i} className="flex items-start gap-2 text-[11px]">
+                          <span className="w-1.5 h-1.5 rounded-full shrink-0 mt-1" style={{ background: h.kind === "checkin" ? "#5E9E8A" : h.flag ? "#C15B5B" : "#8B889C" }} />
                           <span className="text-[#6B6980] w-[76px] shrink-0">{new Date(h.at).toLocaleDateString()}</span>
-                          <span>{h.kind === "checkin" ? `Checked in by ${h.by || "—"}` : h.flag ? `Flagged: ${h.flag}` : "Flag cleared"}</span>
+                          <span>
+                            {h.kind === "checkin" ? `Checked in by ${h.by || "—"}` : h.flag ? `Flagged: ${h.flag}` : "Flag cleared"}
+                            {h.kind === "checkin" && h.note && <span className="block text-[#6B6980] italic mt-0.5">"{h.note}"</span>}
+                          </span>
                         </div>
                       ))}
                     </div>
@@ -3969,6 +4055,34 @@ function RolePicker({ selected, onChange, roleOptions, onAddRoleOption }) {
         <button onClick={addCustom} className="text-[10.5px] text-[#B8862F] px-2">Add</button>
       </div>
       {selected.length >= 2 && <div className="text-[10px] text-[#8B889C] mt-1.5">Max 2 roles selected.</div>}
+    </div>
+  );
+}
+
+const COMM_METHOD_OPTIONS = ["Text", "Email", "Call", "Slack", "In person"];
+
+// Click to append (in the order clicked), click a selected chip to remove it — no drag-and-drop,
+// order is just "the sequence you tapped them in." Capped at 3, matching the ask ("2 or 3").
+function CommPreferencesPicker({ selected, onChange }) {
+  const list = selected || [];
+  const toggle = (method) => {
+    if (list.includes(method)) onChange(list.filter((m) => m !== method));
+    else if (list.length < 3) onChange([...list, method]);
+  };
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {COMM_METHOD_OPTIONS.map((m) => {
+        const rank = list.indexOf(m);
+        const isSelected = rank !== -1;
+        return (
+          <button key={m} onClick={() => toggle(m)}
+            disabled={!isSelected && list.length >= 3}
+            className={`text-[10.5px] px-2 py-1 rounded-full border flex items-center gap-1 ${isSelected ? "bg-[#2B4C7E] text-[#F7F6FB] border-[#2B4C7E]" : "border-[#D8D5EC] text-[#6B6980]"} ${!isSelected && list.length >= 3 ? "opacity-40" : ""}`}>
+            {isSelected && <span className="text-[9px] font-bold opacity-80">{rank + 1}</span>}
+            {m}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -4244,6 +4358,156 @@ function QuickCheckinScreen({ onSubmit, onSubscribe, alreadySubscribed, onDone }
           Not now
         </button>
       </div>
+    </div>
+  );
+}
+
+// ---------- Working-style self-assessments ----------
+//
+// These are OpsCore's own short, original surveys — NOT reproductions of any commercial
+// assessment (Working Genius is a paid, licensed product; the rigorous scored Enneagram/DISC
+// instruments people usually mean are also copyrighted products like the RHETI or Everything
+// DiSC). The category NAMES here (DISC's 4 letters, the 9 Enneagram types, the 6 Working
+// Genius stages) are long-public concepts; the specific statements and the simple sum-and-rank
+// scoring below are original, written for this app, and are an informal self-report — not a
+// validated psychometric result. Every survey says so on-screen.
+
+const DISC_LABELS = { D: "Dominance", I: "Influence", S: "Steadiness", C: "Conscientiousness" };
+const DISC_QUESTIONS = [
+  { key: "d1", dim: "D", text: "I like to take charge and drive decisions quickly." },
+  { key: "d2", dim: "D", text: "I'd rather make a fast call than wait for full consensus." },
+  { key: "i1", dim: "I", text: "I enjoy persuading and energizing a room." },
+  { key: "i2", dim: "I", text: "I build momentum by rallying people around an idea." },
+  { key: "s1", dim: "S", text: "I prefer steady, predictable routines over constant change." },
+  { key: "s2", dim: "S", text: "I'm the one who keeps a team calm and grounded under pressure." },
+  { key: "c1", dim: "C", text: "I care a lot about doing things accurately and by the book." },
+  { key: "c2", dim: "C", text: "I like having clear standards and checking the details before moving on." },
+];
+function scoreDisc(answers) {
+  const totals = { D: 0, I: 0, S: 0, C: 0 };
+  DISC_QUESTIONS.forEach((q) => { totals[q.dim] += answers[q.key] || 0; });
+  const ranked = Object.entries(totals).sort((a, b) => b[1] - a[1]);
+  return { discPrimary: ranked[0][0], discSecondary: ranked[1][0], discCompletedAt: new Date().toISOString() };
+}
+
+const ENNEAGRAM_QUESTIONS = [
+  { key: "e1", type: 1, text: "I hold myself and others to high standards and want to do things the \"right\" way." },
+  { key: "e2", type: 2, text: "I find deep meaning in taking care of other people's needs, sometimes before my own." },
+  { key: "e3", type: 3, text: "I'm driven by accomplishment and how my success is perceived by others." },
+  { key: "e4", type: 4, text: "I feel most myself when I can express something authentic and unique, not just fit in." },
+  { key: "e5", type: 5, text: "I need time alone to think and gather information before I engage." },
+  { key: "e6", type: 6, text: "I think through worst-case scenarios so I can be prepared, and I value loyalty and security." },
+  { key: "e7", type: 7, text: "I'm drawn to new ideas and experiences, and I avoid getting stuck in anything painful or boring." },
+  { key: "e8", type: 8, text: "I speak my mind directly and push back hard against being controlled by anyone." },
+  { key: "e9", type: 9, text: "I go along to keep the peace, and it's easy for me to see every side of a conflict." },
+];
+function scoreEnneagram(answers) {
+  const scores = ENNEAGRAM_QUESTIONS.map((q) => ({ type: q.type, score: answers[q.key] || 0 })).sort((a, b) => b.score - a.score);
+  const primary = scores[0].type;
+  const neighbors = [primary === 1 ? 9 : primary - 1, primary === 9 ? 1 : primary + 1];
+  const wing = scores.filter((s) => neighbors.includes(s.type)).sort((a, b) => b.score - a.score)[0]?.type || neighbors[0];
+  return { enneagramType: primary, enneagramWing: wing, enneagramCompletedAt: new Date().toISOString() };
+}
+
+const WORKING_GENIUS_QUESTIONS = [
+  { key: "w1", type: "Wonder", text: "I naturally wonder if there's a better way or a real problem worth solving before anyone else raises it." },
+  { key: "w2", type: "Invention", text: "I love generating brand new ideas or solutions almost from scratch." },
+  { key: "w3", type: "Discernment", text: "People come to me for a gut check — I'm good at evaluating whether an idea is actually sound." },
+  { key: "w4", type: "Galvanizing", text: "I energize and rally other people to get moving on something." },
+  { key: "w5", type: "Enablement", text: "I genuinely enjoy jumping in to help and support other people get their work done." },
+  { key: "w6", type: "Tenacity", text: "I push things across the finish line and don't feel right leaving something unfinished." },
+];
+function scoreWorkingGenius(answers) {
+  const scores = WORKING_GENIUS_QUESTIONS.map((q) => ({ type: q.type, score: answers[q.key] || 0 })).sort((a, b) => b.score - a.score);
+  return {
+    workingGeniusGeniuses: scores.slice(0, 2).map((s) => s.type),
+    workingGeniusCompetencies: scores.slice(2, 4).map((s) => s.type),
+    workingGeniusFrustrations: scores.slice(4, 6).map((s) => s.type),
+    workingGeniusCompletedAt: new Date().toISOString(),
+  };
+}
+
+function StyleSurveyModal({ title, questions, scoreFn, accentColor, onSubmit, onClose }) {
+  useLockBodyScroll();
+  const [answers, setAnswers] = useState({});
+  const complete = questions.every((q) => answers[q.key]);
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[480px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-[15px] font-semibold">{title}</h2>
+          <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
+        </div>
+        <p className="text-[11px] text-[#8B889C] mb-4">An informal self-report OpsCore uses to show your working style on your profile — not the official certified assessment. Rate how much each statement sounds like you.</p>
+        <div className="space-y-4">
+          {questions.map((q) => (
+            <div key={q.key}>
+              <div className="text-[12.5px] text-[#2A2A3A] mb-1.5">{q.text}</div>
+              <QuickScale value={answers[q.key]} onChange={(v) => setAnswers((prev) => ({ ...prev, [q.key]: v }))} />
+              <div className="flex items-center justify-between text-[10px] text-[#8B889C] mt-1">
+                <span>Not like me</span><span>Very much like me</span>
+              </div>
+            </div>
+          ))}
+        </div>
+        <button onClick={() => complete && onSubmit(scoreFn(answers))} disabled={!complete}
+          className="w-full text-[13px] font-medium rounded-md px-3 py-2.5 mt-5 disabled:opacity-40"
+          style={{ background: accentColor, color: "#F7F6FB" }}>
+          See my result
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function WorkingStylePanel({ myStaff, styleProfile, onSubmitSurvey }) {
+  const [open, setOpen] = useState(null); // "wg" | "enneagram" | "disc" | null
+  if (!myStaff) return null;
+
+  const rows = [
+    {
+      key: "wg", label: "Working Genius", color: "#B8862F",
+      result: styleProfile?.workingGeniusGeniuses?.length ? `Geniuses: ${styleProfile.workingGeniusGeniuses.join(", ")}` : null,
+    },
+    {
+      key: "enneagram", label: "Enneagram", color: "#6B4FA0",
+      result: styleProfile?.enneagramType ? `Type ${styleProfile.enneagramType}${styleProfile.enneagramWing ? `w${styleProfile.enneagramWing}` : ""}` : null,
+    },
+    {
+      key: "disc", label: "DISC", color: "#2B4C7E",
+      result: styleProfile?.discPrimary ? `${styleProfile.discPrimary}${styleProfile.discSecondary ? `/${styleProfile.discSecondary}` : ""} — ${DISC_LABELS[styleProfile.discPrimary] || ""}` : null,
+    },
+  ];
+
+  return (
+    <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mb-5">
+      <div className="text-[13px] font-semibold mb-1">Your working style</div>
+      <p className="text-[11.5px] text-[#6B6980] mb-3">Short, informal self-reports — not certified assessments — that show up on your profile so your OD and Central understand how you work.</p>
+      <div className="space-y-2">
+        {rows.map((r) => (
+          <div key={r.key} className="flex items-center justify-between gap-2 rounded-md px-3 py-2" style={{ background: "#F7F6FB" }}>
+            <div className="min-w-0">
+              <div className="text-[12px] font-medium">{r.label}</div>
+              <div className="text-[11px] text-[#6B6980] truncate">{r.result || "Not taken yet"}</div>
+            </div>
+            <button onClick={() => setOpen(r.key)} className="text-[11px] font-medium rounded-md px-2.5 py-1 whitespace-nowrap" style={{ background: `${r.color}18`, color: r.color }}>
+              {r.result ? "Retake" : "Take survey"}
+            </button>
+          </div>
+        ))}
+      </div>
+      {open === "wg" && (
+        <StyleSurveyModal title="Working Genius — informal self-report" questions={WORKING_GENIUS_QUESTIONS} scoreFn={scoreWorkingGenius} accentColor="#B8862F"
+          onClose={() => setOpen(null)} onSubmit={(result) => { onSubmitSurvey(myStaff.id, myStaff.campusId, result); setOpen(null); }} />
+      )}
+      {open === "enneagram" && (
+        <StyleSurveyModal title="Enneagram — informal self-report" questions={ENNEAGRAM_QUESTIONS} scoreFn={scoreEnneagram} accentColor="#6B4FA0"
+          onClose={() => setOpen(null)} onSubmit={(result) => { onSubmitSurvey(myStaff.id, myStaff.campusId, result); setOpen(null); }} />
+      )}
+      {open === "disc" && (
+        <StyleSurveyModal title="DISC — informal self-report" questions={DISC_QUESTIONS} scoreFn={scoreDisc} accentColor="#2B4C7E"
+          onClose={() => setOpen(null)} onSubmit={(result) => { onSubmitSurvey(myStaff.id, myStaff.campusId, result); setOpen(null); }} />
+      )}
     </div>
   );
 }
@@ -7605,7 +7869,7 @@ function MiniTrendBars({ points, max, color, height = 32 }) {
   );
 }
 
-function StaffProfileModal({ name, projects, onClose, onOpenProject, staffByCampus, canViewTrends, marginSurveys, mobileCheckins, capacityLoadSnapshots }) {
+function StaffProfileModal({ name, projects, onClose, onOpenProject, staffByCampus, canViewTrends, marginSurveys, mobileCheckins, capacityLoadSnapshots, staffAssignmentHistory, staffStyleProfiles }) {
   useLockBodyScroll();
   if (!name) return null;
 
@@ -7629,13 +7893,66 @@ function StaffProfileModal({ name, projects, onClose, onOpenProject, staffByCamp
   const staffCapacitySnapshots = myStaff && capacityLoadSnapshots ? capacityLoadSnapshots.filter((s) => String(s.staffId) === String(myStaff.id)).sort((a, b) => a.snapshotDate.localeCompare(b.snapshotDate)).slice(-12) : [];
   const hasAnyTrendData = staffMarginSurveys.length > 0 || staffCheckins.length > 0 || staffCapacitySnapshots.length > 0;
 
+  const assignmentHistory = myStaff && staffAssignmentHistory
+    ? staffAssignmentHistory.filter((h) => String(h.staffId) === String(myStaff.id)).sort((a, b) => b.changedAt.localeCompare(a.changedAt)).slice(0, 8)
+    : [];
+  const styleProfile = myStaff && staffStyleProfiles ? staffStyleProfiles.find((p) => String(p.staffId) === String(myStaff.id)) : null;
+  const styleRows = [
+    { label: "Working Genius", color: "#B8862F", result: styleProfile?.workingGeniusGeniuses?.length ? `Geniuses: ${styleProfile.workingGeniusGeniuses.join(", ")}` : null },
+    { label: "Enneagram", color: "#6B4FA0", result: styleProfile?.enneagramType ? `Type ${styleProfile.enneagramType}${styleProfile.enneagramWing ? `w${styleProfile.enneagramWing}` : ""}` : null },
+    { label: "DISC", color: "#2B4C7E", result: styleProfile?.discPrimary ? `${styleProfile.discPrimary}${styleProfile.discSecondary ? `/${styleProfile.discSecondary}` : ""} — ${DISC_LABELS[styleProfile.discPrimary] || ""}` : null },
+  ];
+  const hasAnyStyleResult = styleRows.some((r) => r.result);
+
   return (
     <div className="fixed inset-0 z-30 overflow-y-auto p-0 sm:p-4" style={{ background: "rgba(0,0,0,0.65)", WebkitOverflowScrolling: "touch" }} onClick={onClose}>
       <div className="border rounded-none sm:rounded-xl max-w-[560px] w-full min-h-screen sm:min-h-0 my-0 sm:my-8 mx-auto p-5" style={{ background: "#FFFFFF", borderColor: "#D8D5EC", color: "#2A2A3A", fontFamily: "'Inter', sans-serif" }} onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-start justify-between mb-4">
+        <div className="flex items-start justify-between mb-1">
           <h2 className="text-[17px] font-bold">{name}</h2>
           <button onClick={onClose} className="text-[#6B6980] hover:text-[#2A2A3A]"><X size={18} /></button>
         </div>
+        {myStaff && (
+          <div className="text-[11.5px] text-[#6B6980] mb-1">{(myStaff.roles || []).join(" · ") || "No role set"}</div>
+        )}
+        {myStaff && (myStaff.email || myStaff.phone) && (
+          <div className="flex flex-wrap gap-x-3 text-[11px] text-[#6B6980] mb-1">
+            {myStaff.email && <span>{myStaff.email}</span>}
+            {myStaff.phone && <span>{myStaff.phone}</span>}
+          </div>
+        )}
+        {myStaff && myStaff.commPreferences?.length > 0 && (
+          <div className="text-[11px] text-[#6B6980] mb-4">Prefers: {myStaff.commPreferences.map((m, i) => `${i + 1}. ${m}`).join("  ")}</div>
+        )}
+        {!(myStaff && (myStaff.email || myStaff.phone || myStaff.commPreferences?.length > 0)) && <div className="mb-4" />}
+
+        {canViewTrends && myStaff && hasAnyStyleResult && (
+          <div className="rounded-md p-3 mb-4" style={{ background: "#F7F6FB", border: "1px solid #E3E1F0" }}>
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">Working style</div>
+            <div className="space-y-1">
+              {styleRows.filter((r) => r.result).map((r) => (
+                <div key={r.label} className="flex items-center gap-2 text-[11.5px]">
+                  <span className="w-2 h-2 rounded-full shrink-0" style={{ background: r.color }} />
+                  <span className="text-[#8B889C] w-[100px] shrink-0">{r.label}</span>
+                  <span>{r.result}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {canViewTrends && assignmentHistory.length > 0 && (
+          <div className="rounded-md p-3 mb-4" style={{ background: "#F7F6FB", border: "1px solid #E3E1F0" }}>
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">Role & campus history</div>
+            <div className="space-y-1">
+              {assignmentHistory.map((h, i) => (
+                <div key={i} className="flex items-center gap-2 text-[11px]">
+                  <span className="text-[#6B6980] w-[76px] shrink-0">{new Date(h.changedAt).toLocaleDateString()}</span>
+                  <span>{(h.roles || []).join(" · ") || "No role set"}{h.changedBy ? ` — set by ${h.changedBy}` : ""}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {canViewTrends && myStaff && hasAnyTrendData && (
           <div className="rounded-md p-3 mb-4 space-y-3" style={{ background: "#F7F6FB", border: "1px solid #E3E1F0" }}>
@@ -7676,7 +7993,7 @@ function StaffProfileModal({ name, projects, onClose, onOpenProject, staffByCamp
         )}
 
         <div className="mb-4">
-          <div className="text-[11px] text-[#6B6980] mb-2 font-medium">Current projects ({current.length})</div>
+          <div className="text-[11px] text-[#6B6980] mb-2 font-medium">Contribution history — current ({current.length})</div>
           <div className="space-y-1.5">
             {current.map((p) => (
               <button key={p.id} onClick={() => onOpenProject(p.id)} className="w-full text-left text-[12px] bg-[#EFEEFA] rounded-md px-2.5 py-2 flex items-center justify-between gap-2 hover:border-[#B8862F]" style={{ border: "1px solid #E3E1F0" }}>
