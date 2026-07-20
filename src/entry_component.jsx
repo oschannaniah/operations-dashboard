@@ -209,7 +209,7 @@ const PK_MAP = { campus_config: "campus_id", margin_scores: "staff_id", capacity
 const FIELD_MAPS = {
   projects: { organizationId: "organization_id", createdBy: "created_by", completedOn: "completed_on", sharedWith: "shared_with", dueTime: "due_time", seasonId: "season_id", projectType: "project_type" },
   subtasks: { projectId: "project_id", createdBy: "created_by", dueTime: "due_time" },
-  staff: { organizationId: "organization_id", campusId: "campus_id", reportsTo: "reports_to", nextMeeting: "next_meeting", lastContact: "last_contact", calendarSynced: "calendar_synced", userId: "user_id", commPreferences: "comm_preferences" },
+  staff: { organizationId: "organization_id", campusId: "campus_id", reportsTo: "reports_to", nextMeeting: "next_meeting", lastContact: "last_contact", calendarSynced: "calendar_synced", userId: "user_id", commPreferences: "comm_preferences", archivedAt: "archived_at", archivedBy: "archived_by" },
   profiles: { organizationId: "organization_id", firstName: "first_name", lastName: "last_name", campusId: "campus_id", googleCalendarIds: "google_calendar_ids", googleCalendarNames: "google_calendar_names" },
   campus_config: { campusId: "campus_id", slidesLink: "slides_link" },
   notifications: { organizationId: "organization_id", forUser: "for_user_name", projectId: "project_id" },
@@ -1262,7 +1262,7 @@ export default function OpsDashboard() {
   const fullRoster = useMemo(() => {
     const central = CENTRAL_TEAM.map((name) => ({ name, roles: ["Central Team"] }));
     const leads = campuses.map((c) => ({ name: c.lead, roles: ["Campus Operations Director"] }));
-    const allStaff = Object.values(staffByCampus).flat().map((s) => ({ name: s.name, roles: s.roles || [] }));
+    const allStaff = Object.values(staffByCampus).flat().filter((s) => !s.archived).map((s) => ({ name: s.name, roles: s.roles || [] }));
     const combined = [...central, ...leads, ...allStaff];
     const seen = new Set();
     return combined.filter((p) => (seen.has(p.name) ? false : (seen.add(p.name), true)));
@@ -1425,6 +1425,7 @@ export default function OpsDashboard() {
               roles: Array.isArray(s.roles) ? s.roles : [],
               calendars: Array.isArray(s.calendars) ? s.calendars : [],
               calendarSynced: s.calendarSynced === true || s.calendarSynced === "true",
+              archived: s.archived === true || s.archived === "true",
             });
           });
           setStaffByCampus(byCampus);
@@ -1954,9 +1955,41 @@ export default function OpsDashboard() {
       createLoginForNewStaff(campusId, newPerson.id, newPerson.name, data.role, { email: data.email, phone: data.phone, password: data.loginMode === "password" ? data.password : undefined });
     }
   };
-  const removeStaff = (campusId, id) => {
-    setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).filter((s) => s.id !== id) }));
-    syncToBackend(apiDelete("Staff", id));
+  // Soft delete, never a real DELETE — a hard delete would cascade through every history
+  // table tied to this person (flags, check-ins, assignment history, Margin, working style).
+  // Archiving keeps all of it intact and just hides them from the active roster (see 0037).
+  const archiveStaff = (campusId, id) => {
+    const archivedAt = new Date().toISOString();
+    setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, archived: true, archivedAt, archivedBy: currentViewerName } : s) }));
+    syncToBackend(apiUpdate("Staff", id, { archived: true, archivedAt, archivedBy: currentViewerName }));
+  };
+  const restoreStaff = (campusId, id) => {
+    setStaffByCampus((prev) => ({ ...prev, [campusId]: (prev[campusId] || []).map((s) => s.id === id ? { ...s, archived: false, archivedAt: null, archivedBy: null } : s) }));
+    syncToBackend(apiUpdate("Staff", id, { archived: false, archivedAt: null, archivedBy: null }));
+  };
+
+  // Reassignment sweep run before archiving — moves this person off any project they own or
+  // are on the team of, and off any subtask they're the createdBy for. Projects/tasks
+  // themselves are untouched, only the name reference changes.
+  const reassignProjectOwner = (projId, newOwner) => {
+    setProjects((ps) => ps.map((p) => p.id === projId ? { ...p, owner: newOwner } : p));
+    syncToBackend(apiUpdate("Projects", projId, { owner: newOwner }));
+  };
+  const reassignProjectTeamMember = (projId, oldName, newName) => {
+    setProjects((ps) => ps.map((p) => {
+      if (p.id !== projId) return p;
+      const team = (p.team || []).filter((t) => t !== oldName);
+      if (newName) team.push(newName);
+      return { ...p, team };
+    }));
+    const updated = projects.find((p) => p.id === projId);
+    const team = (updated?.team || []).filter((t) => t !== oldName);
+    if (newName) team.push(newName);
+    syncToBackend(apiUpdate("Projects", projId, { team }));
+  };
+  const reassignSubtaskCreatedBy = (projId, subtaskId, newCreatedBy) => {
+    setProjects((ps) => ps.map((p) => p.id !== projId ? p : { ...p, subtasks: (p.subtasks || []).map((s) => s.id === subtaskId ? { ...s, createdBy: newCreatedBy } : s) }));
+    syncToBackend(apiUpdate("Subtasks", subtaskId, { createdBy: newCreatedBy }));
   };
   const updateStaffRoles = (campusId, id, roles) => {
     const trimmed = roles.slice(0, 2);
@@ -2882,7 +2915,9 @@ export default function OpsDashboard() {
             <StaffPanel
               staff={staffForPanel} campusLabel={activeCampus ? activeCampus.name : (staffCampusId === "central" ? "Central Operations Team" : `Select a ${taxonomy.locationSingular.toLowerCase()}`)} full
               campusId={staffCampusId} roleOptions={roleOptions}
-              onAdd={addStaff} onAddTeamRole={addTeamRole} onRemove={removeStaff} onUpdateRoles={updateStaffRoles}
+              onAdd={addStaff} onAddTeamRole={addTeamRole} onArchive={archiveStaff} onRestore={restoreStaff} onUpdateRoles={updateStaffRoles}
+              onReassignProjectOwner={reassignProjectOwner} onReassignProjectTeamMember={reassignProjectTeamMember} onReassignSubtask={reassignSubtaskCreatedBy}
+              marginSurveys={marginSurveys}
               onSetCalendars={setStaffCalendars} onAddRoleOption={addRoleOption}
               slidesLink={campusSlidesLinks[staffCampusId] || ""}
               onSetSlidesLink={(url) => setCampusSlidesLink(staffCampusId, url)}
@@ -3167,7 +3202,7 @@ function CentralTeamWindow({ projects, campuses, centralThreads, onAddTag, onRem
 
 function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, staffByCampus, onSelectCampus, onOpenProject, detail, setDetail, onGoTab, marginScores, capacityWeightSettings, taxonomy }) {
   const sharedProjects = projects.filter((p) => p.shared);
-  const allStaff = Object.values(staffByCampus).flat();
+  const allStaff = Object.values(staffByCampus).flat().filter((s) => !s.archived);
 
   const campusRows = campuses.map((c) => {
     const campusProjects = projects.filter((p) => p.stage !== "Completed" && (p.campus === c.id || (p.shared && (p.sharedWith?.includes(c.id) || p.sharedWith?.includes("all")))));
@@ -3405,7 +3440,7 @@ function CampusDashboard({ campus, projects, staff, notes, activity, dayEvents, 
         </div>
       </div>
 
-      <TeamAttentionBanner staff={staff} onGoTab={onGoTab} accentColor={campus.color} projects={projects} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings} />
+      <TeamAttentionBanner staff={staff.filter((s) => !s.archived)} onGoTab={onGoTab} accentColor={campus.color} projects={projects} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings} />
 
       <div className="grid lg:grid-cols-2 gap-4">
         <Window title="Staff & Team" icon={Users} onExpand={() => onGoTab("staff")} accentColor={campus.color}>
@@ -3514,7 +3549,11 @@ function ProgressBar({ subtasks }) {
   );
 }
 
-function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onAddTeamRole, onRemove, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile, users, onLinkUser, onCreateAndLinkUser, marginScores, canManageMargin, onSubmitMarginSurvey, onSendMarginPulse, onSetFlag, onLogCheckIn, onSetCommPreferences, teams, teamMembers, onCreateTeam, onDeleteTeam, onAddTeamMember, onRemoveTeamMember, onSetTeamMemberRole, flagHistory, checkinLog, projects, capacityWeightSettings }) {
+function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, onAdd, onAddTeamRole, onArchive, onRestore, onUpdateRoles, onSetCalendars, onAddRoleOption, slidesLink, onSetSlidesLink, campusPhase, onCommitOrgChart, pendingReassignments, onResolveReassignment, onOpenProfile, users, onLinkUser, onCreateAndLinkUser, marginScores, canManageMargin, onSubmitMarginSurvey, onSendMarginPulse, onSetFlag, onLogCheckIn, onSetCommPreferences, teams, teamMembers, onCreateTeam, onDeleteTeam, onAddTeamMember, onRemoveTeamMember, onSetTeamMemberRole, flagHistory, checkinLog, projects, capacityWeightSettings, onReassignProjectOwner, onReassignProjectTeamMember, onReassignSubtask, marginSurveys }) {
+  const [showArchived, setShowArchived] = useState(false);
+  const [archivingId, setArchivingId] = useState(null); // which row's ArchiveStaffModal is open
+  const visibleStaff = showArchived ? staff : staff.filter((s) => !s.archived);
+  const archivedCount = staff.filter((s) => s.archived).length;
   const [addingLane, setAddingLane] = useState(null); // which lane's "Add Team Role" modal is open
   const [creatingTeam, setCreatingTeam] = useState(false);
   const [newTeamName, setNewTeamName] = useState("");
@@ -3841,15 +3880,22 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
         </div>
       )}
 
+      {full && campusId && archivedCount > 0 && (
+        <label className="flex items-center gap-2 text-[11.5px] text-[#6B6980] mb-2 cursor-pointer w-fit">
+          <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} className="accent-[#8B889C]" />
+          Show archived ({archivedCount})
+        </label>
+      )}
       <div className="space-y-2">
-        {staff.map((s) => (
-          <div key={s.id} className={`bg-[#EFEEFA] border border-[#E3E1F0] rounded-md ${compact ? "px-3 py-2" : "px-4 py-3"}`}>
+        {visibleStaff.map((s) => (
+          <div key={s.id} className={`bg-[#EFEEFA] border border-[#E3E1F0] rounded-md ${compact ? "px-3 py-2" : "px-4 py-3"} ${s.archived ? "opacity-60" : ""}`}>
             <div className="flex items-center justify-between flex-wrap gap-y-1.5">
               <div className="flex-1 min-w-0 pr-2">
                 <button onClick={() => onOpenProfile && onOpenProfile(s.name)} className="text-[13px] truncate text-left hover:underline hover:text-[#B8862F] block">{s.name}</button>
                 <div className="text-[11px] text-[#6B6980] truncate">{(s.roles || []).join(" · ") || "No role set"}</div>
               </div>
               <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                {s.archived && <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#8B889C22] text-[#8B889C] whitespace-nowrap">Archived {s.archivedAt ? new Date(s.archivedAt).toLocaleDateString() : ""}</span>}
                 {s.flag && <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#C15B5B22] text-[#C15B5B] flex items-center gap-1 whitespace-nowrap"><AlertTriangle size={10} />{s.flag}</span>}
                 {full && campusId && needsCheckIn(s.lastContact) && (
                   <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#B8862F22] text-[#B8862F] whitespace-nowrap">Needs check-in</span>
@@ -3867,7 +3913,7 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                     </span>
                   ) : null;
                 })()}
-                {full && campusId && (
+                {full && campusId && !s.archived && (
                   <>
                     <button onClick={() => { setCheckinNoteId(checkinNoteId === s.id ? null : s.id); setCheckinNoteDraft(""); }}
                       className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#5E9E8A66] text-[#5E9E8A] hover:border-[#5E9E8A] whitespace-nowrap">
@@ -3878,6 +3924,12 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                       <MoreHorizontal size={11} /> Manage
                     </button>
                   </>
+                )}
+                {full && campusId && s.archived && (
+                  <button onClick={() => onRestore(campusId, s.id)}
+                    className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#5E9E8A66] text-[#5E9E8A] hover:border-[#5E9E8A] whitespace-nowrap">
+                    Restore
+                  </button>
                 )}
               </div>
             </div>
@@ -3932,8 +3984,8 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                         className={`text-[9.5px] px-2 py-0.5 rounded-full border whitespace-nowrap ${s.calendarSynced ? "border-[#5E9E8A] text-[#5E9E8A]" : "border-[#2B4C7E66] text-[#2B4C7E] hover:border-[#2B4C7E]"}`}>
                         {s.calendarSynced ? `${s.calendars?.length || 0} cal${s.calendars?.length === 1 ? "" : "s"} synced` : "Sync Calendar"}
                       </button>
-                      <button onClick={() => onRemove(campusId, s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#C15B5B66] text-[#C15B5B] hover:border-[#C15B5B] whitespace-nowrap flex items-center gap-1">
-                        <Trash2 size={10} /> Remove
+                      <button onClick={() => setArchivingId(s.id)} className="text-[9.5px] px-2 py-0.5 rounded-full border border-[#C15B5B66] text-[#C15B5B] hover:border-[#C15B5B] whitespace-nowrap flex items-center gap-1">
+                        <Trash2 size={10} /> Archive
                       </button>
                     </div>
                   </>
@@ -3994,9 +4046,19 @@ function StaffPanel({ staff, campusLabel, compact, full, campusId, roleOptions, 
                 onSubmit={(answers) => { onSubmitMarginSurvey(s.id, campusId, answers); setAssessingId(null); }}
                 onClose={() => setAssessingId(null)} />
             )}
+            {archivingId === s.id && (
+              <ArchiveStaffModal
+                staffPerson={s} roster={staff.filter((other) => other.id !== s.id && !other.archived)}
+                projects={projects} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings}
+                checkinLog={checkinLog} marginSurveys={marginSurveys}
+                onReassignProjectOwner={onReassignProjectOwner} onReassignProjectTeamMember={onReassignProjectTeamMember} onReassignSubtask={onReassignSubtask}
+                onArchive={() => { onArchive(campusId, s.id); setArchivingId(null); }}
+                onClose={() => setArchivingId(null)}
+              />
+            )}
           </div>
         ))}
-        {staff.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No team members in view.</div>}
+        {visibleStaff.length === 0 && <div className="text-[11.5px] text-[#8B889C] py-6 text-center">No team members in view.</div>}
       </div>
     </div>
   );
@@ -4570,6 +4632,183 @@ function WorkingStylePanel({ myStaff, styleProfile, onSubmitSurvey }) {
         <StyleSurveyModal title="DISC — informal self-report" questions={DISC_QUESTIONS} scoreFn={scoreDisc} accentColor="#2B4C7E"
           onClose={() => setOpen(null)} onSubmit={(result) => { onSubmitSurvey(myStaff.id, myStaff.campusId, result); setOpen(null); }} />
       )}
+    </div>
+  );
+}
+
+// Archiving is the only way to "remove" someone now — see archiveStaff/0037_staff_archive.sql.
+// This is the gate in front of it: a chance to move anything still outstanding off their name
+// first, then a deliberate type-to-confirm step (typing the word itself, not just clicking a
+// button a second time) before their profile is hidden from the active roster. An exit report
+// exports automatically at the moment of archiving — the one time this data is this easy to
+// pull together in one place.
+function ArchiveStaffModal({ staffPerson, roster, projects, marginScores, capacityWeightSettings, checkinLog, marginSurveys, onReassignProjectOwner, onReassignProjectTeamMember, onReassignSubtask, onArchive, onClose }) {
+  useLockBodyScroll();
+  const [step, setStep] = useState("reassign"); // "reassign" | "confirm"
+  const [confirmText, setConfirmText] = useState("");
+  const [ownerChoices, setOwnerChoices] = useState({});
+  const [teamChoices, setTeamChoices] = useState({});
+  const [subtaskChoices, setSubtaskChoices] = useState({});
+
+  const isOwner = (p) => p.owner === staffPerson.name;
+  const isTeamMember = (p) => (p.team || []).includes(staffPerson.name);
+  const ownedProjects = projects.filter((p) => p.stage !== "Completed" && isOwner(p));
+  const teamProjects = projects.filter((p) => p.stage !== "Completed" && !isOwner(p) && isTeamMember(p));
+  const outstandingSubtasks = [];
+  projects.forEach((p) => {
+    if (p.stage === "Completed") return;
+    (p.subtasks || []).forEach((s) => {
+      if (!s.done && s.createdBy === staffPerson.name) outstandingSubtasks.push({ ...s, projectId: p.id, projectTitle: p.title });
+    });
+  });
+  const hasOutstanding = ownedProjects.length > 0 || teamProjects.length > 0 || outstandingSubtasks.length > 0;
+
+  const applyReassignments = () => {
+    const log = [];
+    ownedProjects.forEach((p) => {
+      if (ownerChoices[p.id]) { onReassignProjectOwner(p.id, ownerChoices[p.id]); log.push([`Project (owner)`, p.title, ownerChoices[p.id]]); }
+    });
+    teamProjects.forEach((p) => {
+      if (teamChoices[p.id]) { onReassignProjectTeamMember(p.id, staffPerson.name, teamChoices[p.id]); log.push([`Project (team)`, p.title, teamChoices[p.id]]); }
+      else if (teamChoices[p.id] === "") { onReassignProjectTeamMember(p.id, staffPerson.name, null); log.push([`Project (team)`, p.title, "Removed, no replacement"]); }
+    });
+    outstandingSubtasks.forEach((s) => {
+      if (subtaskChoices[s.id]) { onReassignSubtask(s.projectId, s.id, subtaskChoices[s.id]); log.push([`Task`, `${s.t} (${s.projectTitle})`, subtaskChoices[s.id]]); }
+    });
+    return log;
+  };
+
+  const exportExitReport = (reassignLog) => {
+    const margin = marginScores?.[staffPerson.id];
+    const forecast = capacityForecast(staffPerson, projects, marginScores, capacityWeightSettings);
+    const loadScore = computeCapacityLoad(staffPerson, projects, capacityWeightSettings || DEFAULT_CAPACITY_WEIGHTS);
+    const lastCheckin = (checkinLog || []).filter((c) => String(c.staffId) === String(staffPerson.id)).sort((a, b) => b.loggedAt.localeCompare(a.loggedAt))[0];
+    const lastAssessment = (marginSurveys || []).filter((s) => String(s.staffId) === String(staffPerson.id)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+
+    const docPdf = new jsPDF();
+    docPdf.setFontSize(16);
+    docPdf.text(`Exit Report — ${staffPerson.name}`, 14, 16);
+    docPdf.setFontSize(10);
+    docPdf.text(`Archived ${TODAY_STR}`, 14, 22);
+    autoTable(docPdf, {
+      startY: 28,
+      body: [
+        ["Role(s)", (staffPerson.roles || []).join(", ") || "No role set"],
+        ["Margin", margin ? `${MARGIN_STATUS_LABEL[margin.status] || margin.status} (score ${margin.score})` : "Not assessed"],
+        ["Capacity / weight", `Load score ${loadScore.toFixed(1)}${forecast ? ` — ${forecast.label}` : ""}`],
+        ["Last check-in", lastCheckin ? `${new Date(lastCheckin.loggedAt).toLocaleDateString()}${lastCheckin.note ? ` — "${lastCheckin.note}"` : ""}` : "Never logged"],
+        ["Last Margin assessment", lastAssessment ? new Date(lastAssessment.createdAt).toLocaleDateString() : "Never assessed"],
+      ],
+      theme: "plain", styles: { fontSize: 10, cellPadding: 2 }, columnStyles: { 0: { fontStyle: "bold", cellWidth: 55 } }, margin: { left: 14 },
+    });
+    let y = docPdf.lastAutoTable.finalY + 10;
+    docPdf.setFontSize(11);
+    docPdf.text("Reassigned before archiving", 14, y);
+    y += 4;
+    if (reassignLog.length === 0) {
+      docPdf.setFontSize(9);
+      docPdf.text("Nothing outstanding was assigned to them.", 14, y + 5);
+    } else {
+      autoTable(docPdf, {
+        startY: y + 2,
+        head: [["Type", "Item", "Reassigned to"]],
+        body: reassignLog,
+        styles: { fontSize: 9 }, headStyles: { fillColor: [43, 76, 126] }, margin: { left: 14 },
+      });
+    }
+    docPdf.save(`opscore-exit-report-${staffPerson.name.replace(/\s+/g, "-").toLowerCase()}-${TODAY_STR}.pdf`);
+  };
+
+  const confirmArchive = () => {
+    const reassignLog = applyReassignments();
+    exportExitReport(reassignLog);
+    onArchive();
+  };
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-0 sm:p-4" style={{ background: "rgba(42,42,58,0.45)" }}>
+      <div className="bg-[#FFFFFF] rounded-none sm:rounded-xl p-6 w-full max-w-[520px] h-full sm:h-auto max-h-full sm:max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-[15px] font-semibold">Archive {staffPerson.name}</h2>
+          <button onClick={onClose} className="text-[#8B889C] hover:text-[#2A2A3A]"><X size={16} /></button>
+        </div>
+
+        {step === "reassign" && (
+          <>
+            <p className="text-[11.5px] text-[#6B6980] mb-4">Their check-in, flag, Margin, and working-style history is kept — archiving only hides them from the active roster. Optionally reassign anything of theirs still outstanding first.</p>
+            {!hasOutstanding && <div className="text-[12px] text-[#8B889C] mb-4">Nothing outstanding is assigned to them.</div>}
+            {ownedProjects.length > 0 && (
+              <div className="mb-4">
+                <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">Projects they own</div>
+                <div className="space-y-2">
+                  {ownedProjects.map((p) => (
+                    <div key={p.id} className="flex items-center justify-between gap-2 bg-[#F7F6FB] rounded-md px-3 py-2">
+                      <span className="text-[12px] truncate">{p.title}</span>
+                      <select value={ownerChoices[p.id] || ""} onChange={(e) => setOwnerChoices((prev) => ({ ...prev, [p.id]: e.target.value }))} className="text-[11px] bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 outline-none">
+                        <option value="">Reassign owner to…</option>
+                        {roster.map((r) => <option key={r.id} value={r.name}>{r.name}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {teamProjects.length > 0 && (
+              <div className="mb-4">
+                <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">Projects they're on the team of</div>
+                <div className="space-y-2">
+                  {teamProjects.map((p) => (
+                    <div key={p.id} className="flex items-center justify-between gap-2 bg-[#F7F6FB] rounded-md px-3 py-2">
+                      <span className="text-[12px] truncate">{p.title}</span>
+                      <select value={teamChoices[p.id] ?? ""} onChange={(e) => setTeamChoices((prev) => ({ ...prev, [p.id]: e.target.value }))} className="text-[11px] bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 outline-none">
+                        <option value="">Just remove them</option>
+                        {roster.map((r) => <option key={r.id} value={r.name}>Replace with {r.name}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {outstandingSubtasks.length > 0 && (
+              <div className="mb-4">
+                <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[#8B889C] mb-2">Outstanding tasks</div>
+                <div className="space-y-2">
+                  {outstandingSubtasks.map((s) => (
+                    <div key={s.id} className="flex items-center justify-between gap-2 bg-[#F7F6FB] rounded-md px-3 py-2">
+                      <span className="text-[12px] truncate">{s.t} <span className="text-[#8B889C]">· {s.projectTitle}</span></span>
+                      <select value={subtaskChoices[s.id] || ""} onChange={(e) => setSubtaskChoices((prev) => ({ ...prev, [s.id]: e.target.value }))} className="text-[11px] bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 outline-none">
+                        <option value="">Leave as-is</option>
+                        {roster.map((r) => <option key={r.id} value={r.name}>Reassign to {r.name}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            <button onClick={() => setStep("confirm")} className="w-full text-[13px] font-medium rounded-md px-3 py-2.5 mt-2" style={{ background: "#C15B5B", color: "#F7F6FB" }}>
+              Continue to archive
+            </button>
+          </>
+        )}
+
+        {step === "confirm" && (
+          <>
+            <p className="text-[11.5px] text-[#6B6980] mb-3">This archives {staffPerson.name} and downloads a final exit report (Margin, capacity, last check-in, last assessment, and anything just reassigned). Their history stays in the system — nothing is deleted.</p>
+            <div className="rounded-md p-3 mb-4" style={{ background: "#C15B5B0F", border: "1px solid #C15B5B55" }}>
+              <label className="text-[11.5px] font-medium block mb-1.5" style={{ color: "#8A3A2E" }}>Type ARCHIVE to confirm</label>
+              <input value={confirmText} onChange={(e) => setConfirmText(e.target.value)} placeholder="ARCHIVE" autoFocus
+                className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#C15B5B]" />
+            </div>
+            <div className="flex gap-2">
+              <button onClick={() => setStep("reassign")} className="text-[12px] text-[#6B6980] px-3 py-2">Back</button>
+              <button onClick={confirmArchive} disabled={confirmText.trim().toUpperCase() !== "ARCHIVE"}
+                className="flex-1 text-[13px] font-medium rounded-md px-3 py-2.5 disabled:opacity-40" style={{ background: "#C15B5B", color: "#F7F6FB" }}>
+                Archive {staffPerson.name}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }

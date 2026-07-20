@@ -1415,6 +1415,10 @@ video {
   background-color: rgb(43 76 126 / var(--tw-bg-opacity, 1));
 }
 
+.bg-\[\#8B889C22\] {
+  background-color: #8B889C22;
+}
+
 .bg-\[\#8B889C\] {
   --tw-bg-opacity: 1;
   background-color: rgb(139 136 156 / var(--tw-bg-opacity, 1));
@@ -1934,12 +1938,20 @@ video {
   text-decoration-style: dotted;
 }
 
+.accent-\[\#8B889C\] {
+  accent-color: #8B889C;
+}
+
 .accent-\[\#B8862F\] {
   accent-color: #B8862F;
 }
 
 .opacity-40 {
   opacity: 0.4;
+}
+
+.opacity-60 {
+  opacity: 0.6;
 }
 
 .opacity-70 {
