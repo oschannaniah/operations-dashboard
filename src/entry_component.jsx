@@ -84,6 +84,18 @@ function maLabel(taxonomy, value) {
   return taxonomy?.ministryAreaLabels?.[value] || value;
 }
 
+// Web Push — this is the public half of a VAPID key pair (safe to ship in client code by
+// design; the private half lives only as a Supabase Edge Function secret, never sent to the
+// browser). Identifies this app to a push service so it can be trusted to send notifications.
+const VAPID_PUBLIC_KEY = "BGuaFEjPQ3HkYJZokW8K50qJL1ZhtcIQeukJdOknt_qda2EnCcAlxDTDKpHpYffc7Bn7r5948ZN_CYfFqyHkEeg";
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = atob(base64);
+  return Uint8Array.from([...rawData].map((c) => c.charCodeAt(0)));
+}
+
 // Approval workflows — deliberately single-step (submit, one approver decides, done), no
 // multi-level chains. Who the approver actually is gets resolved at submit time, not stored as
 // a fixed field: an od/staff request goes to that campus's other admin-tier person(s) if one
@@ -154,7 +166,7 @@ let handleUnauthorized = () => {};
 // vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
 // the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
 // snake_case columns — so every existing call site keeps working unchanged.
-const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses", ApprovalRequests: "approval_requests", TaxonomySettings: "taxonomy_settings" };
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses", ApprovalRequests: "approval_requests", TaxonomySettings: "taxonomy_settings", MobileCheckins: "mobile_checkins", PushSubscriptions: "push_subscriptions", CapacityLoadSnapshots: "capacity_load_snapshots" };
 
 // Every table's primary key is "id" except campus_config (natural key campus_id) and
 // margin_scores (natural key staff_id, one row per staff member) — neither has a separate
@@ -188,6 +200,9 @@ const FIELD_MAPS = {
   pulse_responses: { waveId: "wave_id", campusId: "campus_id", submittedAt: "submitted_at" },
   approval_requests: { organizationId: "organization_id", campusId: "campus_id", startsOn: "starts_on", endsOn: "ends_on", requestedBy: "requested_by", requestedByProfileId: "requested_by_profile_id", decidedBy: "decided_by", decidedAt: "decided_at", decisionNote: "decision_note", createdAt: "created_at" },
   taxonomy_settings: { organizationId: "organization_id", locationSingular: "location_singular", locationPlural: "location_plural", ministryAreaFieldLabel: "ministry_area_field_label", ministryAreaLabels: "ministry_area_labels", updatedAt: "updated_at", updatedBy: "updated_by" },
+  mobile_checkins: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", profileId: "profile_id", createdAt: "created_at" },
+  push_subscriptions: { profileId: "profile_id", authKey: "auth_key", createdAt: "created_at" },
+  capacity_load_snapshots: { organizationId: "organization_id", campusId: "campus_id", staffId: "staff_id", loadScore: "load_score", snapshotDate: "snapshot_date", snapshottedAt: "snapshotted_at" },
 };
 
 function toSnakeRow(table, obj) {
@@ -236,6 +251,16 @@ async function apiCreateNoReturn(sheet, data) {
   const table = TABLE_MAP[sheet] || sheet;
   const { error } = await supabase.from(table).insert(toSnakeRow(table, data));
   throwOrHandle(error);
+}
+
+// Upserts on a caller-specified conflict target instead of the primary key — used for
+// capacity_load_snapshots, which dedupes same-day writes via a (staff_id, snapshot_date)
+// unique constraint rather than by id.
+async function apiUpsert(sheet, data, conflictColumns) {
+  const table = TABLE_MAP[sheet] || sheet;
+  const { error } = await supabase.from(table).upsert(toSnakeRow(table, data), { onConflict: conflictColumns });
+  throwOrHandle(error);
+  return { ok: true };
 }
 
 async function apiUpdate(sheet, id, data) {
@@ -721,23 +746,22 @@ function bracketWeight(brackets, value, maxKey) {
   return 1;
 }
 
-// Capacity forecasting — Margin's survey/pulse score is a snapshot; this layers a forward-
-// looking, weighted read from what's already sitting on someone's plate instead of only the
-// after-the-fact status. Already-over-capacity people don't need a separate forecast — the real
-// signal there is the status itself. "Involved" mirrors StaffProfileModal's own definition
-// (owner, on the team, or created a sub-task) so this reads the same set of projects a person
-// would see attributed to them anywhere else in the app.
+// The raw weighted load number, split out from capacityForecast() below so the capacity-load
+// snapshot job (which needs the number even when it's low — a trend line shouldn't have gaps
+// that look like missing data) and the live StaffPanel badge (which only needs it once it
+// crosses a threshold) share one formula instead of two copies that can drift apart.
 //
 // Per assigned project: urgency (days to due) x cost bracket x project-type weight, divided by
 // how many people are actually on it — a $20k event three people are sharing carries less
 // per-person load than the same event one person is running solo. Summed across everything
-// they're on, then bucketed against Central's configured thresholds.
-function capacityForecast(person, projects, marginScores, weights) {
-  if (marginScores?.[person.id]?.status === "over_capacity") return null;
+// they're on. "Involved" mirrors StaffProfileModal's own definition (owner, on the team, or
+// created a sub-task) so this reads the same set of projects a person would see attributed to
+// them anywhere else in the app.
+function computeCapacityLoad(person, projects, weights) {
   const w = weights || DEFAULT_CAPACITY_WEIGHTS;
   const involved = (p) => p.stage !== "Completed" && (p.owner === person.name || (p.team || []).includes(person.name) || (p.subtasks || []).some((s) => s.createdBy === person.name));
   const assigned = projects.filter(involved);
-  if (assigned.length === 0) return null;
+  if (assigned.length === 0) return 0;
 
   const todayDate = new Date(TODAY_STR + "T00:00:00");
   let totalLoad = 0;
@@ -749,6 +773,18 @@ function capacityForecast(person, projects, marginScores, weights) {
     const teamSize = new Set([p.owner, ...(p.team || [])].filter(Boolean)).size || 1;
     totalLoad += (urgencyW * costW * typeW) / teamSize;
   });
+  return totalLoad;
+}
+
+// Capacity forecasting — Margin's survey/pulse score is a snapshot; this layers a forward-
+// looking, weighted read from what's already sitting on someone's plate instead of only the
+// after-the-fact status. Already-over-capacity people don't need a separate forecast — the real
+// signal there is the status itself.
+function capacityForecast(person, projects, marginScores, weights) {
+  if (marginScores?.[person.id]?.status === "over_capacity") return null;
+  const w = weights || DEFAULT_CAPACITY_WEIGHTS;
+  const totalLoad = computeCapacityLoad(person, projects, w);
+  if (totalLoad === 0) return null;
 
   if (totalLoad >= w.overCapacityThreshold) return { label: "Trending toward over capacity", detail: `load score ${totalLoad.toFixed(1)}`, color: "#C15B5B" };
   if (totalLoad >= w.heavyLoadThreshold) return { label: "Heavy load", detail: `load score ${totalLoad.toFixed(1)}`, color: "#B8862F" };
@@ -1044,6 +1080,11 @@ export default function OpsDashboard() {
   const [approvalRequests, setApprovalRequests] = useState([]);
   const [taxonomySettings, setTaxonomySettings] = useState(null);
   const taxonomy = taxonomySettings || DEFAULT_TAXONOMY;
+  const [marginSurveys, setMarginSurveys] = useState([]); // history for the Staff Profile trend view — see 0006_margin.sql; empty for 'staff'-tier viewers by RLS
+  const [mobileCheckins, setMobileCheckins] = useState([]);
+  const [pushSubscriptions, setPushSubscriptions] = useState([]); // own row(s) only, per RLS
+  const [capacityLoadSnapshots, setCapacityLoadSnapshots] = useState([]);
+  const [exitedQuickCheckin, setExitedQuickCheckin] = useState(false);
   const [pendingMarginPulse, setPendingMarginPulse] = useState(null);
   const [campuses, setCampuses] = useState([]);
   const [users, setUsers] = useState([]);
@@ -1239,8 +1280,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult, approvalRequestsResult, taxonomySettingsResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"), apiGet("ApprovalRequests"), apiGet("TaxonomySettings"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult, approvalRequestsResult, taxonomySettingsResult, mobileCheckinsResult, pushSubscriptionsResult, capacityLoadSnapshotsResult, marginSurveysResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"), apiGet("ApprovalRequests"), apiGet("TaxonomySettings"), apiGet("MobileCheckins"), apiGet("PushSubscriptions"), apiGet("CapacityLoadSnapshots"), apiGet("MarginSurveys"),
       ]);
       if (cancelled) return;
 
@@ -1388,6 +1429,10 @@ export default function OpsDashboard() {
       if (approvalRequestsResult.status === "fulfilled") setApprovalRequests(approvalRequestsResult.value);
 
       if (taxonomySettingsResult.status === "fulfilled" && taxonomySettingsResult.value[0]) setTaxonomySettings(taxonomySettingsResult.value[0]);
+      if (mobileCheckinsResult.status === "fulfilled") setMobileCheckins(mobileCheckinsResult.value);
+      if (pushSubscriptionsResult.status === "fulfilled") setPushSubscriptions(pushSubscriptionsResult.value);
+      if (capacityLoadSnapshotsResult.status === "fulfilled") setCapacityLoadSnapshots(capacityLoadSnapshotsResult.value);
+      if (marginSurveysResult.status === "fulfilled") setMarginSurveys(marginSurveysResult.value);
 
       if (failures.length > 0) {
         setBackendStatus("offline");
@@ -1398,6 +1443,41 @@ export default function OpsDashboard() {
     })();
     return () => { cancelled = true; };
   }, [auth]);
+
+  // Capacity-load snapshots — computeCapacityLoad() is only ever live in the browser (see
+  // 0033_capacity_load_snapshots_client_write.sql for why this stays client-computed rather
+  // than a second SQL implementation), so an OD/Central viewer's own page load is what feeds
+  // the trend line. Fires once per mount, gated by role — a staff-tier viewer has no visibility
+  // into this data anyway (see 0032's select policy) so there's nothing for them to snapshot.
+  // The DB's (staff_id, snapshot_date) upsert makes repeat visits same-day a no-op overwrite,
+  // not a pile of duplicate rows.
+  const capacitySnapshotSentRef = useRef(false);
+  useEffect(() => {
+    if (capacitySnapshotSentRef.current) return;
+    if (!auth?.user || (auth.user.tier !== "od" && auth.user.tier !== "central")) return;
+    if (Object.keys(staffByCampus).length === 0 || projects.length === 0) return;
+    capacitySnapshotSentRef.current = true;
+
+    const weights = capacityWeightSettings || DEFAULT_CAPACITY_WEIGHTS;
+    const campusIds = auth.user.tier === "central" ? Object.keys(staffByCampus) : [auth.user.campusId];
+    const snapshots = [];
+    campusIds.forEach((campusId) => {
+      (staffByCampus[campusId] || []).forEach((s) => {
+        const loadScore = computeCapacityLoad(s, projects, weights);
+        const status = loadScore >= weights.overCapacityThreshold ? "over_capacity" : loadScore >= weights.heavyLoadThreshold ? "heavy_load" : null;
+        snapshots.push({ organizationId: OSC_ORG_ID, campusId, staffId: s.id, loadScore, status, snapshotDate: TODAY_STR });
+      });
+    });
+    if (snapshots.length === 0) return;
+    (async () => {
+      try {
+        await Promise.all(snapshots.map((row) => apiUpsert("CapacityLoadSnapshots", row, "staff_id,snapshot_date")));
+      } catch {
+        // Best-effort background write — a failed snapshot just means a gap in the trend
+        // line, not a broken feature; never surface this as a sync error to the viewer.
+      }
+    })();
+  }, [auth, staffByCampus, projects, capacityWeightSettings]);
 
   const loadDemoData = async () => {
     setBackendStatus("bootstrapping");
@@ -2176,6 +2256,71 @@ export default function OpsDashboard() {
     }
   };
 
+  // Mobile check-ins — self-initiated, tied to the submitter (not anonymous, see
+  // 0031_mobile_checkins.sql), visible to their own OD and Central so a rough answer can
+  // actually get followed up on. staffId/campusId are resolved from the caller's own linked
+  // staff record rather than trusted from anywhere else, and RLS double-checks that link
+  // server-side — see the WITH CHECK in the same migration.
+  const submitMobileCheckin = async ({ mood, energy, pace, support, note }) => {
+    const myStaff = Object.values(staffByCampus).flat().find((s) => s.userId === auth?.user?.id);
+    if (!myStaff) throw new Error("No staff record is linked to this login yet — ask your OD to link one.");
+    setSyncing(true);
+    try {
+      const created = await apiCreate("MobileCheckins", {
+        organizationId: OSC_ORG_ID, campusId: myStaff.campusId, staffId: myStaff.id, profileId: auth.user.id,
+        mood, energy, pace, support, note: note || null,
+      });
+      setMobileCheckins((prev) => [...prev, created]);
+      setBackendStatus("connected"); setBackendError("");
+      return created;
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+      throw err;
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  // Web Push subscribe/unsubscribe — the browser and push service handle the actual
+  // subscription; this just persists (or removes) the resulting endpoint/keys so
+  // checkin-nudge knows where to send. Silently no-ops if the browser doesn't support any of
+  // this (older Safari, no service worker) rather than surfacing an error for something the
+  // person can't do anything about.
+  const subscribeToPush = async () => {
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) return false;
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") return false;
+    const registration = await navigator.serviceWorker.ready;
+    let subscription = await registration.pushManager.getSubscription();
+    if (!subscription) {
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+      });
+    }
+    const json = subscription.toJSON();
+    const created = await apiCreate("PushSubscriptions", {
+      profileId: auth.user.id, endpoint: json.endpoint, p256dh: json.keys.p256dh, authKey: json.keys.auth,
+    });
+    setPushSubscriptions((prev) => [...prev, created]);
+    return true;
+  };
+
+  const unsubscribeFromPush = async () => {
+    if (!("serviceWorker" in navigator)) return;
+    const registration = await navigator.serviceWorker.ready;
+    const subscription = await registration.pushManager.getSubscription();
+    if (subscription) {
+      const endpoint = subscription.endpoint;
+      await subscription.unsubscribe();
+      const match = pushSubscriptions.find((p) => p.endpoint === endpoint);
+      if (match) {
+        setPushSubscriptions((prev) => prev.filter((p) => p.id !== match.id));
+        syncToBackend(apiDelete("PushSubscriptions", match.id));
+      }
+    }
+  };
+
   // Notifies whoever resolveApprovalApprovers says should decide this request — same
   // notifications table every other feature already uses, just with no projectId to attach.
   const notifyApprovalApprovers = (request) => {
@@ -2458,6 +2603,20 @@ export default function OpsDashboard() {
   if (!auth) return <LoginScreen />;
   if (auth.user.tier === "unassigned") return <PendingAssignmentScreen user={auth.user} onSignOut={() => supabase.auth.signOut()} />;
 
+  // A dedicated, no-chrome entry point for the PWA's "Check In" home-screen shortcut — someone
+  // between shifts shouldn't have to navigate the full dashboard just to answer four taps.
+  const wantsQuickCheckin = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("checkin") === "1";
+  if (wantsQuickCheckin && !exitedQuickCheckin) {
+    return (
+      <QuickCheckinScreen
+        onSubmit={submitMobileCheckin}
+        onSubscribe={subscribeToPush}
+        alreadySubscribed={pushSubscriptions.length > 0}
+        onDone={() => { window.history.replaceState({}, "", window.location.pathname); setExitedQuickCheckin(true); }}
+      />
+    );
+  }
+
   return (
     <div style={{ fontFamily: "'Inter', sans-serif", background: "#F7F6FB", color: "#2A2A3A" }} className="min-h-screen w-full">
 
@@ -2477,6 +2636,10 @@ export default function OpsDashboard() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          <button onClick={() => { window.location.href = window.location.pathname + "?checkin=1"; }}
+            title="Quick check-in" className="w-8 h-8 rounded-md flex items-center justify-center" style={{ background: "rgba(247,246,251,0.14)", border: "1px solid rgba(247,246,251,0.35)" }}>
+            <ActivityIcon size={15} color="#F7F6FB" />
+          </button>
           <div className="relative">
             <button onClick={() => setShowNotifications((v) => !v)} className="relative w-8 h-8 rounded-md flex items-center justify-center" style={{ background: "rgba(247,246,251,0.14)", border: "1px solid rgba(247,246,251,0.35)" }}>
               <Bell size={15} color="#F7F6FB" />
@@ -2636,7 +2799,8 @@ export default function OpsDashboard() {
 
           {tab === "calendar" && (
             <CalendarPanel calDate={calDate} setCalDate={setCalDate} calView={calView} setCalView={setCalView} dayEvents={dayEvents} full
-              authUser={auth.user} onSaveGoogleCalendars={saveMyGoogleCalendars} onSetGoogleConnected={setMyGoogleConnected} />
+              authUser={auth.user} onSaveGoogleCalendars={saveMyGoogleCalendars} onSetGoogleConnected={setMyGoogleConnected}
+              pushEnabled={pushSubscriptions.length > 0} onSubscribePush={subscribeToPush} onUnsubscribePush={unsubscribeFromPush} />
           )}
 
           {tab === "notes" && (
@@ -2726,7 +2890,11 @@ export default function OpsDashboard() {
         />
       )}
       {showNewProject && <NewProjectModal onClose={() => setShowNewProject(false)} onCreate={(data) => { addProject(data); setShowNewProject(false); }} campusRoster={campusRoster} fullRoster={fullRoster} campusLabel={activeCampus ? `${activeCampus.name} (${activeCampus.abbr})` : "Central"} taxonomy={taxonomy} />}
-      {openStaffProfile && <StaffProfileModal name={openStaffProfile} projects={displayProjects} onClose={() => setOpenStaffProfile(null)} onOpenProject={(id) => { setOpenStaffProfile(null); setOpenProject(id); }} />}
+      {openStaffProfile && (
+        <StaffProfileModal name={openStaffProfile} projects={displayProjects} onClose={() => setOpenStaffProfile(null)} onOpenProject={(id) => { setOpenStaffProfile(null); setOpenProject(id); }}
+          staffByCampus={staffByCampus} canViewTrends={auth.user.tier === "central" || auth.user.tier === "od"}
+          marginSurveys={marginSurveys} mobileCheckins={mobileCheckins} capacityLoadSnapshots={capacityLoadSnapshots} />
+      )}
     </div>
   );
 }
@@ -2902,7 +3070,7 @@ function CentralOverview({ campuses, orgBudgetUsed, orgBudgetTotal, projects, st
         <p className="text-[13px] text-[#6B6980] mt-1">Organization-wide standing, at a glance.</p>
       </div>
 
-      <TeamAttentionBanner staff={allStaff} onGoTab={onGoTab} accentColor="#C15B5B" projects={projects} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings} />
+      <TeamAttentionBanner staff={allStaff} onGoTab={onGoTab} onSelectCampus={onSelectCampus} accentColor="#C15B5B" projects={projects} marginScores={marginScores} capacityWeightSettings={capacityWeightSettings} />
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
         <SummaryCard onClick={() => setDetail("projects")} icon={ListChecks} label="Open Projects" value={projects.filter((p) => p.stage !== "Completed").length} sub="org-wide" color="#2B4C7E" />
@@ -3069,7 +3237,12 @@ function SummaryCard({ icon: Icon, label, value, sub, color, onClick }) {
 // Manager Nudges v1 — a proactive summary instead of relying on someone to notice the
 // per-row "Needs check-in" badge buried in Staff & Team. Renders nothing when there's nothing
 // to act on, so it doesn't become permanent noise once a team is caught up.
-function TeamAttentionBanner({ staff, onGoTab, accentColor, projects, marginScores, capacityWeightSettings }) {
+// onSelectCampus is only passed from the All-Campuses (cross-campus) context — when present,
+// "staff" here is pooled across every campus, so onGoTab("staff") alone would land on whatever
+// staffCampusId falls back to (the small "Central Operations Team" roster, not the campus the
+// flagged person is actually on). Jumping to that person's own campus first fixes that; the
+// single-campus CampusDashboard usage never passes this, since it's already scoped correctly.
+function TeamAttentionBanner({ staff, onGoTab, onSelectCampus, accentColor, projects, marginScores, capacityWeightSettings }) {
   const needingCheckIn = staff.filter((s) => needsCheckIn(s.lastContact));
   const flagged = staff.filter((s) => s.flag);
   const forecasted = projects && marginScores !== undefined ? staff.filter((s) => capacityForecast(s, projects, marginScores, capacityWeightSettings)) : [];
@@ -3079,8 +3252,13 @@ function TeamAttentionBanner({ staff, onGoTab, accentColor, projects, marginScor
   if (needingCheckIn.length > 0) parts.push(`${needingCheckIn.length} need${needingCheckIn.length === 1 ? "s" : ""} a check-in`);
   if (flagged.length > 0) parts.push(`${flagged.length} flagged`);
   if (forecasted.length > 0) parts.push(`${forecasted.length} flagged for capacity risk`);
+  const target = needingCheckIn[0] || flagged[0] || forecasted[0];
+  const goToAttention = () => {
+    if (onSelectCampus && target?.campusId && target.campusId !== "central") onSelectCampus(target.campusId);
+    onGoTab("staff");
+  };
   return (
-    <button onClick={() => onGoTab("staff")}
+    <button onClick={goToAttention}
       className="w-full flex items-center justify-between gap-3 bg-[#FFFFFF] rounded-lg p-4 mb-5 text-left transition"
       style={{ border: `1.5px solid ${color}55` }}
       onMouseEnter={(e) => e.currentTarget.style.borderColor = color}
@@ -3956,6 +4134,120 @@ function OrgPulsePrompt({ wave, onSubmit }) {
   );
 }
 
+const QUICK_CHECKIN_QUESTIONS = [
+  { key: "mood", label: "Mood", low: "Rough", high: "Great" },
+  { key: "energy", label: "Energy", low: "Drained", high: "Energized" },
+  { key: "pace", label: "Today's pace", low: "Way too slow", high: "Way too much" },
+  { key: "support", label: "Feeling supported", low: "Not really", high: "Very" },
+];
+
+function QuickScale({ value, onChange }) {
+  return (
+    <div className="flex gap-1.5">
+      {[1, 2, 3, 4, 5].map((n) => (
+        <button key={n} type="button" onClick={() => onChange(n)}
+          className="flex-1 h-11 rounded-md text-[13px] font-medium border transition"
+          style={value === n
+            ? { background: "#B8862F", color: "#F7F6FB", borderColor: "#B8862F" }
+            : { background: "#FFFFFF", color: "#6B6980", borderColor: "#D8D5EC" }}>
+          {n}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// The PWA shortcut's actual destination — no dashboard chrome, no nav, nothing to navigate
+// past. Four taps and an optional note, meant to take under 15 seconds on a phone between
+// shifts. See 0031_mobile_checkins.sql: this is self-initiated and NOT anonymous (unlike Org
+// Pulse) — the point is that a rough answer can reach the person's own OD, not just an
+// aggregate number.
+function QuickCheckinScreen({ onSubmit, onSubscribe, alreadySubscribed, onDone }) {
+  const [answers, setAnswers] = useState({});
+  const [note, setNote] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+  const [error, setError] = useState("");
+  const [subscribePrompted, setSubscribePrompted] = useState(false);
+  const setAnswer = (key, value) => setAnswers((prev) => ({ ...prev, [key]: value }));
+  const complete = QUICK_CHECKIN_QUESTIONS.every((q) => answers[q.key]);
+
+  const submit = async () => {
+    if (!complete || submitting) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      await onSubmit({ ...answers, note: note.trim() });
+      setSubmitted(true);
+    } catch (err) {
+      setError(err?.message || "Couldn't send that — try again.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (submitted) {
+    return (
+      <div className="fixed inset-0 z-40 flex flex-col items-center justify-center p-6 text-center" style={{ background: "#F7F6FB" }}>
+        <div className="w-14 h-14 rounded-full flex items-center justify-center mb-4" style={{ background: "#5E9E8A22" }}>
+          <CheckCircle2 size={28} color="#5E9E8A" />
+        </div>
+        <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[19px] font-semibold mb-1">Thanks for checking in</h1>
+        <p className="text-[12.5px] text-[#6B6980] mb-6 max-w-[280px]">Your OD can see this and follow up if you need it.</p>
+        {!alreadySubscribed && !subscribePrompted && (
+          <div className="w-full max-w-[300px] bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mb-4">
+            <div className="text-[12.5px] font-medium mb-1">Get a nudge to check in?</div>
+            <p className="text-[11px] text-[#6B6980] mb-3">A quiet reminder if you haven't checked in for a while — no spam, easy to turn off.</p>
+            <button onClick={async () => { await onSubscribe().catch(() => {}); setSubscribePrompted(true); }}
+              className="w-full text-[12.5px] font-medium rounded-md px-3 py-2" style={{ background: "#2B4C7E", color: "#F7F6FB" }}>
+              Enable notifications
+            </button>
+          </div>
+        )}
+        <button onClick={onDone} className="text-[12.5px] font-medium rounded-md px-4 py-2" style={{ background: "#EFEEFA", color: "#2A2A3A" }}>
+          Done
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-40 overflow-y-auto p-5" style={{ background: "#F7F6FB" }}>
+      <div className="max-w-[420px] mx-auto pt-6 pb-10">
+        <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[19px] font-semibold mb-1">Quick check-in</h1>
+        <p className="text-[12px] text-[#6B6980] mb-6">Four taps, takes a few seconds. Only your OD and Central see this.</p>
+        <div className="space-y-5">
+          {QUICK_CHECKIN_QUESTIONS.map((q) => (
+            <div key={q.key}>
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[13px] font-medium">{q.label}</span>
+              </div>
+              <QuickScale value={answers[q.key]} onChange={(v) => setAnswer(q.key, v)} />
+              <div className="flex items-center justify-between text-[10px] text-[#8B889C] mt-1">
+                <span>{q.low}</span><span>{q.high}</span>
+              </div>
+            </div>
+          ))}
+          <div>
+            <div className="text-[13px] font-medium mb-1.5">Anything else? <span className="text-[#8B889C] font-normal">(optional)</span></div>
+            <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2}
+              className="w-full bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-3 py-2 text-[12.5px] outline-none focus:border-[#B8862F]" />
+          </div>
+        </div>
+        {error && <div className="text-[11.5px] mt-4" style={{ color: "#C15B5B" }}>{error}</div>}
+        <button onClick={submit} disabled={!complete || submitting}
+          className="w-full text-[13px] font-medium rounded-md px-3 py-2.5 mt-5 disabled:opacity-40"
+          style={{ background: "#B8862F", color: "#F7F6FB" }}>
+          {submitting ? "Sending…" : "Send check-in"}
+        </button>
+        <button onClick={onDone} className="w-full text-[12px] text-[#8B889C] mt-3 py-1">
+          Not now
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // Lets a Staff & Team roster entry (directory info, no login) get connected to a real Users
 // login — either an existing account (an unassigned one waiting to be claimed, or one already
 // scoped to this campus) or a brand-new one created and linked in the same step.
@@ -4114,7 +4406,25 @@ function OtherConnectionsPanel() {
   );
 }
 
-function CalendarPanel({ calDate, setCalDate, calView, setCalView, dayEvents, full, authUser, onSaveGoogleCalendars, onSetGoogleConnected }) {
+function CalendarPanel({ calDate, setCalDate, calView, setCalView, dayEvents, full, authUser, onSaveGoogleCalendars, onSetGoogleConnected, pushEnabled, onSubscribePush, onUnsubscribePush }) {
+  const [pushBusy, setPushBusy] = useState(false);
+  const [pushError, setPushError] = useState("");
+  const togglePush = async () => {
+    setPushBusy(true);
+    setPushError("");
+    try {
+      if (pushEnabled) {
+        await onUnsubscribePush();
+      } else {
+        const ok = await onSubscribePush();
+        if (!ok) setPushError("Notifications need to be allowed in your browser to turn this on.");
+      }
+    } catch (err) {
+      setPushError(err?.message || "Couldn't update notifications.");
+    } finally {
+      setPushBusy(false);
+    }
+  };
   const [searchQuery, setSearchQuery] = useState("");
   const [customStart, setCustomStart] = useState(calDate);
   const [customEnd, setCustomEnd] = useState(calDate);
@@ -4251,6 +4561,19 @@ function CalendarPanel({ calDate, setCalDate, calView, setCalView, dayEvents, fu
               </div>
             </div>
           </div>
+
+          <div className="flex items-center justify-between gap-3 rounded-lg px-3 py-2.5 mb-3" style={{ background: "#EFEEFA", border: "1px solid #D8D5EC" }}>
+            <div className="text-[11.5px] text-[#6B6980] flex items-center gap-1.5">
+              <ActivityIcon size={12} className={pushEnabled ? "text-[#5E9E8A]" : ""} />
+              {pushEnabled ? "Check-in reminders are on" : "Get a reminder if you haven't checked in for a while"}
+            </div>
+            <button onClick={togglePush} disabled={pushBusy}
+              className="text-[11.5px] rounded-md px-3 py-1.5 font-medium whitespace-nowrap"
+              style={pushEnabled ? { background: "#E3E1F0", color: "#2A2A3A" } : { background: "#2B4C7E", color: "#F7F6FB", opacity: pushBusy ? 0.7 : 1 }}>
+              {pushBusy ? "…" : pushEnabled ? "Turn off" : "Enable notifications"}
+            </button>
+          </div>
+          {pushError && <div className="text-[11px] mb-3 rounded-md px-3 py-2" style={{ background: "#C15B5B1A", color: "#C15B5B" }}>{pushError}</div>}
 
           {calError && <div className="text-[11px] mb-3 rounded-md px-3 py-2" style={{ background: "#C15B5B1A", color: "#C15B5B" }}>{calError}</div>}
           {loadingEvents && <div className="text-[11px] text-[#6B6980] mb-3">Loading your calendar events…</div>}
@@ -7266,7 +7589,23 @@ function CreateAccountModal({ campuses, roleOptions, onClose, onCreate }) {
   );
 }
 
-function StaffProfileModal({ name, projects, onClose, onOpenProject }) {
+// A minimal, hand-rolled bar trend — no charting library is used anywhere else in this app, so
+// this matches that existing visual convention instead of introducing a new dependency for one
+// section. Bars scale against the series' own max (or an explicit ceiling, e.g. a 1-5 scale)
+// rather than each other's absolute values, so a flat low series doesn't render as all-zero.
+function MiniTrendBars({ points, max, color, height = 32 }) {
+  if (points.length === 0) return <div className="text-[10.5px] text-[#8B889C] italic">No data yet</div>;
+  const ceiling = max ?? Math.max(...points, 0.001);
+  return (
+    <div className="flex items-end gap-[3px]" style={{ height }}>
+      {points.map((v, i) => (
+        <div key={i} title={String(v)} className="flex-1 rounded-sm" style={{ height: `${Math.max(6, Math.round((v / ceiling) * 100))}%`, background: color, opacity: 0.5 + 0.5 * (i / Math.max(1, points.length - 1)) }} />
+      ))}
+    </div>
+  );
+}
+
+function StaffProfileModal({ name, projects, onClose, onOpenProject, staffByCampus, canViewTrends, marginSurveys, mobileCheckins, capacityLoadSnapshots }) {
   useLockBodyScroll();
   if (!name) return null;
 
@@ -7281,6 +7620,15 @@ function StaffProfileModal({ name, projects, onClose, onOpenProject }) {
   const current = involved.filter((p) => p.stage !== "Completed");
   const needsAttention = current.filter((p) => p.stage === "Stalled" || (p.due && p.due < TODAY_STR) || (p.subtasks || []).some((s) => !s.done && s.due && s.due < TODAY_STR));
 
+  // Trend history — OD/Central only (canViewTrends), matches Margin's own visibility. A
+  // 'staff'-tier viewer only ever opens their own profile from nowhere in this app's nav, but
+  // canViewTrends is the actual gate, not an assumption about who can reach this modal.
+  const myStaff = staffByCampus ? Object.values(staffByCampus).flat().find((s) => s.name === name) : null;
+  const staffMarginSurveys = myStaff && marginSurveys ? marginSurveys.filter((s) => String(s.staffId) === String(myStaff.id)).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(-12) : [];
+  const staffCheckins = myStaff && mobileCheckins ? mobileCheckins.filter((c) => String(c.staffId) === String(myStaff.id)).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(-12) : [];
+  const staffCapacitySnapshots = myStaff && capacityLoadSnapshots ? capacityLoadSnapshots.filter((s) => String(s.staffId) === String(myStaff.id)).sort((a, b) => a.snapshotDate.localeCompare(b.snapshotDate)).slice(-12) : [];
+  const hasAnyTrendData = staffMarginSurveys.length > 0 || staffCheckins.length > 0 || staffCapacitySnapshots.length > 0;
+
   return (
     <div className="fixed inset-0 z-30 overflow-y-auto p-0 sm:p-4" style={{ background: "rgba(0,0,0,0.65)", WebkitOverflowScrolling: "touch" }} onClick={onClose}>
       <div className="border rounded-none sm:rounded-xl max-w-[560px] w-full min-h-screen sm:min-h-0 my-0 sm:my-8 mx-auto p-5" style={{ background: "#FFFFFF", borderColor: "#D8D5EC", color: "#2A2A3A", fontFamily: "'Inter', sans-serif" }} onClick={(e) => e.stopPropagation()}>
@@ -7288,6 +7636,30 @@ function StaffProfileModal({ name, projects, onClose, onOpenProject }) {
           <h2 className="text-[17px] font-bold">{name}</h2>
           <button onClick={onClose} className="text-[#6B6980] hover:text-[#2A2A3A]"><X size={18} /></button>
         </div>
+
+        {canViewTrends && myStaff && hasAnyTrendData && (
+          <div className="rounded-md p-3 mb-4 space-y-3" style={{ background: "#F7F6FB", border: "1px solid #E3E1F0" }}>
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C]">Trends</div>
+            {staffMarginSurveys.length > 0 && (
+              <div>
+                <div className="text-[11px] text-[#6B6980] mb-1">Margin score · last {staffMarginSurveys.length} assessment{staffMarginSurveys.length === 1 ? "" : "s"}</div>
+                <MiniTrendBars points={staffMarginSurveys.map((s) => Number(s.score) || 0)} max={10} color="#2B4C7E" />
+              </div>
+            )}
+            {staffCheckins.length > 0 && (
+              <div>
+                <div className="text-[11px] text-[#6B6980] mb-1">Check-in mood · last {staffCheckins.length}</div>
+                <MiniTrendBars points={staffCheckins.map((c) => Number(c.mood) || 0)} max={5} color="#B8862F" />
+              </div>
+            )}
+            {staffCapacitySnapshots.length > 0 && (
+              <div>
+                <div className="text-[11px] text-[#6B6980] mb-1">Capacity load · last {staffCapacitySnapshots.length} day{staffCapacitySnapshots.length === 1 ? "" : "s"} tracked</div>
+                <MiniTrendBars points={staffCapacitySnapshots.map((s) => Number(s.loadScore) || 0)} color="#C15B5B" />
+              </div>
+            )}
+          </div>
+        )}
 
         {needsAttention.length > 0 && (
           <div className="rounded-md p-3 mb-4" style={{ background: "#C15B5B18", border: "1px solid #C15B5B55" }}>

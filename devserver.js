@@ -13,7 +13,7 @@ const server = http.createServer(async (req, res) => {
   fs.readFile(filePath, (err, data) => {
     if (err) { res.writeHead(404); res.end("not found"); return; }
     const ext = path.extname(filePath);
-    const type = ext === ".js" ? "text/javascript" : ext === ".css" ? "text/css" : "text/html";
+    const type = { ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml" }[ext] || "text/html";
     res.writeHead(200, { "Content-Type": type });
     res.end(data);
   });
