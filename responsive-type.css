@@ -1,0 +1,39 @@
+/* Desktop-only type bump — every arbitrary Tailwind text-size class used in
+ * entry_component.jsx gets +1px at the lg breakpoint (1024px+). Mobile is untouched;
+ * this file must load AFTER output.css in index.html so it wins the cascade at equal
+ * specificity. Regenerate by re-running the generator script if new text-[...] sizes
+ * are ever introduced (grep -oE "text-\[[0-9.]+px\]|text-\[clamp\([^]]+\)\]"). */
+
+@media (min-width: 1024px) {
+  .text-\[8px\] { font-size: 9px; }
+  .text-\[8\.5px\] { font-size: 9.5px; }
+  .text-\[9px\] { font-size: 10px; }
+  .text-\[9\.5px\] { font-size: 10.5px; }
+  .text-\[10px\] { font-size: 11px; }
+  .text-\[10\.5px\] { font-size: 11.5px; }
+  .text-\[11px\] { font-size: 12px; }
+  .text-\[11\.5px\] { font-size: 12.5px; }
+  .text-\[12px\] { font-size: 13px; }
+  .text-\[12\.5px\] { font-size: 13.5px; }
+  .text-\[13px\] { font-size: 14px; }
+  .text-\[13\.5px\] { font-size: 14.5px; }
+  .text-\[14px\] { font-size: 15px; }
+  .text-\[15px\] { font-size: 16px; }
+  .text-\[16px\] { font-size: 17px; }
+  .text-\[17px\] { font-size: 18px; }
+  .text-\[18px\] { font-size: 19px; }
+  .text-\[19px\] { font-size: 20px; }
+  .text-\[20px\] { font-size: 21px; }
+  .text-\[21px\] { font-size: 22px; }
+  .text-\[22px\] { font-size: 23px; }
+  .text-\[26px\] { font-size: 27px; }
+
+  .text-\[clamp\(10px\2c 2vw\2c 11px\)\] { font-size: clamp(11px, 2vw, 12px); }
+  .text-\[clamp\(13px\2c 2\.6vw\2c 15px\)\] { font-size: clamp(14px, 2.6vw, 16px); }
+  .text-\[clamp\(14px\2c 3vw\2c 16px\)\] { font-size: clamp(15px, 3vw, 17px); }
+  .text-\[clamp\(17px\2c 4\.2vw\2c 22px\)\] { font-size: clamp(18px, 4.2vw, 23px); }
+  .text-\[clamp\(18px\2c 3\.6vw\2c 22px\)\] { font-size: clamp(19px, 3.6vw, 23px); }
+  .text-\[clamp\(19px\2c 4vw\2c 24px\)\] { font-size: clamp(20px, 4vw, 25px); }
+  .text-\[clamp\(20px\2c 4vw\2c 26px\)\] { font-size: clamp(21px, 4vw, 27px); }
+  .text-\[clamp\(9\.5px\2c 1\.8vw\2c 10\.5px\)\] { font-size: clamp(10.5px, 1.8vw, 11.5px); }
+}
