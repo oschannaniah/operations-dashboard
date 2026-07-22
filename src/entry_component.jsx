@@ -200,7 +200,7 @@ let handleUnauthorized = () => {};
 // vocabulary. Rather than rewrite every one of those call sites, these two maps translate at
 // the boundary: sheet name -> real Postgres table name, and camelCase <-> the table's actual
 // snake_case columns — so every existing call site keeps working unchanged.
-const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses", ApprovalRequests: "approval_requests", TaxonomySettings: "taxonomy_settings", MobileCheckins: "mobile_checkins", PushSubscriptions: "push_subscriptions", CapacityLoadSnapshots: "capacity_load_snapshots", StaffStyleProfile: "staff_style_profile", StaffAssignmentHistory: "staff_assignment_history", EngagementRhythmSettings: "engagement_rhythm_settings" };
+const TABLE_MAP = { Projects: "projects", Subtasks: "subtasks", Staff: "staff", Users: "profiles", CampusConfig: "campus_config", Notifications: "notifications", Campuses: "campuses", CentralThreads: "central_threads", MarginScores: "margin_scores", MarginSurveys: "margin_surveys", MarginPulses: "margin_pulses", Seasons: "seasons", Teams: "teams", TeamMembers: "team_members", StaffFlagHistory: "staff_flag_history", StaffCheckinLog: "staff_checkin_log", PlaybookTemplates: "playbook_templates", PlaybookTemplateItems: "playbook_template_items", PlaybookRuns: "playbook_runs", PlaybookRunItems: "playbook_run_items", CapacityWeightSettings: "capacity_weight_settings", PulseWaves: "pulse_waves", PulseWaveParticipants: "pulse_wave_participants", PulseResponses: "pulse_responses", ApprovalRequests: "approval_requests", TaxonomySettings: "taxonomy_settings", MobileCheckins: "mobile_checkins", PushSubscriptions: "push_subscriptions", CapacityLoadSnapshots: "capacity_load_snapshots", StaffStyleProfile: "staff_style_profile", StaffAssignmentHistory: "staff_assignment_history", EngagementRhythmSettings: "engagement_rhythm_settings", TaskGroupOptions: "task_group_options" };
 
 // Every table's primary key is "id" except campus_config (natural key campus_id) and
 // margin_scores (natural key staff_id, one row per staff member) — neither has a separate
@@ -209,7 +209,8 @@ const PK_MAP = { campus_config: "campus_id", margin_scores: "staff_id", capacity
 
 const FIELD_MAPS = {
   projects: { organizationId: "organization_id", createdBy: "created_by", completedOn: "completed_on", sharedWith: "shared_with", dueTime: "due_time", seasonId: "season_id", projectType: "project_type" },
-  subtasks: { projectId: "project_id", createdBy: "created_by", dueTime: "due_time" },
+  subtasks: { projectId: "project_id", createdBy: "created_by", dueTime: "due_time", taskGroup: "task_group" },
+  task_group_options: { organizationId: "organization_id", name: "name", sortOrder: "sort_order", createdAt: "created_at", createdBy: "created_by" },
   staff: { organizationId: "organization_id", campusId: "campus_id", reportsTo: "reports_to", nextMeeting: "next_meeting", lastContact: "last_contact", calendarSynced: "calendar_synced", userId: "user_id", commPreferences: "comm_preferences", archivedAt: "archived_at", archivedBy: "archived_by" },
   profiles: { organizationId: "organization_id", firstName: "first_name", lastName: "last_name", campusId: "campus_id", googleCalendarIds: "google_calendar_ids", googleCalendarNames: "google_calendar_names" },
   campus_config: { campusId: "campus_id", slidesLink: "slides_link" },
@@ -1129,6 +1130,7 @@ export default function OpsDashboard() {
   const [staffAssignmentHistory, setStaffAssignmentHistory] = useState([]);
   const [allMarginPulses, setAllMarginPulses] = useState([]); // full history (not just pending) — feeds engagement rhythm scoring
   const [engagementRhythmSettings, setEngagementRhythmSettings] = useState(null);
+  const [taskGroupOptions, setTaskGroupOptions] = useState([]); // Central-curated list — see 0038_task_groups.sql
   const [mobileCheckins, setMobileCheckins] = useState([]);
   const [pushSubscriptions, setPushSubscriptions] = useState([]); // own row(s) only, per RLS
   const [capacityLoadSnapshots, setCapacityLoadSnapshots] = useState([]);
@@ -1333,8 +1335,8 @@ export default function OpsDashboard() {
       // failed fetch in a Promise.all rejected the whole batch and silently reset everything
       // (staff, projects, users) back to nothing, which is exactly what happened when the
       // CampusConfig tab didn't exist yet.
-      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult, approvalRequestsResult, taxonomySettingsResult, mobileCheckinsResult, pushSubscriptionsResult, capacityLoadSnapshotsResult, marginSurveysResult, staffStyleProfilesResult, staffAssignmentHistoryResult, allMarginPulsesResult, engagementRhythmSettingsResult] = await Promise.allSettled([
-        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"), apiGet("ApprovalRequests"), apiGet("TaxonomySettings"), apiGet("MobileCheckins"), apiGet("PushSubscriptions"), apiGet("CapacityLoadSnapshots"), apiGet("MarginSurveys"), apiGet("StaffStyleProfile"), apiGet("StaffAssignmentHistory"), apiGet("MarginPulses"), apiGet("EngagementRhythmSettings"),
+      const [projectsResult, subtasksResult, staffResult, usersResult, campusConfigResult, campusesResult, notificationsResult, centralThreadsResult, marginScoresResult, marginPulsesResult, seasonsResult, teamsResult, teamMembersResult, flagHistoryResult, checkinLogResult, playbookTemplatesResult, playbookTemplateItemsResult, playbookRunsResult, playbookRunItemsResult, capacityWeightSettingsResult, pulseWavesResult, pulseParticipantsResult, pulseResponsesResult, approvalRequestsResult, taxonomySettingsResult, mobileCheckinsResult, pushSubscriptionsResult, capacityLoadSnapshotsResult, marginSurveysResult, staffStyleProfilesResult, staffAssignmentHistoryResult, allMarginPulsesResult, engagementRhythmSettingsResult, taskGroupOptionsResult] = await Promise.allSettled([
+        apiGet("Projects"), apiGet("Subtasks"), apiGet("Staff"), apiGet("Users"), apiGet("CampusConfig"), apiGet("Campuses"), apiGet("Notifications"), apiGet("CentralThreads"), apiGet("MarginScores"), apiGet("MarginPulses", { status: "pending" }), apiGet("Seasons"), apiGet("Teams"), apiGet("TeamMembers"), apiGet("StaffFlagHistory"), apiGet("StaffCheckinLog"), apiGet("PlaybookTemplates"), apiGet("PlaybookTemplateItems"), apiGet("PlaybookRuns"), apiGet("PlaybookRunItems"), apiGet("CapacityWeightSettings"), apiGet("PulseWaves"), apiGet("PulseWaveParticipants"), apiGet("PulseResponses"), apiGet("ApprovalRequests"), apiGet("TaxonomySettings"), apiGet("MobileCheckins"), apiGet("PushSubscriptions"), apiGet("CapacityLoadSnapshots"), apiGet("MarginSurveys"), apiGet("StaffStyleProfile"), apiGet("StaffAssignmentHistory"), apiGet("MarginPulses"), apiGet("EngagementRhythmSettings"), apiGet("TaskGroupOptions"),
       ]);
       if (cancelled) return;
 
@@ -1491,6 +1493,7 @@ export default function OpsDashboard() {
       if (staffAssignmentHistoryResult.status === "fulfilled") setStaffAssignmentHistory(staffAssignmentHistoryResult.value);
       if (allMarginPulsesResult.status === "fulfilled") setAllMarginPulses(allMarginPulsesResult.value);
       if (engagementRhythmSettingsResult.status === "fulfilled" && engagementRhythmSettingsResult.value[0]) setEngagementRhythmSettings(engagementRhythmSettingsResult.value[0]);
+      if (taskGroupOptionsResult.status === "fulfilled") setTaskGroupOptions([...taskGroupOptionsResult.value].sort((a, b) => Number(a.sortOrder) - Number(b.sortOrder)));
 
       if (failures.length > 0) {
         setBackendStatus("offline");
@@ -1704,7 +1707,9 @@ export default function OpsDashboard() {
       title: data.title,
       stage: data.stage || "Pending",
       owner: data.owner || "Unassigned",
-      createdBy: currentViewerName,
+      // Live UI creation never passes createdBy, so this always stamps the current viewer there —
+      // the override only exists so the import tool can preserve a source file's original creator.
+      createdBy: data.createdBy || currentViewerName,
       createdAt: TODAY_STR,
       completedOn: null,
       team: data.team ? data.team.split(",").map((s) => s.trim()).filter(Boolean) : [],
@@ -1719,7 +1724,9 @@ export default function OpsDashboard() {
       recurrence: data.recurrence?.freq === "none" ? null : data.recurrence,
       subtasks: [],
       photos: [],
-      notes: [],
+      notes: data.initialNote?.trim()
+        ? [{ ts: TODAY_STR + " " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), author: data.createdBy || currentViewerName, text: data.initialNote.trim() }]
+        : [],
     };
     setProjects((ps) => [...ps, newProject]);
     notifyInvolved(newProject, `created the project "${newProject.title}"`);
@@ -1754,12 +1761,18 @@ export default function OpsDashboard() {
     if (updatedSubtask) syncToBackend(apiUpdate("Subtasks", updatedSubtask.id, { done: updatedSubtask.done, due: updatedSubtask.due, recurrence: updatedSubtask.recurrence }));
   };
 
-  const addSubtask = (projId, text, recurrence, due, cost, dueTime, assignees) => {
+  // `extra` (createdBy/taskGroup/initialNote/done) is only ever populated by the import tool —
+  // the live "Add sub-task" form never passes it, so ordinary task creation is unaffected.
+  const addSubtask = (projId, text, recurrence, due, cost, dueTime, assignees, extra = {}) => {
     const proj = projects.find((p) => p.id === projId);
     logActivity("added task", `"${text}" to ${proj?.title || "a project"}`, proj?.campus);
     const newSubtask = {
-      id: Date.now(), t: text, done: false, due: due || null, dueTime: dueTime || null, assignees: assignees || [],
-      createdBy: currentViewerName, photos: [], notes: [], cost: Number(cost) || 0, spent: 0, recurrence: recurrence?.freq === "none" ? null : recurrence,
+      id: Date.now(), t: text, done: !!extra.done, due: due || null, dueTime: dueTime || null, assignees: assignees || [],
+      createdBy: extra.createdBy || currentViewerName,
+      taskGroup: extra.taskGroup || null,
+      photos: [],
+      notes: extra.initialNote?.trim() ? [{ ts: TODAY_STR, author: extra.createdBy || currentViewerName, text: extra.initialNote.trim() }] : [],
+      cost: Number(cost) || 0, spent: 0, recurrence: recurrence?.freq === "none" ? null : recurrence,
     };
     setProjects((ps) => ps.map((p) => p.id === projId ? { ...p, subtasks: [...p.subtasks, newSubtask] } : p));
     if (proj) {
@@ -1785,6 +1798,18 @@ export default function OpsDashboard() {
     if (proj) notifyInvolved(proj, `assigned you to "${subtaskTitle}" on "${proj.title}"`, assignees);
     logActivity(`assigned "${subtaskTitle}"`, assignees.join(", "), proj?.campus);
     if (subtaskId) syncToBackend(apiUpdate("Subtasks", subtaskId, { assignees }));
+  };
+
+  const setSubtaskGroup = (projId, idx, taskGroup) => {
+    let subtaskId = null;
+    setProjects((ps) => ps.map((p) => {
+      if (p.id !== projId) return p;
+      const subtasks = [...p.subtasks];
+      subtasks[idx] = { ...subtasks[idx], taskGroup: taskGroup || null };
+      subtaskId = subtasks[idx].id;
+      return { ...p, subtasks };
+    }));
+    if (subtaskId) syncToBackend(apiUpdate("Subtasks", subtaskId, { taskGroup: taskGroup || null }));
   };
 
   const setSubtaskDue = (projId, idx, due, dueTime) => {
@@ -2336,6 +2361,31 @@ export default function OpsDashboard() {
     }
   };
 
+  // Unlike the one-row-per-org settings above, Task Groups is a genuine list Central adds to
+  // and removes from over time — see 0038_task_groups.sql. Needs the real DB-generated id back
+  // (uuid, not the Date.now() convention used for local Projects/Subtasks), same reason
+  // createSeason awaits apiCreate directly instead of the fire-and-forget syncToBackend.
+  const addTaskGroupOption = async (name) => {
+    const trimmed = (name || "").trim();
+    if (!trimmed || taskGroupOptions.some((g) => g.name.toLowerCase() === trimmed.toLowerCase())) return null;
+    setSyncing(true);
+    try {
+      const created = await apiCreate("TaskGroupOptions", { organizationId: OSC_ORG_ID, name: trimmed, sortOrder: taskGroupOptions.length, createdBy: currentViewerName });
+      setTaskGroupOptions((prev) => [...prev, created]);
+      setBackendStatus("connected"); setBackendError("");
+      return created;
+    } catch (err) {
+      setBackendStatus("offline"); setBackendError(err?.message || String(err));
+      return null;
+    } finally {
+      setSyncing(false);
+    }
+  };
+  const removeTaskGroupOption = (id) => {
+    setTaskGroupOptions((prev) => prev.filter((g) => g.id !== id));
+    syncToBackend(apiDelete("TaskGroupOptions", id));
+  };
+
   // Same one-row-per-org upsert shape as updateCapacityWeightSettings above.
   const updateTaxonomySettings = async (patch) => {
     setSyncing(true);
@@ -2775,7 +2825,7 @@ export default function OpsDashboard() {
             </button>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap justify-end">
           <button onClick={() => { window.location.href = window.location.pathname + "?checkin=1"; }}
             title="Quick check-in" className="w-8 h-8 rounded-md flex items-center justify-center" style={{ background: "rgba(247,246,251,0.14)", border: "1px solid rgba(247,246,251,0.35)" }}>
             <ActivityIcon size={15} color="#F7F6FB" />
@@ -2809,13 +2859,13 @@ export default function OpsDashboard() {
           </div>
           {auth.user.tier === "central" ? (
             <select value={role} onChange={(e) => { setRole(e.target.value); setSelectedCampus(null); setTab("overview"); }}
-              className="text-[13px] rounded-md px-2.5 py-1.5 outline-none"
+              className="text-[13px] rounded-md px-2.5 py-1.5 outline-none max-w-[120px] sm:max-w-[220px] text-ellipsis"
               style={{ background: "rgba(247,246,251,0.14)", border: "1px solid rgba(247,246,251,0.35)", color: "#F7F6FB" }}>
               <option value="central" style={{ color: "#2A2A3A" }}>Central Operations Director</option>
               {campuses.map((c) => <option key={c.id} value={c.id} style={{ color: "#2A2A3A" }}>{c.name} ({c.abbr}) — Campus OD</option>)}
             </select>
           ) : (
-            <div className="text-[12.5px] px-2.5 py-1.5" style={{ color: "#C9D6E8" }}>{activeCampus?.name} ({activeCampus?.abbr})</div>
+            <div className="text-[12.5px] px-2.5 py-1.5 truncate max-w-[140px] sm:max-w-none" style={{ color: "#C9D6E8" }}>{activeCampus?.name} ({activeCampus?.abbr})</div>
           )}
           <div className="flex items-center gap-2 pl-2 ml-1" style={{ borderLeft: "1px solid rgba(247,246,251,0.25)" }}>
             <span className="text-[12px] hidden sm:inline" style={{ color: "#C9D6E8" }}>{currentViewerName}</span>
@@ -2867,7 +2917,7 @@ export default function OpsDashboard() {
           </div>
         </nav>
 
-        <main className="flex-1 min-w-0 px-6 py-6 max-w-[1180px] pb-24 md:pb-6">
+        <main className="flex-1 min-w-0 px-6 py-6 max-w-[1440px] mx-auto pb-24 md:pb-6">
           {tab === "overview" && role === "central" && !selectedCampus && (
             <CentralOverview campuses={campuses} orgBudgetUsed={orgBudgetUsed} orgBudgetTotal={orgBudgetTotal}
               projects={displayProjects} staffByCampus={staffByCampus} onSelectCampus={(id) => { setSelectedCampus(id); setTab("overview"); }}
@@ -2886,7 +2936,8 @@ export default function OpsDashboard() {
               users={users} pulseWaves={pulseWaves} pulseParticipants={pulseParticipants} pulseResponses={pulseResponses}
               onCreatePulseWave={createPulseWave} onDeletePulseWave={deletePulseWave}
               taxonomy={taxonomy} onUpdateTaxonomy={updateTaxonomySettings}
-              engagementRhythmSettings={engagementRhythmSettings} onUpdateEngagementRhythmSettings={updateEngagementRhythmSettings} />
+              engagementRhythmSettings={engagementRhythmSettings} onUpdateEngagementRhythmSettings={updateEngagementRhythmSettings}
+              taskGroupOptions={taskGroupOptions} onAddTaskGroupOption={addTaskGroupOption} onRemoveTaskGroupOption={removeTaskGroupOption} />
           )}
 
           {tab === "overview" && (role !== "central" || selectedCampus) && activeCampus && (
@@ -3036,6 +3087,7 @@ export default function OpsDashboard() {
           onSetDue={setProjectDue} onSetSubtaskDue={setSubtaskDue}
           onAssignSubtask={assignSubtask} onDeleteSubtask={deleteSubtask} onDeleteProject={deleteProject}
           roster={fullRoster} seasons={seasons} onSetSeason={setProjectSeason}
+          taskGroupOptions={taskGroupOptions} onSetSubtaskGroup={setSubtaskGroup}
         />
       )}
       {showNewProject && <NewProjectModal onClose={() => setShowNewProject(false)} onCreate={(data) => { addProject(data); setShowNewProject(false); }} campusRoster={campusRoster} fullRoster={fullRoster} campusLabel={activeCampus ? `${activeCampus.name} (${activeCampus.abbr})` : "Central"} taxonomy={taxonomy} />}
@@ -3044,6 +3096,7 @@ export default function OpsDashboard() {
           onClose={() => setShowImportProjects(false)}
           roster={campusRoster} projects={scopedProjects} taxonomy={taxonomy}
           onAddProject={addProject} onAddSubtask={addSubtask}
+          taskGroupOptions={taskGroupOptions} onAddTaskGroupOption={addTaskGroupOption}
         />
       )}
       {openStaffProfile && (
@@ -5628,7 +5681,7 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, o
 
   return (
     <div>
-      <div className="mb-4 flex items-center justify-between">
+      <div className="mb-4 flex items-center justify-between flex-wrap gap-2">
         <div>
           <h1 style={{ fontFamily: "'Fraunces', serif" }} className="text-[clamp(18px,3.6vw,22px)] font-semibold tracking-tight">Projects & Tasks — {campusLabel}</h1>
           <p className="text-[12px] text-[#6B6980] mt-1">Click a card to open cost, sub-tasks, and notes. Click the stage pill to advance it.</p>
@@ -5712,7 +5765,10 @@ function ProjectsBoard({ projects, campusLabel, onCycle, onOpen, onSetSection, o
   );
 }
 
-function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetStage, onAddProjectNote, onAddSubtaskNote, onAddProjectPhoto, onAddSubtaskPhoto, onUpdateProjectBudget, onUpdateSubtaskBudget, onSetDue, onSetSubtaskDue, onAssignSubtask, onDeleteSubtask, onDeleteProject, roster, seasons, onSetSeason }) {
+function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetStage, onAddProjectNote, onAddSubtaskNote, onAddProjectPhoto, onAddSubtaskPhoto, onUpdateProjectBudget, onUpdateSubtaskBudget, onSetDue, onSetSubtaskDue, onAssignSubtask, onDeleteSubtask, onDeleteProject, roster, seasons, onSetSeason, taskGroupOptions, onSetSubtaskGroup }) {
+  const [newSubtaskGroup, setNewSubtaskGroup] = useState("");
+  const [editingGroup, setEditingGroup] = useState(null);
+  const [subtaskGroupDraft, setSubtaskGroupDraft] = useState("");
   const [showAddSubtask, setShowAddSubtask] = useState(false);
   const [subtaskText, setSubtaskText] = useState("");
   const [subtaskCost, setSubtaskCost] = useState("");
@@ -5755,12 +5811,24 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
   const subtaskEntries = (project.subtasks || []).map((s, i) => ({ s, i }));
   if (subtaskSort === "team") subtaskEntries.sort((a, b) => (a.s.createdBy || "").localeCompare(b.s.createdBy || ""));
 
+  // Groups render in the org's curated order (task_group_options.sort_order), with anything
+  // ungrouped — or tagged with a group Central has since removed from the list — collected last
+  // rather than silently dropped.
+  const groupedSubtaskEntries = subtaskSort === "group"
+    ? [...(taskGroupOptions || []).map((g) => g.name), "Ungrouped"].map((name) => ({
+        name,
+        entries: name === "Ungrouped"
+          ? subtaskEntries.filter(({ s }) => !s.taskGroup || !(taskGroupOptions || []).some((g) => g.name === s.taskGroup))
+          : subtaskEntries.filter(({ s }) => s.taskGroup === name),
+      })).filter((g) => g.entries.length > 0)
+    : null;
+
   const submitSubtask = () => {
     if (!subtaskText.trim()) return;
     const recurrence = recurFreq === "none" ? { freq: "none" } : { freq: recurFreq, customEvery, customUnit, endType, count, untilDate };
     const due = recurFreq !== "none" ? startDate : (startDate || null);
-    onAddSubtask(project.id, subtaskText.trim(), recurrence, due, subtaskCost, newSubtaskTime, newSubtaskAssignees);
-    setSubtaskText(""); setSubtaskCost(""); setRecurFreq("none"); setEndType("never"); setStartDate(TODAY_STR); setNewSubtaskTime(""); setNewSubtaskAssignees([]); setShowAddSubtask(false);
+    onAddSubtask(project.id, subtaskText.trim(), recurrence, due, subtaskCost, newSubtaskTime, newSubtaskAssignees, { taskGroup: newSubtaskGroup || null });
+    setSubtaskText(""); setSubtaskCost(""); setRecurFreq("none"); setEndType("never"); setStartDate(TODAY_STR); setNewSubtaskTime(""); setNewSubtaskAssignees([]); setNewSubtaskGroup(""); setShowAddSubtask(false);
   };
 
   const toggleNewSubtaskAssignee = (name) =>
@@ -5938,13 +6006,21 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
               <select value={subtaskSort} onChange={(e) => setSubtaskSort(e.target.value)} className="bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-1.5 py-1 text-[10px] outline-none">
                 <option value="default">Sort: Default</option>
                 <option value="team">Sort: Team Member</option>
+                <option value="group">Group by: Task Group</option>
               </select>
               <button onClick={() => setShowAddSubtask((v) => !v)} className="text-[10.5px] text-[#B8862F] flex items-center gap-1"><Plus size={12} /> Add sub-task</button>
             </div>
           </div>
           <div className="space-y-1.5 mb-2">
-            {subtaskEntries.map(({ s, i }) => (
-              <div key={s.id ?? i} className="rounded-md" style={{ background: expandedSubtask === i ? "#EFEEFA" : "transparent" }}>
+            {(subtaskSort === "group"
+              ? groupedSubtaskEntries.flatMap((g) => g.entries.map((e, gi) => ({ ...e, groupHeader: gi === 0 ? g.name : null })))
+              : subtaskEntries.map((e) => ({ ...e, groupHeader: null }))
+            ).map(({ s, i, groupHeader }) => (
+              <React.Fragment key={s.id ?? i}>
+              {groupHeader && (
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-[#8B889C] px-1 pt-3 pb-1 first:pt-0">{groupHeader}</div>
+              )}
+              <div className="rounded-md" style={{ background: expandedSubtask === i ? "#EFEEFA" : "transparent" }}>
                 <div className="flex items-center gap-2 px-1 py-1 flex-wrap">
                   <button onClick={() => onToggleSubtask(project.id, i)} className="flex items-center gap-2 text-left flex-1 min-w-0 basis-full sm:basis-0">
                     {s.done ? <CheckCircle2 size={14} className="text-[#5E9E8A] shrink-0" /> : <Circle size={14} className="text-[#A8A5BE] shrink-0" />}
@@ -6092,9 +6168,32 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
                         {(!s.notes || s.notes.length === 0) && <div className="text-[10.5px] text-[#8B889C]">No notes yet.</div>}
                       </div>
                     </div>
+                    {/* sub-task group */}
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="text-[10px] text-[#6B6980]">Task Group</span>
+                        {editingGroup !== i && (
+                          <button onClick={() => { setSubtaskGroupDraft(s.taskGroup || ""); setEditingGroup(i); }} className="text-[10px] text-[#B8862F]">Edit</button>
+                        )}
+                      </div>
+                      {editingGroup === i ? (
+                        <div className="flex items-center gap-1.5">
+                          <select value={subtaskGroupDraft} onChange={(e) => setSubtaskGroupDraft(e.target.value)}
+                            className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11px] outline-none">
+                            <option value="">No group</option>
+                            {(taskGroupOptions || []).map((g) => <option key={g.id} value={g.name}>{g.name}</option>)}
+                          </select>
+                          <button onClick={() => { onSetSubtaskGroup(project.id, i, subtaskGroupDraft); setEditingGroup(null); }} className="text-[10.5px] text-[#B8862F] font-medium">Save</button>
+                          <button onClick={() => setEditingGroup(null)} className="text-[10.5px] text-[#6B6980]">Cancel</button>
+                        </div>
+                      ) : (
+                        <div className="text-[11px] text-[#6B6980]">{s.taskGroup || "No group"}</div>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
+              </React.Fragment>
             ))}
           </div>
 
@@ -6112,6 +6211,16 @@ function ProjectModal({ project, onClose, onToggleSubtask, onAddSubtask, onSetSt
                 <input type="number" value={subtaskCost} onChange={(e) => setSubtaskCost(e.target.value)} placeholder="0"
                   className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11px] outline-none" />
               </div>
+              {taskGroupOptions?.length > 0 && (
+                <div className="flex items-center gap-2">
+                  <span className="text-[10.5px] text-[#6B6980] w-[60px] shrink-0">Group</span>
+                  <select value={newSubtaskGroup} onChange={(e) => setNewSubtaskGroup(e.target.value)}
+                    className="flex-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 text-[11px] outline-none">
+                    <option value="">No group</option>
+                    {taskGroupOptions.map((g) => <option key={g.id} value={g.name}>{g.name}</option>)}
+                  </select>
+                </div>
+              )}
               <div className="flex items-start gap-2">
                 <span className="text-[10.5px] text-[#6B6980] w-[60px] shrink-0 pt-1">Assign to</span>
                 <div className="flex-1 flex flex-wrap gap-x-3 gap-y-1 bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1.5">
@@ -6216,10 +6325,13 @@ function EventsList({ campusId, campuses }) {
 const IMPORT_TARGET_FIELDS = [
   { key: "title", label: "Title", required: true },
   { key: "section", label: "Ministry Area" },
+  { key: "group", label: "Task Group (within one project)" },
   { key: "stage", label: "Stage" },
   { key: "owner", label: "Owner" },
   { key: "team", label: "Team (comma-separated ok)" },
+  { key: "createdBy", label: "Created By" },
   { key: "due", label: "Due Date" },
+  { key: "completedDate", label: "Completed Date" },
   { key: "cost", label: "Budget / Cost" },
   { key: "notes", label: "Notes" },
   { key: "ignore", label: "— Don't import —" },
@@ -6232,11 +6344,17 @@ function guessFieldForHeader(header) {
   // the auto-guess over the real "Name" column since it usually appears first in export order.
   if (/\bid\b/.test(h)) return "ignore";
   if (/team|collaborat|assignees|members/.test(h)) return "team";
-  if (/owner|lead|assignee$|responsible/.test(h)) return "owner";
+  if (/created ?by|author|reporter/.test(h)) return "createdBy";
+  if (/completed|closed|finished/.test(h)) return "completedDate";
+  if (/^assignee$|owner|lead|responsible/.test(h)) return "owner";
   if (/due|deadline|end date|target date/.test(h)) return "due";
   if (/cost|budget|price|amount|spend/.test(h)) return "cost";
   if (/stage|status/.test(h)) return "stage";
-  if (/section|ministry|area|category|department|lane/.test(h)) return "section";
+  // Asana-style "Section/Column" clusters tasks WITHIN one project's list — that's the new Task
+  // Group concept, not Ministry Area (which categorizes whole projects org-wide). A literal
+  // "Ministry Area" column, if a file ever has one, still needs its own separate check below.
+  if (/section|column/.test(h)) return "group";
+  if (/ministry|area|category|department|lane/.test(h)) return "section";
   if (/note|description|detail|comment/.test(h)) return "notes";
   if (/^(name|title)$/.test(h) || /^(task|project|item)\s*name$/.test(h) || h === "task") return "title";
   return "ignore";
@@ -6338,15 +6456,17 @@ function splitPeopleCell(raw) {
   return String(raw || "").split(/[,;]/).map((s) => s.trim()).filter(Boolean);
 }
 
-function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject, onAddSubtask }) {
+function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject, onAddSubtask, taskGroupOptions, onAddTaskGroupOption }) {
   useLockBodyScroll();
-  const [step, setStep] = useState("upload"); // "upload" | "map" | "people" | "preview"
+  const [step, setStep] = useState("upload"); // "upload" | "map" | "people" | "groups" | "completed" | "preview"
   const [fileName, setFileName] = useState("");
   const [fileError, setFileError] = useState("");
   const [headers, setHeaders] = useState([]);
   const [rows, setRows] = useState([]);
   const [fieldMap, setFieldMap] = useState({});
   const [personMap, setPersonMap] = useState({});
+  const [groupCrosswalk, setGroupCrosswalk] = useState({}); // raw Section/Column value -> Task Group name
+  const [recurringRows, setRecurringRows] = useState({}); // row index -> recurrence freq, for rows with a Completed Date
   const [importMode, setImportMode] = useState("projects"); // "projects" | "tasks"
   const [targetProjectId, setTargetProjectId] = useState("");
   const [newTaskListTitle, setNewTaskListTitle] = useState("");
@@ -6373,34 +6493,84 @@ function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject
   const titleHeader = Object.keys(fieldMap).find((h) => fieldMap[h] === "title");
   const ownerHeader = Object.keys(fieldMap).find((h) => fieldMap[h] === "owner");
   const teamHeader = Object.keys(fieldMap).find((h) => fieldMap[h] === "team");
+  const createdByHeader = Object.keys(fieldMap).find((h) => fieldMap[h] === "createdBy");
+  const groupHeader = Object.keys(fieldMap).find((h) => fieldMap[h] === "group");
+  const completedDateHeader = Object.keys(fieldMap).find((h) => fieldMap[h] === "completedDate");
 
   const uniquePeople = useMemo(() => {
     const set = new Set();
     rows.forEach((row) => {
       if (ownerHeader && row[ownerHeader]) splitPeopleCell(row[ownerHeader]).forEach((n) => set.add(n));
       if (teamHeader && row[teamHeader]) splitPeopleCell(row[teamHeader]).forEach((n) => set.add(n));
+      if (createdByHeader && row[createdByHeader]) set.add(String(row[createdByHeader]).trim());
     });
+    set.delete("");
     return [...set].sort((a, b) => a.localeCompare(b));
-  }, [rows, ownerHeader, teamHeader]);
+  }, [rows, ownerHeader, teamHeader, createdByHeader]);
+
+  const uniqueGroupValues = useMemo(() => {
+    if (!groupHeader) return [];
+    const set = new Set();
+    rows.forEach((row) => { const v = String(row[groupHeader] || "").trim(); if (v) set.add(v); });
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [rows, groupHeader]);
+
+  const completedRowIndexes = useMemo(() => {
+    if (!completedDateHeader) return [];
+    const idxs = [];
+    rows.forEach((row, i) => { if (String(row[completedDateHeader] || "").trim() !== "") idxs.push(i); });
+    return idxs;
+  }, [rows, completedDateHeader]);
+
+  // Every step only appears when the file actually needs it — a plain two-column CSV with just
+  // Title/Due skips straight from "map" to "preview".
+  const stepOrder = ["upload", "map",
+    ...(uniquePeople.length > 0 ? ["people"] : []),
+    ...(uniqueGroupValues.length > 0 ? ["groups"] : []),
+    ...(completedRowIndexes.length > 0 ? ["completed"] : []),
+    "preview"];
+  const goNext = () => setStep(stepOrder[stepOrder.indexOf(step) + 1]);
+  const goBack = () => setStep(stepOrder[stepOrder.indexOf(step) - 1]);
 
   const resolvePerson = (name) => personMap[name] || name;
 
+  const handleGroupCrosswalkChange = async (raw, selected) => {
+    if (selected === "__new__") {
+      const created = await onAddTaskGroupOption(raw);
+      setGroupCrosswalk((prev) => ({ ...prev, [raw]: created?.name || raw }));
+    } else {
+      setGroupCrosswalk((prev) => ({ ...prev, [raw]: selected }));
+    }
+  };
+
   const preview = useMemo(() => {
-    return rows.map((row) => {
+    return rows.map((row, i) => {
       const get = (key) => { const h = Object.keys(fieldMap).find((h) => fieldMap[h] === key); return h ? row[h] : ""; };
       const title = String(get("title") || "").trim();
       const owner = ownerHeader ? splitPeopleCell(row[ownerHeader]).map(resolvePerson)[0] || "" : "";
       const team = teamHeader ? splitPeopleCell(row[teamHeader]).map(resolvePerson) : [];
+      const createdByRaw = createdByHeader ? String(row[createdByHeader] || "").trim() : "";
+      const groupRaw = groupHeader ? String(row[groupHeader] || "").trim() : "";
+      const completedRaw = completedDateHeader ? String(row[completedDateHeader] || "").trim() : "";
+      const recurFreq = recurringRows[i] || null;
+      let skipReason = null;
+      if (!title) skipReason = "no-title";
+      else if (completedRaw && !recurFreq) skipReason = "completed-not-recurring";
       return {
-        title, section: String(get("section") || "").trim(), stageRaw: get("stage"),
+        i, title, section: String(get("section") || "").trim(), stageRaw: get("stage"),
         owner, team, due: parseImportedDate(get("due")), cost: parseImportedCost(get("cost")), notes: String(get("notes") || "").trim(),
-        valid: !!title,
+        createdBy: createdByRaw ? resolvePerson(createdByRaw) : "",
+        group: groupRaw ? (groupCrosswalk[groupRaw] || "") : "",
+        recurFreq,
+        valid: !skipReason,
+        skipReason,
       };
     });
-  }, [rows, fieldMap, ownerHeader, teamHeader, personMap]);
+  }, [rows, fieldMap, ownerHeader, teamHeader, createdByHeader, groupHeader, completedDateHeader, personMap, groupCrosswalk, recurringRows]);
 
   const validCount = preview.filter((r) => r.valid).length;
-  const invalidCount = preview.length - validCount;
+  const noTitleCount = preview.filter((r) => r.skipReason === "no-title").length;
+  const completedSkipCount = preview.filter((r) => r.skipReason === "completed-not-recurring").length;
 
   const commitImport = () => {
     setImporting(true);
@@ -6414,7 +6584,9 @@ function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject
           owner: r.owner,
           team: r.team.join(", "),
           collaborators: "", due: r.due, dueTime: "", cost: r.cost,
-          recurrence: { freq: "none" }, shared: false,
+          recurrence: r.recurFreq ? { freq: r.recurFreq } : { freq: "none" }, shared: false,
+          createdBy: r.createdBy || undefined,
+          initialNote: r.notes || undefined,
         });
       });
     } else {
@@ -6430,7 +6602,11 @@ function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject
       if (projId) {
         validRows.forEach((r) => {
           const assignees = [r.owner, ...r.team].filter(Boolean);
-          onAddSubtask(projId, r.title, { freq: "none" }, r.due, r.cost, "", assignees);
+          onAddSubtask(projId, r.title, r.recurFreq ? { freq: r.recurFreq } : { freq: "none" }, r.due, r.cost, "", assignees, {
+            createdBy: r.createdBy || undefined,
+            taskGroup: r.group || undefined,
+            initialNote: r.notes || undefined,
+          });
         });
       }
     }
@@ -6452,7 +6628,11 @@ function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject
               <CheckCircle2 size={28} color="#5E9E8A" />
             </div>
             <div className="text-[14px] font-medium mb-1">Imported {importedCount} {importMode === "projects" ? "project" : "task"}{importedCount === 1 ? "" : "s"}</div>
-            <p className="text-[12px] text-[#6B6980] mb-5">{invalidCount > 0 ? `${invalidCount} row${invalidCount === 1 ? "" : "s"} skipped — no title.` : "Everything with a title came in."}</p>
+            <p className="text-[12px] text-[#6B6980] mb-5">
+              {noTitleCount === 0 && completedSkipCount === 0 && "Everything came in."}
+              {noTitleCount > 0 && `${noTitleCount} row${noTitleCount === 1 ? "" : "s"} skipped — no title. `}
+              {completedSkipCount > 0 && `${completedSkipCount} skipped — already completed, not marked recurring.`}
+            </p>
             <button onClick={onClose} className="text-[13px] font-medium rounded-md px-4 py-2" style={{ background: "#B8862F", color: "#F7F6FB" }}>Done</button>
           </div>
         ) : (
@@ -6490,7 +6670,7 @@ function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject
                 {!titleHeader && <div className="text-[11.5px] mb-3" style={{ color: "#C15B5B" }}>Map a column to Title before continuing — every row needs one to import.</div>}
                 <div className="flex gap-2">
                   <button onClick={() => setStep("upload")} className="text-[12px] text-[#6B6980] px-3 py-2">Back</button>
-                  <button onClick={() => setStep(uniquePeople.length > 0 ? "people" : "preview")} disabled={!titleHeader}
+                  <button onClick={goNext} disabled={!titleHeader}
                     className="flex-1 text-[13px] font-medium rounded-md px-3 py-2.5 disabled:opacity-40" style={{ background: "#B8862F", color: "#F7F6FB" }}>
                     Continue
                   </button>
@@ -6514,8 +6694,80 @@ function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject
                   ))}
                 </div>
                 <div className="flex gap-2">
-                  <button onClick={() => setStep("map")} className="text-[12px] text-[#6B6980] px-3 py-2">Back</button>
-                  <button onClick={() => setStep("preview")} className="flex-1 text-[13px] font-medium rounded-md px-3 py-2.5" style={{ background: "#B8862F", color: "#F7F6FB" }}>
+                  <button onClick={goBack} className="text-[12px] text-[#6B6980] px-3 py-2">Back</button>
+                  <button onClick={goNext} className="flex-1 text-[13px] font-medium rounded-md px-3 py-2.5" style={{ background: "#B8862F", color: "#F7F6FB" }}>
+                    Continue
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {step === "groups" && (
+              <div className="py-2">
+                <p className="text-[12px] text-[#6B6980] mb-4">This file clusters tasks with a column like Asana's "Section/Column." Map each value to one of your Task Groups, create a new one, or leave it ungrouped.</p>
+                <div className="space-y-2 mb-4 max-h-[360px] overflow-y-auto pr-1">
+                  {uniqueGroupValues.map((raw) => {
+                    const matched = (taskGroupOptions || []).find((g) => g.name.toLowerCase() === raw.toLowerCase());
+                    const current = groupCrosswalk[raw] ?? (matched?.name || "");
+                    return (
+                      <div key={raw} className="flex items-center justify-between gap-3 bg-[#F7F6FB] rounded-md px-3 py-2">
+                        <span className="text-[12px] truncate flex-1">{raw}</span>
+                        <select value={current} onChange={(e) => handleGroupCrosswalkChange(raw, e.target.value)}
+                          className="text-[11.5px] bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 outline-none max-w-[220px]">
+                          <option value="">Don't group</option>
+                          {(taskGroupOptions || []).map((g) => <option key={g.id} value={g.name}>{g.name}</option>)}
+                          <option value="__new__">+ Add "{raw}" as a new group</option>
+                        </select>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={goBack} className="text-[12px] text-[#6B6980] px-3 py-2">Back</button>
+                  <button onClick={goNext} className="flex-1 text-[13px] font-medium rounded-md px-3 py-2.5" style={{ background: "#B8862F", color: "#F7F6FB" }}>
+                    Continue
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {step === "completed" && (
+              <div className="py-2">
+                <p className="text-[12px] text-[#6B6980] mb-4">These rows already show a completed date. One-off completed items are skipped by default — tick "Recurring" for anything that should keep going in OpsCore, and pick how often it repeats.</p>
+                <div className="space-y-2 mb-4 max-h-[360px] overflow-y-auto pr-1">
+                  {completedRowIndexes.map((idx) => {
+                    const row = rows[idx];
+                    const title = titleHeader ? String(row[titleHeader] || "").trim() : "";
+                    const isRecurring = !!recurringRows[idx];
+                    return (
+                      <div key={idx} className="bg-[#F7F6FB] rounded-md px-3 py-2">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-[12px] truncate flex-1">{title || "(untitled row)"}</span>
+                          <label className="flex items-center gap-1.5 text-[11px] text-[#6B6980] cursor-pointer shrink-0">
+                            <input type="checkbox" checked={isRecurring}
+                              onChange={(e) => setRecurringRows((prev) => {
+                                const next = { ...prev };
+                                if (e.target.checked) next[idx] = next[idx] || "weekly"; else delete next[idx];
+                                return next;
+                              })}
+                              className="accent-[#B8862F]" />
+                            Recurring
+                          </label>
+                        </div>
+                        {isRecurring && (
+                          <select value={recurringRows[idx]} onChange={(e) => setRecurringRows((prev) => ({ ...prev, [idx]: e.target.value }))}
+                            className="mt-1.5 text-[11.5px] bg-[#FFFFFF] border border-[#D8D5EC] rounded-md px-2 py-1 outline-none">
+                            {RECUR_FREQ.filter((f) => f.id !== "none" && f.id !== "custom").map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}
+                          </select>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                <p className="text-[11px] text-[#8B889C] mb-3">{completedRowIndexes.length - Object.keys(recurringRows).length} one-off completed row{completedRowIndexes.length - Object.keys(recurringRows).length === 1 ? "" : "s"} will be skipped; recurring ones import active, ready for their next cycle.</p>
+                <div className="flex gap-2">
+                  <button onClick={goBack} className="text-[12px] text-[#6B6980] px-3 py-2">Back</button>
+                  <button onClick={goNext} className="flex-1 text-[13px] font-medium rounded-md px-3 py-2.5" style={{ background: "#B8862F", color: "#F7F6FB" }}>
                     Continue
                   </button>
                 </div>
@@ -6544,7 +6796,11 @@ function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject
                   </div>
                 )}
 
-                <div className="text-[11.5px] text-[#6B6980] mb-2">{validCount} ready to import{invalidCount > 0 ? ` · ${invalidCount} skipped (no title)` : ""}</div>
+                <div className="text-[11.5px] text-[#6B6980] mb-2">
+                  {validCount} ready to import
+                  {noTitleCount > 0 ? ` · ${noTitleCount} skipped (no title)` : ""}
+                  {completedSkipCount > 0 ? ` · ${completedSkipCount} skipped (completed, not recurring)` : ""}
+                </div>
                 <div className="border border-[#E3E1F0] rounded-lg overflow-x-auto max-h-[300px] overflow-y-auto mb-4">
                   <table className="w-full text-[11px]">
                     <thead className="sticky top-0 bg-[#FFFFFF]">
@@ -6554,6 +6810,8 @@ function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject
                         <th className="px-2 py-1.5 font-medium">Team</th>
                         <th className="px-2 py-1.5 font-medium">Due</th>
                         <th className="px-2 py-1.5 font-medium">Stage</th>
+                        {createdByHeader && <th className="px-2 py-1.5 font-medium">Created By</th>}
+                        {groupHeader && importMode === "tasks" && <th className="px-2 py-1.5 font-medium">Group</th>}
                       </tr>
                     </thead>
                     <tbody>
@@ -6562,8 +6820,10 @@ function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject
                           <td className="px-2 py-1.5 max-w-[160px] truncate">{r.title || "—"}</td>
                           <td className="px-2 py-1.5 whitespace-nowrap">{r.owner || "—"}</td>
                           <td className="px-2 py-1.5 max-w-[120px] truncate">{r.team.join(", ") || "—"}</td>
-                          <td className="px-2 py-1.5 whitespace-nowrap">{r.due || "—"}</td>
+                          <td className="px-2 py-1.5 whitespace-nowrap">{r.due || "—"}{r.recurFreq ? ` (${r.recurFreq})` : ""}</td>
                           <td className="px-2 py-1.5 whitespace-nowrap">{guessStage(r.stageRaw)}</td>
+                          {createdByHeader && <td className="px-2 py-1.5 whitespace-nowrap">{r.createdBy || "—"}</td>}
+                          {groupHeader && importMode === "tasks" && <td className="px-2 py-1.5 whitespace-nowrap">{r.group || "—"}</td>}
                         </tr>
                       ))}
                     </tbody>
@@ -6571,7 +6831,7 @@ function ImportProjectsModal({ onClose, roster, projects, taxonomy, onAddProject
                 </div>
 
                 <div className="flex gap-2">
-                  <button onClick={() => setStep(uniquePeople.length > 0 ? "people" : "map")} className="text-[12px] text-[#6B6980] px-3 py-2">Back</button>
+                  <button onClick={goBack} className="text-[12px] text-[#6B6980] px-3 py-2">Back</button>
                   <button onClick={commitImport} disabled={importing || validCount === 0 || (importMode === "tasks" && !targetProjectId)}
                     className="flex-1 text-[13px] font-medium rounded-md px-3 py-2.5 disabled:opacity-40" style={{ background: "#5E9E8A", color: "#F7F6FB" }}>
                     {importing ? "Importing…" : `Import ${validCount} ${importMode === "projects" ? "project" : "task"}${validCount === 1 ? "" : "s"}`}
@@ -6650,7 +6910,7 @@ function NewProjectModal({ onClose, onCreate, campusRoster, fullRoster, campusLa
             </div>
           </div>
 
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div>
               <label className="text-[10.5px] text-[#6B6980] block mb-1">Due date</label>
               <input type="date" value={due} onChange={(e) => setDue(e.target.value)} className="w-full bg-[#EFEEFA] border border-[#D8D5EC] rounded-md px-2 py-2 text-[12.5px] outline-none" />
@@ -7496,8 +7756,8 @@ function SeasonsPanel({ seasons, projects, campuses, onCreateSeason, onOpenProje
 // Central Management — the three org-wide tools (Central Team, Seasons, Location Scorecards)
 // that used to live as full-width buttons on All Campuses. Same accordion pattern throughout:
 // click a button, its panel expands in place below the row; only one open at a time.
-function CentralManagementPanel({ projects, campuses, staffByCampus, marginScores, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, seasons, onCreateSeason, onOpenProject, onSelectCampus, capacityWeightSettings, onUpdateCapacityWeightSettings, users, pulseWaves, pulseParticipants, pulseResponses, onCreatePulseWave, onDeletePulseWave, taxonomy, onUpdateTaxonomy, engagementRhythmSettings, onUpdateEngagementRhythmSettings }) {
-  const [open, setOpen] = useState(null); // "team" | "seasons" | "scorecards" | "weights" | "pulse" | "terminology" | "rhythm" | null
+function CentralManagementPanel({ projects, campuses, staffByCampus, marginScores, centralThreads, onAddTag, onRemoveTag, onAddMessage, currentViewerName, seasons, onCreateSeason, onOpenProject, onSelectCampus, capacityWeightSettings, onUpdateCapacityWeightSettings, users, pulseWaves, pulseParticipants, pulseResponses, onCreatePulseWave, onDeletePulseWave, taxonomy, onUpdateTaxonomy, engagementRhythmSettings, onUpdateEngagementRhythmSettings, taskGroupOptions, onAddTaskGroupOption, onRemoveTaskGroupOption }) {
+  const [open, setOpen] = useState(null); // "team" | "seasons" | "scorecards" | "weights" | "pulse" | "terminology" | "rhythm" | "groups" | null
 
   const tools = [
     { key: "team", label: "Central Team", color: "#2B4C7E", icon: Users, desc: "Browse any project or task by campus, leave a private note, optionally assign it. Campus teams never see this." },
@@ -7507,6 +7767,7 @@ function CentralManagementPanel({ projects, campuses, staffByCampus, marginScore
     { key: "pulse", label: "Org Pulse", color: "#C15B5B", icon: MessageSquare, desc: "A quarterly, anonymous org-wide sentiment read — separate from each person's Margin pulse." },
     { key: "terminology", label: "Terminology", color: "#2A2A3A", icon: Tag, desc: "Rename \"Campus\" and the Ministry Area labels org-wide — a display change only." },
     { key: "rhythm", label: "Engagement Rhythm", color: "#5E9E8A", icon: Clock, desc: "Set the target check-in/pulse cadence used to grade each leader's engagement on the Team Review export." },
+    { key: "groups", label: "Task Groups", color: "#6B4FA0", icon: ListChecks, desc: "The named sub-groups (Safety, Admin, Facilities…) available for clustering tasks inside a single project's list." },
   ];
 
   return (
@@ -7572,6 +7833,45 @@ function CentralManagementPanel({ projects, campuses, staffByCampus, marginScore
           <EngagementRhythmPanel settings={engagementRhythmSettings || DEFAULT_ENGAGEMENT_RHYTHM} onSave={onUpdateEngagementRhythmSettings} />
         </div>
       )}
+      {open === "groups" && (
+        <div className="bg-[#FFFFFF] border border-[#E3E1F0] rounded-lg p-4 mt-3 mb-8">
+          <TaskGroupsPanel groups={taskGroupOptions} onAdd={onAddTaskGroupOption} onRemove={onRemoveTaskGroupOption} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TaskGroupsPanel({ groups, onAdd, onRemove }) {
+  const [draft, setDraft] = useState("");
+
+  const submit = () => {
+    if (!draft.trim()) return;
+    onAdd(draft);
+    setDraft("");
+  };
+
+  return (
+    <div>
+      <div className="text-[13px] font-semibold mb-1">Task Groups</div>
+      <p className="text-[11.5px] text-[#6B6980] mb-4">Named sub-groups for clustering the tasks inside one project's list — the same role Asana's per-project "Sections" play. Distinct from Ministry Area, which categorizes whole projects across the org, not tasks within one. Anyone building a project's task list can assign one of these to a task; only Central adds or removes names from this list.</p>
+
+      <div className="flex gap-2 mb-4">
+        <input value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+          placeholder="New group name (e.g. Safety, Admin, Facilities)"
+          className="flex-1 bg-[#F7F6FB] border border-[#D8D5EC] rounded-md px-3 py-2 text-[13px] outline-none focus:border-[#B8862F]" />
+        <button onClick={submit} className="text-[13px] font-medium rounded-md px-4 py-2 shrink-0" style={{ background: "#B8862F", color: "#F7F6FB" }}>Add</button>
+      </div>
+
+      <div className="space-y-1.5">
+        {groups.map((g) => (
+          <div key={g.id} className="flex items-center justify-between gap-2 bg-[#F7F6FB] border border-[#E3E1F0] rounded-md px-3 py-2">
+            <span className="text-[12.5px]">{g.name}</span>
+            <button onClick={() => onRemove(g.id)} className="text-[#8B889C] hover:text-[#C15B5B]"><Trash2 size={13} /></button>
+          </div>
+        ))}
+        {groups.length === 0 && <div className="text-[11.5px] text-[#8B889C] italic">No task groups yet — add one above.</div>}
+      </div>
     </div>
   );
 }
